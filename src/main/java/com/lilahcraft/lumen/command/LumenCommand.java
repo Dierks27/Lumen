@@ -58,6 +58,8 @@ public final class LumenCommand {
                         .executes(LumenCommand::here))
                 .then(CommandManager.literal("inventory")
                         .executes(LumenCommand::inventory))
+                .then(CommandManager.literal("drop")
+                        .executes(LumenCommand::drop))
                 .then(CommandManager.literal("why")
                         .executes(LumenCommand::why))
                 .then(CommandManager.literal("memory")
@@ -215,6 +217,20 @@ public final class LumenCommand {
         return 1;
     }
 
+    /** Hands everything back: pack, worn gear and anything not yet delivered. */
+    private static int drop(CommandContext<ServerCommandSource> context) {
+        ServerCommandSource source = context.getSource();
+        LumenEntity lumen = requireLumen(source);
+        if (lumen == null) {
+            return 0;
+        }
+        int dropped = lumen.dropEverything();
+        source.sendFeedback(() -> Text.literal(Lumen.config().companionName
+                + (dropped == 0 ? " has nothing to give back." : " drops " + dropped + " stack(s)."))
+                .formatted(Formatting.AQUA), false);
+        return 1;
+    }
+
     private static int memory(CommandContext<ServerCommandSource> context) {
         ServerCommandSource source = context.getSource();
         List<String> lines = Lumen.memory().lines(15);
@@ -274,10 +290,9 @@ public final class LumenCommand {
             return 0;
         }
         String query = StringArgumentType.getString(context, "block");
-        if (!lumen.startMining(player, query)) {
-            source.sendError(Text.literal("Nothing matching \"" + query + "\" within "
-                    + Math.round(Lumen.config().miningRadius) + " blocks that "
-                    + Lumen.config().companionName + " can reach."));
+        String refusal = lumen.startMining(player, query);
+        if (refusal != null) {
+            source.sendError(Text.literal(Lumen.config().companionName + ": " + refusal));
             return 0;
         }
         source.sendFeedback(() -> Text.literal(Lumen.config().companionName

@@ -152,8 +152,12 @@ public final class LumenConfig {
 
     // ------------------------------------------------------------------ combat
 
-    /** Fight hostile mobs that come near Lumen or the player it is following. */
-    public boolean combat = true;
+    /**
+     * Fight hostile mobs near Lumen or the player it follows. Off by default: v0.3.0
+     * shipped an aggro leak that killed a player, and while that path is now closed
+     * three ways over, turning it back on should be a deliberate choice.
+     */
+    public boolean combat = false;
 
     /** Base damage per hit. Weapons Lumen is holding add to this. */
     public double attackDamage = 3.0D;

@@ -234,10 +234,14 @@ public final class LumenBrain {
             query = query.replaceFirst("^(me|us)\\b", "").trim();
             query = query.replaceFirst("^(some|a|an|the|down)\\b", "").trim();
             ServerPlayerEntity requester = resolvePlayer(server, senderName, senderName);
-            if (!query.isEmpty() && requester != null && lumen.startMining(requester, query)) {
+            if (query.isEmpty() || requester == null) {
                 return;
             }
-            Lumen.LOGGER.debug("Nothing minable matching '{}' nearby", query);
+            String refusal = lumen.startMining(requester, query);
+            if (refusal != null) {
+                // Say why rather than standing there doing nothing.
+                Lumen.broadcast(server, refusal);
+            }
             return;
         }
 

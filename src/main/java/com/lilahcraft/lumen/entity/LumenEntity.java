@@ -21,7 +21,6 @@ import net.minecraft.entity.ai.goal.LongDoorInteractGoal;
 import net.minecraft.entity.ai.goal.LookAroundGoal;
 import net.minecraft.entity.ai.goal.LookAtEntityGoal;
 import net.minecraft.entity.ai.goal.MeleeAttackGoal;
-import net.minecraft.entity.ai.goal.RevengeGoal;
 import net.minecraft.entity.ai.goal.SwimGoal;
 import net.minecraft.entity.ai.pathing.EntityNavigation;
 import com.lilahcraft.lumen.entity.ai.LumenNavigation;
@@ -224,8 +223,10 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         this.goalSelector.add(7, new LookAtEntityGoal(this, PlayerEntity.class, 8.0F));
         this.goalSelector.add(8, new LookAroundGoal(this));
 
-        this.targetSelector.add(1, new RevengeGoal(this));
-        this.targetSelector.add(2, new ActiveTargetGoal<>(this, HostileEntity.class, 10, true, false,
+        // No RevengeGoal. It retaliates against whoever last damaged Lumen, with no
+        // filter - so one stray swing from the player during a fight made Lumen turn
+        // on them and kill them. Lumen only ever picks its own targets, below.
+        this.targetSelector.add(1, new ActiveTargetGoal<>(this, HostileEntity.class, 10, true, false,
                 this::shouldDefendAgainst));
     }
 
@@ -620,10 +621,14 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
      *
      * @return false when nothing suitable is in range, so the caller can say so
      */
-    public boolean startMining(PlayerEntity requester, String query) {
+    @Nullable
+    public String startMining(PlayerEntity requester, String query) {
         LumenConfig config = Lumen.config();
-        if (!config.allowMining || !(this.getWorld() instanceof ServerWorld world)) {
-            return false;
+        if (!config.allowMining) {
+            return "mining is switched off";
+        }
+        if (!(this.getWorld() instanceof ServerWorld world)) {
+            return "i can't do that here";
         }
         this.mineQuery = query;
         this.deliverTo = requester.getUuid();
@@ -632,7 +637,21 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         this.followTarget = null;
         this.destination = null;
         this.stuckTicks = 0;
-        return targetNextBlock(world);
+        if (!targetNextBlock(world)) {
+            this.mineQuery = null;
+            return "i can't see any " + query + " around here";
+        }
+        // Checked before setting out. Walking over, playing the whole break animation
+        // and only then discovering the tool is wrong is what v0.3.0 did.
+        if (!canHarvest(this.mineTarget)) {
+            this.mineTarget = null;
+            this.mineQuery = null;
+            this.mode = Mode.IDLE;
+            return this.getMainHandStack().isEmpty()
+                    ? "i'd need a tool for that - put one in my pack"
+                    : "what i'm holding won't break that";
+        }
+        return null;
     }
 
     private boolean targetNextBlock(ServerWorld world) {
@@ -645,6 +664,19 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         this.mode = Mode.MINE;
         this.mineTarget = next;
         return true;
+    }
+
+    /**
+     * Whether Lumen could actually break {@code pos} with what it is holding. Checked
+     * before setting out, so "I need a pickaxe" is said up front rather than after
+     * standing there playing the whole break animation.
+     */
+    public boolean canHarvest(BlockPos pos) {
+        if (!(this.getWorld() instanceof ServerWorld world)) {
+            return false;
+        }
+        BlockState state = world.getBlockState(pos);
+        return !state.isToolRequired() || this.getMainHandStack().isSuitableFor(state);
     }
 
     @Nullable
@@ -682,14 +714,23 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
                     + " without " + needed;
         }
 
-        for (ItemStack drop : Block.getDroppedStacks(state, world, target, world.getBlockEntity(target), this, tool)) {
+        // Order matters: work out the drops, then break, and only bank them if the
+        // break actually happened. Banking first meant a break that was refused - no
+        // suitable tool, or a protection mod vetoing it - still handed over items,
+        // which is items from nothing and the block still standing.
+        List<ItemStack> drops = Block.getDroppedStacks(state, world, target,
+                world.getBlockEntity(target), this, tool);
+        if (!world.breakBlock(target, false, this)) {
+            Lumen.LOGGER.warn("Refused to break {} at {}; not banking its drops",
+                    Registries.BLOCK.getId(state.getBlock()), target.toShortString());
+            finishMining();
+            return "something stopped me breaking that";
+        }
+        for (ItemStack drop : drops) {
             if (!drop.isEmpty()) {
                 pendingDelivery.add(drop);
             }
         }
-        // drops=false: the drops are already banked above, so they go to whoever asked
-        // instead of scattering on the floor.
-        world.breakBlock(target, false, this);
         world.setBlockBreakingInfo(this.getId(), target, -1);
         this.swingHand(Hand.MAIN_HAND);
         if (!tool.isEmpty()) {
@@ -705,7 +746,7 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
     }
 
     private String continueOrFinish(ServerWorld world) {
-        if (!targetNextBlock(world)) {
+        if (!targetNextBlock(world) || !canHarvest(this.mineTarget)) {
             finishMining();
         }
         return null;
@@ -735,6 +776,9 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         if (!config.combat || candidate == null || !candidate.isAlive()) {
             return false;
         }
+        if (candidate instanceof PlayerEntity) {
+            return false;
+        }
         double radiusSquared = config.defendRadius * config.defendRadius;
         if (this.squaredDistanceTo(candidate) <= radiusSquared) {
             return true;
@@ -744,12 +788,30 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
     }
 
     /**
+     * The single chokepoint for aggro. A player can never become a target, whatever
+     * asked for it - a goal, another mod, or a mixin. After v0.3.0 killed a player
+     * this is a hard invariant rather than a predicate someone can forget to apply.
+     */
+    @Override
+    public void setTarget(@Nullable LivingEntity target) {
+        if (target instanceof PlayerEntity) {
+            super.setTarget(null);
+            return;
+        }
+        super.setTarget(target);
+    }
+
+    /**
      * Villagers have no attack damage attribute, and Lumen is wearing a villager, so
      * the vanilla path through {@code getAttributeValue(GENERIC_ATTACK_DAMAGE)} would
      * throw. Damage comes from config plus whatever is in Lumen's hand instead.
      */
     @Override
     public boolean tryAttack(Entity target) {
+        // Belt and braces: even if something hands us a player, we do not swing at one.
+        if (target instanceof PlayerEntity || !Lumen.config().combat) {
+            return false;
+        }
         float damage = (float) (Lumen.config().attackDamage + attackBonus(this.getMainHandStack()));
         boolean hit = target.damage(this.getDamageSources().mobAttack(this), damage);
         if (hit) {
@@ -916,6 +978,11 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
                 && this.getBlockPos().isWithinDistance(destination, 2.0D)) {
             stopAndIdle();
         }
+        // Let go the instant the fight is over, rather than carrying aggro onward.
+        LivingEntity currentTarget = this.getTarget();
+        if (currentTarget != null && (!currentTarget.isAlive() || currentTarget instanceof PlayerEntity)) {
+            this.setTarget(null);
+        }
         updateStuckState();
         collectNearbyItems();
         deliverIfClose();
@@ -960,6 +1027,42 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
 
         player.openHandledScreen(this);
         return ActionResult.SUCCESS;
+    }
+
+    /**
+     * Puts everything Lumen is carrying on the ground: pack, worn gear and anything
+     * fetched but not yet handed over. Used by despawn, which previously deleted the
+     * lot, and by /lumen drop.
+     *
+     * @return how many stacks were dropped
+     */
+    public int dropEverything() {
+        int dropped = 0;
+        SimpleInventory pack = getInventory();
+        for (int slot = 0; slot < pack.size(); slot++) {
+            ItemStack stack = pack.getStack(slot);
+            if (!stack.isEmpty()) {
+                this.dropStack(stack);
+                dropped++;
+            }
+        }
+        pack.clear();
+        for (EquipmentSlot slot : EquipmentSlot.values()) {
+            ItemStack equipped = this.getEquippedStack(slot);
+            if (!equipped.isEmpty()) {
+                this.dropStack(equipped);
+                this.equipStack(slot, ItemStack.EMPTY);
+                dropped++;
+            }
+        }
+        for (ItemStack stack : pendingDelivery) {
+            if (!stack.isEmpty()) {
+                this.dropStack(stack);
+                dropped++;
+            }
+        }
+        pendingDelivery.clear();
+        return dropped;
     }
 
     @Override

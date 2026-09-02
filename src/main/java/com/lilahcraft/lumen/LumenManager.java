@@ -88,6 +88,11 @@ public final class LumenManager {
         if (lumen == null) {
             return false;
         }
+        // Despawning used to delete the pack. Anything a player handed over comes back.
+        int dropped = lumen.dropEverything();
+        if (dropped > 0) {
+            Lumen.LOGGER.info("Dropped {} stack(s) that {} was carrying", dropped, Lumen.config().companionName);
+        }
         lumen.discard();
         return true;
     }
