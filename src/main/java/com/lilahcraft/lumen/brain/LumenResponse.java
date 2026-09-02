@@ -3,7 +3,8 @@ package com.lilahcraft.lumen.brain;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
-import com.lilahcraft.lumen.Lumen;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * The three field object we ask the model for:
@@ -14,6 +15,8 @@ import com.lilahcraft.lumen.Lumen;
  * a response we cannot parse at all becomes a plain chat line instead of an error.
  */
 public record LumenResponse(String reason, String command, String message) {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger("Lumen");
 
     public boolean hasMessage() {
         return message != null && !message.isBlank();
@@ -49,7 +52,7 @@ public record LumenResponse(String reason, String command, String message) {
                             readString(object, "message"));
                 }
             } catch (RuntimeException e) {
-                Lumen.LOGGER.debug("Could not parse LLM JSON, treating it as plain text: {}", e.toString());
+                LOGGER.debug("Could not parse LLM JSON, treating it as plain text: {}", e.toString());
             }
         }
 

@@ -52,6 +52,8 @@ server restart.
    ./gradlew build
    ```
    The jar lands in `build/libs/lumen-<version>.jar` (ignore the `-sources` jar).
+   `./gradlew test` runs the parser tests - the LLM response handling is covered
+   there, since it is the part most likely to meet input nobody predicted.
 2. Drop it in the server's `mods/` folder. Requires **Fabric API**.
 3. Start the server once to generate `config/lumen.json`, then edit it.
 4. `/lumen spawn`.

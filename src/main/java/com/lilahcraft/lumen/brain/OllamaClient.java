@@ -97,8 +97,10 @@ public final class OllamaClient {
      * Digs the assistant text out of the response. Handles the OpenAI shape used by
      * {@code /v1/chat/completions} plus Ollama's own {@code /api/chat} and
      * {@code /api/generate} shapes, so a mistyped URL still produces something useful.
+     *
+     * <p>Package private so it can be unit tested without a server.
      */
-    private static String extractContent(String body) {
+    static String extractContent(String body) {
         JsonElement root = JsonParser.parseString(body);
         if (!root.isJsonObject()) {
             throw new IllegalStateException("Ollama response was not a JSON object");
