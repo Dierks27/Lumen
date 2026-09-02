@@ -68,6 +68,15 @@ public final class WorldSnapshot {
                 .append(" in ").append(prettyId(world.getRegistryKey().getValue()))
                 .append(", in ").append(biomeName(world, pos)).append(".\n");
 
+        // The bed case: Lumen used to walk onto a thing and then ask where it was.
+        BlockState floor = world.getBlockState(pos.down());
+        BlockState feet = world.getBlockState(pos);
+        out.append("- You are standing on ").append(floor.isAir() ? "nothing" : blockName(floor));
+        if (!feet.isAir()) {
+            out.append(", with your feet inside ").append(blockName(feet));
+        }
+        out.append(".\n");
+
         out.append("- It is ").append(timeOfDay(world)).append(", ").append(weather(world));
         if (!world.isSkyVisible(pos)) {
             out.append(pos.getY() < 55 ? ", and you are underground" : ", and you are indoors or under cover");
@@ -144,6 +153,15 @@ public final class WorldSnapshot {
         }
         if (items > 0) {
             parts.add(joinCounts(counts, 6) + " in your pack");
+        }
+        Map<String, Integer> delivering = new LinkedHashMap<>();
+        for (ItemStack stack : lumen.getPendingDelivery()) {
+            if (!stack.isEmpty()) {
+                delivering.merge(stack.getName().getString(), stack.getCount(), Integer::sum);
+            }
+        }
+        if (!delivering.isEmpty()) {
+            parts.add(joinCounts(delivering, 4) + " to hand over to whoever asked for it");
         }
         return parts.isEmpty() ? null : String.join(", ", parts);
     }

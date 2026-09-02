@@ -215,6 +215,19 @@ public final class LumenBrain {
             return;
         }
 
+        if (command.startsWith("find") || command.startsWith("fetch") || command.startsWith("get ")) {
+            String query = command.replaceFirst("^(find|fetch|get)", "").trim();
+            // Models like to pad the object: "find me some iron" -> "iron".
+            query = query.replaceFirst("^(me|us)\\b", "").trim();
+            query = query.replaceFirst("^(some|a|an|the)\\b", "").trim();
+            ServerPlayerEntity requester = resolvePlayer(server, senderName, senderName);
+            if (!query.isEmpty() && requester != null && lumen.startFetch(requester, query)) {
+                return;
+            }
+            Lumen.LOGGER.debug("Nothing nearby holds '{}'", query);
+            return;
+        }
+
         Lumen.LOGGER.debug("Ignoring unknown command from the model: '{}'", rawCommand);
     }
 
@@ -255,6 +268,8 @@ public final class LumenBrain {
                 + "  idle            - stand around, wander a little, do nothing in particular\n"
                 + "  follow <player> - walk after that player and keep up with them\n"
                 + "  come            - walk to whoever just spoke to you\n"
+                + "  find <item>     - go through nearby chests and barrels for that item and "
+                + "bring it back to whoever asked\n"
                 + "Use exactly one command. If nothing needs to change, use \"idle\".\n"
                 + "The \"message\" field is the only thing players see: keep it to one or two short "
                 + "sentences, lowercase and casual, like typing in chat. Never mention JSON, commands "

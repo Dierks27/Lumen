@@ -114,6 +114,15 @@ public final class LumenConfig {
     /** Drop everything Lumen was carrying when it dies. */
     public boolean dropInventoryOnDeath = true;
 
+    /** Let Lumen take requested items out of nearby containers. */
+    public boolean allowChestAccess = true;
+
+    /** How far Lumen will look for a container holding what was asked for. */
+    public double chestSearchRadius = 16.0D;
+
+    /** Most stacks Lumen will take out of a container in one errand. */
+    public int maxFetchStacks = 3;
+
     // ------------------------------------------------------------------ combat
 
     /** Fight hostile mobs that come near Lumen or the player it is following. */
@@ -238,6 +247,8 @@ public final class LumenConfig {
         stuckTeleportTicks = (int) clamp(stuckTeleportTicks, stuckRepathTicks + 20, 2400);
         inventorySize = (int) clamp(inventorySize, 1, 54);
         pickUpRadius = clamp(pickUpRadius, 0.0D, 32.0D);
+        chestSearchRadius = clamp(chestSearchRadius, 0.0D, 64.0D);
+        maxFetchStacks = (int) clamp(maxFetchStacks, 1, 27);
         attackDamage = clamp(attackDamage, 0.0D, 100.0D);
         defendRadius = clamp(defendRadius, 0.0D, 64.0D);
         adminPermissionLevel = (int) clamp(adminPermissionLevel, 0, 4);

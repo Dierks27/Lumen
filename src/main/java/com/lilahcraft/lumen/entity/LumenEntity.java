@@ -2,6 +2,7 @@ package com.lilahcraft.lumen.entity;
 
 import com.lilahcraft.lumen.Lumen;
 import com.lilahcraft.lumen.LumenConfig;
+import com.lilahcraft.lumen.entity.goal.LumenFetchGoal;
 import com.lilahcraft.lumen.entity.goal.LumenFollowGoal;
 import com.lilahcraft.lumen.entity.goal.LumenGoToGoal;
 import com.lilahcraft.lumen.entity.goal.LumenPickUpItemGoal;
@@ -20,6 +21,7 @@ import net.minecraft.entity.ai.goal.MeleeAttackGoal;
 import net.minecraft.entity.ai.goal.RevengeGoal;
 import net.minecraft.entity.ai.goal.SwimGoal;
 import net.minecraft.entity.ai.pathing.EntityNavigation;
+import com.lilahcraft.lumen.entity.ai.LumenNavigation;
 import net.minecraft.entity.ai.pathing.MobNavigation;
 import net.minecraft.entity.ai.pathing.PathNodeType;
 import net.minecraft.entity.attribute.EntityAttributeInstance;
@@ -28,12 +30,15 @@ import net.minecraft.entity.attribute.EntityAttributes;
 import net.minecraft.entity.mob.HostileEntity;
 import net.minecraft.entity.mob.PathAwareEntity;
 import net.minecraft.entity.player.PlayerEntity;
+import net.minecraft.inventory.Inventory;
 import net.minecraft.inventory.SimpleInventory;
 import net.minecraft.item.ItemStack;
 import net.minecraft.nbt.NbtCompound;
 import net.minecraft.registry.Registries;
 import net.minecraft.server.world.ServerWorld;
+import net.minecraft.sound.SoundCategory;
 import net.minecraft.sound.SoundEvent;
+import net.minecraft.sound.SoundEvents;
 import net.minecraft.text.Text;
 import net.minecraft.util.ActionResult;
 import net.minecraft.util.Formatting;
@@ -45,6 +50,7 @@ import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.World;
 import org.jetbrains.annotations.Nullable;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
@@ -66,7 +72,9 @@ public class LumenEntity extends PathAwareEntity {
         /** Keep up with a specific player. */
         FOLLOW,
         /** Walk to a fixed position, then go back to idling. */
-        GO_TO
+        GO_TO,
+        /** Walk to a container, take what was asked for, then bring it back. */
+        FETCH
     }
 
     private Mode mode;
@@ -76,6 +84,11 @@ public class LumenEntity extends PathAwareEntity {
     // Lazily built: MobEntity's constructor runs initGoals() before our field
     // initialisers, so anything a goal might touch has to be created on demand.
     private SimpleInventory inventory;
+
+    private BlockPos fetchChest;
+    private String fetchQuery;
+    private UUID deliverTo;
+    private final List<ItemStack> pendingDelivery = new ArrayList<>();
 
     private Vec3d lastProgressPos;
     private int stuckTicks;
@@ -159,7 +172,7 @@ public class LumenEntity extends PathAwareEntity {
 
     @Override
     protected EntityNavigation createNavigation(World world) {
-        MobNavigation navigation = new MobNavigation(this, world);
+        MobNavigation navigation = new LumenNavigation(this, world);
         navigation.setCanSwim(true);
         // Closed wooden doors become passable for the pathfinder; the door goal below
         // does the actual opening. Without both, Lumen stops dead at every doorway.
@@ -179,6 +192,7 @@ public class LumenEntity extends PathAwareEntity {
         this.goalSelector.add(1, new EscapeDangerGoal(this, 1.3D));
         this.goalSelector.add(2, new LumenFollowGoal(this));
         this.goalSelector.add(3, new LumenGoToGoal(this));
+        this.goalSelector.add(3, new LumenFetchGoal(this));
         this.goalSelector.add(4, new MeleeAttackGoal(this, 1.2D, true));
         this.goalSelector.add(5, new LumenPickUpItemGoal(this));
         this.goalSelector.add(6, new LumenWanderGoal(this, 0.7D));
@@ -215,8 +229,114 @@ public class LumenEntity extends PathAwareEntity {
         this.mode = Mode.IDLE;
         this.followTarget = null;
         this.destination = null;
+        this.fetchChest = null;
+        this.fetchQuery = null;
         this.stuckTicks = 0;
         this.getNavigation().stop();
+        // pendingDelivery survives: whatever Lumen fetched still belongs to whoever
+        // asked for it, and tick() hands it over as soon as they are close enough.
+    }
+
+    /**
+     * Sends Lumen off to a nearby container that holds {@code query}.
+     *
+     * @return false when nothing nearby has it, so the caller can say so
+     */
+    public boolean startFetch(PlayerEntity requester, String query) {
+        LumenConfig config = Lumen.config();
+        if (!config.allowChestAccess || !(this.getWorld() instanceof ServerWorld world)) {
+            return false;
+        }
+        ChestFinder.Match match = ChestFinder.findContainerWith(
+                world, this.getBlockPos(), config.chestSearchRadius, query);
+        if (match == null) {
+            return false;
+        }
+        this.mode = Mode.FETCH;
+        this.fetchChest = match.pos();
+        this.fetchQuery = query;
+        this.deliverTo = requester.getUuid();
+        this.followTarget = null;
+        this.destination = null;
+        this.stuckTicks = 0;
+        return true;
+    }
+
+    @Nullable
+    public BlockPos getFetchChest() {
+        return getMode() == Mode.FETCH ? fetchChest : null;
+    }
+
+    public List<ItemStack> getPendingDelivery() {
+        return pendingDelivery;
+    }
+
+    /**
+     * Empties the matching items out of the container Lumen walked to, then heads back
+     * to whoever asked. Called by the fetch goal once Lumen is standing at the chest.
+     */
+    public void collectFromChest() {
+        LumenConfig config = Lumen.config();
+        BlockPos chest = this.fetchChest;
+        String query = this.fetchQuery;
+        PlayerEntity requester = deliverTo == null ? null : this.getWorld().getPlayerByUuid(deliverTo);
+        this.fetchChest = null;
+        this.fetchQuery = null;
+        if (chest == null || query == null) {
+            stopAndIdle();
+            return;
+        }
+
+        int taken = 0;
+        if (this.getWorld().getBlockEntity(chest) instanceof Inventory inventory) {
+            this.getWorld().playSound(null, chest, SoundEvents.BLOCK_CHEST_OPEN,
+                    SoundCategory.BLOCKS, 0.6F, 1.0F);
+            for (int slot = 0; slot < inventory.size() && taken < config.maxFetchStacks; slot++) {
+                ItemStack stack = inventory.getStack(slot);
+                if (ChestFinder.matches(stack, query)) {
+                    pendingDelivery.add(inventory.removeStack(slot));
+                    taken++;
+                }
+            }
+            inventory.markDirty();
+            this.getWorld().playSound(null, chest, SoundEvents.BLOCK_CHEST_CLOSE,
+                    SoundCategory.BLOCKS, 0.6F, 1.0F);
+        }
+        // Taking from someone's storage is worth an audit line in the server log.
+        Lumen.LOGGER.info("Lumen took {} stack(s) matching '{}' from the container at {} for {}",
+                taken, query, chest.toShortString(),
+                requester == null ? "nobody" : requester.getName().getString());
+
+        if (requester != null) {
+            followPlayer(requester);
+        } else {
+            stopAndIdle();
+        }
+    }
+
+    /** Hands fetched items over once Lumen is back beside whoever asked for them. */
+    private void deliverIfClose() {
+        if (pendingDelivery.isEmpty() || deliverTo == null) {
+            return;
+        }
+        PlayerEntity requester = this.getWorld().getPlayerByUuid(deliverTo);
+        if (requester == null || requester.getWorld() != this.getWorld()
+                || this.squaredDistanceTo(requester) > 9.0D) {
+            return;
+        }
+        int delivered = 0;
+        for (ItemStack stack : pendingDelivery) {
+            if (!stack.isEmpty()) {
+                this.dropStack(stack);
+                delivered += stack.getCount();
+            }
+        }
+        pendingDelivery.clear();
+        this.deliverTo = null;
+        if (delivered > 0) {
+            requester.sendMessage(Text.literal(Lumen.config().companionName + " drops "
+                    + delivered + " item(s) for you.").formatted(Formatting.AQUA), false);
+        }
     }
 
     @Nullable
@@ -244,6 +364,10 @@ public class LumenEntity extends PathAwareEntity {
                 BlockPos pos = getDestination();
                 return pos == null ? "standing around"
                         : "walking to " + pos.getX() + ", " + pos.getY() + ", " + pos.getZ();
+            }
+            case FETCH -> {
+                return fetchQuery == null ? "standing around"
+                        : "going to a nearby container to fetch " + fetchQuery;
             }
             default -> {
                 return "standing around";
@@ -437,6 +561,10 @@ public class LumenEntity extends PathAwareEntity {
                 BlockPos target = getDestination();
                 return target != null && !this.getBlockPos().isWithinDistance(target, 2.0D) ? target : null;
             }
+            case FETCH -> {
+                return fetchChest != null && !this.getBlockPos().isWithinDistance(fetchChest, 2.5D)
+                        ? fetchChest : null;
+            }
             default -> {
                 return null;
             }
@@ -489,6 +617,7 @@ public class LumenEntity extends PathAwareEntity {
         }
         updateStuckState();
         collectNearbyItems();
+        deliverIfClose();
     }
 
     @Override
