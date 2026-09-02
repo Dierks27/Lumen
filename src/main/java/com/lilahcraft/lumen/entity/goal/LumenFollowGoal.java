@@ -19,6 +19,8 @@ public class LumenFollowGoal extends Goal {
     private final LumenEntity lumen;
     private PlayerEntity target;
     private int repathCountdown;
+    /** Consecutive re-paths that produced no route at all. */
+    private int noRouteRounds;
 
     public LumenFollowGoal(LumenEntity lumen) {
         this.lumen = lumen;
@@ -51,6 +53,7 @@ public class LumenFollowGoal extends Goal {
     @Override
     public void start() {
         this.repathCountdown = 0;
+        this.noRouteRounds = 0;
     }
 
     @Override
@@ -84,12 +87,22 @@ public class LumenFollowGoal extends Goal {
         }
 
         EntityNavigation navigation = lumen.getNavigation();
-        if (!navigation.startMovingTo(target, config.followSpeedMultiplier) && !lumen.hasVehicle()) {
-            // Nothing walkable between here and there; only warp once it is far enough
-            // away to be obviously stuck rather than briefly blocked by a fence.
-            if (distanceSquared > 12.0D * 12.0D) {
-                lumen.teleportNear(target.getBlockPos());
-            }
+        boolean started = navigation.startMovingTo(target, config.followSpeedMultiplier);
+        // Vanilla reports success for a path that stops short - at the wall of the
+        // house the player just walked into. That is no route, and counts as one.
+        boolean noRoute = !started || (lumen.pathGoesNowhere() && distanceSquared > 6.0D * 6.0D);
+        if (!noRoute) {
+            this.noRouteRounds = 0;
+            return;
+        }
+        if (lumen.hasVehicle()) {
+            return;
+        }
+        // Nothing walkable between here and there. Warp once it is clearly not a
+        // brief block by a closing door: a few rounds, or far enough to be obvious.
+        if (++this.noRouteRounds >= 4 || distanceSquared > 12.0D * 12.0D) {
+            lumen.teleportNear(target.getBlockPos());
+            this.noRouteRounds = 0;
         }
     }
 }

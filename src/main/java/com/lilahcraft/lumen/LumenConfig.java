@@ -107,7 +107,11 @@ public final class LumenConfig {
 
     // --------------------------------------------------------------- inventory
 
-    /** Chest sized (27) or double chest sized (54); nothing else can be displayed. */
+    /**
+     * Slots in Lumen's pack: 27 or 45. The pack screen adds a row underneath showing
+     * what Lumen is holding and wearing, so the screen is a 9x4 or 9x6 chest - the
+     * shapes a vanilla client can draw.
+     */
     public int inventorySize = 27;
 
     /** Eat from the pack when hurt. Lumen has no hunger bar; food simply heals. */
@@ -285,9 +289,9 @@ public final class LumenConfig {
         awarenessEntityRadius = clamp(awarenessEntityRadius, 0.0D, 128.0D);
         stuckRepathTicks = (int) clamp(stuckRepathTicks, 20, 1200);
         stuckTeleportTicks = (int) clamp(stuckTeleportTicks, stuckRepathTicks + 20, 2400);
-        // Shown in a vanilla chest screen, and only the 9x3 and 9x6 variants can be
-        // handed an existing inventory - so it is one size or the other.
-        inventorySize = inventorySize > 27 ? 54 : 27;
+        // Shown in a vanilla chest screen with an equipment row underneath, so the
+        // pack itself is 27 (9x4 screen) or 45 (9x6 screen). Older configs said 54.
+        inventorySize = inventorySize > 27 ? 45 : 27;
         eatHealthFraction = clamp(eatHealthFraction, 0.0D, 1.0D);
         pickUpRadius = clamp(pickUpRadius, 0.0D, 32.0D);
         miningRadius = clamp(miningRadius, 0.0D, 32.0D);

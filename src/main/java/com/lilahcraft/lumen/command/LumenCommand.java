@@ -11,7 +11,10 @@ import com.mojang.brigadier.context.CommandContext;
 import com.mojang.brigadier.exceptions.CommandSyntaxException;
 import net.minecraft.block.BlockState;
 import net.minecraft.command.argument.EntityArgumentType;
-import net.minecraft.entity.ai.pathing.NavigationType;
+import net.minecraft.entity.ai.pathing.LandPathNodeMaker;
+import net.minecraft.entity.ai.pathing.Path;
+import net.minecraft.entity.ai.pathing.PathNode;
+import net.minecraft.entity.ai.pathing.PathNodeType;
 import net.minecraft.entity.EquipmentSlot;
 import net.minecraft.inventory.SimpleInventory;
 import net.minecraft.item.ItemStack;
@@ -23,6 +26,9 @@ import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.text.Text;
 import net.minecraft.util.Formatting;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Direction;
+import net.minecraft.util.math.MathHelper;
+import net.minecraft.util.shape.VoxelShape;
 import net.minecraft.world.World;
 
 import java.util.ArrayList;
@@ -63,6 +69,10 @@ public final class LumenCommand {
                         .executes(LumenCommand::inventory))
                 .then(CommandManager.literal("drop")
                         .executes(LumenCommand::drop))
+                .then(CommandManager.literal("give")
+                        .executes(LumenCommand::drop)
+                        .then(CommandManager.argument("item", StringArgumentType.greedyString())
+                                .executes(LumenCommand::give)))
                 .then(CommandManager.literal("why")
                         .executes(LumenCommand::why))
                 .then(CommandManager.literal("debug")
@@ -293,16 +303,47 @@ public final class LumenCommand {
         return flat.length() <= 160 ? flat : flat.substring(0, 157) + "...";
     }
 
-    /** Hands everything back: pack, worn gear and anything not yet delivered. */
-    private static int drop(CommandContext<ServerCommandSource> context) {
+    /**
+     * Hands everything back: pack, worn gear and anything not yet delivered. Straight
+     * into the player's inventory - on the ground it was Lumen's again within a tick.
+     */
+    private static int drop(CommandContext<ServerCommandSource> context) throws CommandSyntaxException {
+        return handOver(context, null);
+    }
+
+    /** Hands one kind of thing back: {@code /lumen give sword}. */
+    private static int give(CommandContext<ServerCommandSource> context) throws CommandSyntaxException {
+        return handOver(context, StringArgumentType.getString(context, "item"));
+    }
+
+    private static int handOver(CommandContext<ServerCommandSource> context, String item)
+            throws CommandSyntaxException {
         ServerCommandSource source = context.getSource();
+        ServerPlayerEntity player = source.getPlayerOrThrow();
         LumenEntity lumen = requireLumen(source);
         if (lumen == null) {
             return 0;
         }
-        int dropped = lumen.dropEverything();
-        source.sendFeedback(() -> Text.literal(Lumen.config().companionName
-                + (dropped == 0 ? " has nothing to give back." : " drops " + dropped + " stack(s)."))
+        String name = Lumen.config().companionName;
+        boolean everything = ChestFinder.meansEverything(item);
+        if (!everything && !lumen.isCarrying(item)) {
+            source.sendError(Text.literal(name + " has no " + item.trim() + "."));
+            return 0;
+        }
+        LumenEntity.HandoverResult result = lumen.requestHandover(player, everything ? null : item);
+        if (result == null) {
+            source.sendFeedback(() -> Text.literal(name + " is coming over with "
+                    + (everything ? "everything." : "the " + item.trim() + ".")).formatted(Formatting.AQUA), false);
+            return 1;
+        }
+        if (result.stacks() == 0) {
+            source.sendFeedback(() -> Text.literal(name + " has nothing to give back.")
+                    .formatted(Formatting.AQUA), false);
+            return 1;
+        }
+        source.sendFeedback(() -> Text.literal(name + " hands over " + result.stacks() + " stack(s)"
+                + (result.what().isEmpty() ? "" : " - " + result.what())
+                + (result.droppedSome() ? ". Your inventory is full, so some of it is on the ground." : "."))
                 .formatted(Formatting.AQUA), false);
         return 1;
     }
@@ -344,13 +385,17 @@ public final class LumenCommand {
             source.sendError(Text.literal("Chest access is turned off in the config."));
             return 0;
         }
-        if (!lumen.startFetch(player, query)) {
-            source.sendError(Text.literal("No container within "
-                    + Math.round(Lumen.config().chestSearchRadius) + " blocks has \"" + query + "\"."));
+        ChestFinder.Request request = ChestFinder.parseRequest(query, Lumen.config().defaultFetchCount);
+        if (!lumen.startFetch(player, request)) {
+            source.sendError(Text.literal(lumen.fetchSawUnreachable()
+                    ? "A container within " + Math.round(Lumen.config().chestSearchRadius) + " blocks has \""
+                            + request.query() + "\", but " + Lumen.config().companionName + " cannot path to it."
+                    : "No container within " + Math.round(Lumen.config().chestSearchRadius) + " blocks has \""
+                            + request.query() + "\"."));
             return 0;
         }
         source.sendFeedback(() -> Text.literal(Lumen.config().companionName
-                + " goes looking for " + query + ".").formatted(Formatting.AQUA), false);
+                + " goes looking for " + ChestFinder.describeRequest(request) + ".").formatted(Formatting.AQUA), false);
         return 1;
     }
 
@@ -377,9 +422,13 @@ public final class LumenCommand {
     }
 
     /**
-     * Explains why Lumen is not going anywhere, and names the blocks around it that
-     * vanilla pathfinding refuses to route through. In a modded pack that list is the
-     * fastest way to find out which mod's blocks are the problem.
+     * Explains why Lumen is not going anywhere.
+     *
+     * <p>Runs a real path test to wherever Lumen is trying to get to and reports where
+     * the path actually ends, then names the blocks around Lumen's feet by the verdict
+     * vanilla pathfinding gives each one. Slabs, stairs and carpets are called out as
+     * half blocks it steps over rather than lumped in with walls - v0.5 listed the
+     * slab floor Lumen was standing on as "solid", which read as the culprit.
      */
     private static int why(CommandContext<ServerCommandSource> context) {
         ServerCommandSource source = context.getSource();
@@ -389,37 +438,121 @@ public final class LumenCommand {
         }
         World world = lumen.getWorld();
         BlockPos origin = lumen.getBlockPos();
+        // Vanilla plans from floor(y + 0.5): standing on a bottom slab at 97.5 means
+        // the node is 98, the air above the slab, not the slab block itself.
+        int nodeY = MathHelper.floor(lumen.getY() + 0.5D);
         boolean idle = lumen.getNavigation().isIdle();
 
         source.sendFeedback(() -> Text.literal(Lumen.config().companionName + " is "
                 + lumen.describeActivity() + "; navigation is "
                 + (idle ? "idle (no path)" : "walking a path")
-                + " at " + origin.toShortString()).formatted(Formatting.GRAY), false);
+                + " at " + origin.toShortString() + " (y=" + String.format("%.2f", lumen.getY())
+                + ", " + (lumen.isOnGround() ? "on the ground" : "not on the ground") + ")")
+                .formatted(Formatting.GRAY), false);
 
-        Set<String> blockers = new LinkedHashSet<>();
-        for (int dx = -2; dx <= 2; dx++) {
-            for (int dy = 0; dy <= 1; dy++) {
-                for (int dz = -2; dz <= 2; dz++) {
-                    BlockPos pos = origin.add(dx, dy, dz);
-                    BlockState state = world.getBlockState(pos);
-                    if (state.isAir() || state.canPathfindThrough(world, pos, NavigationType.LAND)) {
-                        continue;
+        // The path test: the honest answer to "can it get there".
+        BlockPos target = lumen.currentTarget();
+        String targetLabel = "its target";
+        if (target == null && source.getEntity() instanceof ServerPlayerEntity player
+                && player.getWorld() == world) {
+            target = player.getBlockPos();
+            targetLabel = "you";
+        }
+        if (target != null) {
+            BlockPos goal = lumen.canStandAt(target) ? target : lumen.findApproach(target);
+            BlockPos finalGoal = goal == null ? target : goal;
+            String label = targetLabel;
+            if (!lumen.isOnGround()) {
+                source.sendFeedback(() -> Text.literal("Path test skipped: it is not on the ground, and vanilla "
+                        + "will not plan a path mid-air.").formatted(Formatting.YELLOW), false);
+            } else {
+                Path path = lumen.getNavigation().findPathTo(finalGoal, 1);
+                if (path == null) {
+                    source.sendFeedback(() -> Text.literal("Path test to " + label + " at "
+                            + finalGoal.toShortString() + ": NO PATH at all.").formatted(Formatting.YELLOW), false);
+                } else {
+                    PathNode end = path.getEnd();
+                    String endText = end == null ? "nowhere" : end.x + ", " + end.y + ", " + end.z;
+                    double short_ = end == null ? -1 : Math.sqrt(finalGoal.getSquaredDistance(
+                            new BlockPos(end.x, end.y, end.z)));
+                    source.sendFeedback(() -> Text.literal("Path test to " + label + " at "
+                            + finalGoal.toShortString() + ": " + path.getLength() + " node(s), "
+                            + (path.reachesTarget() ? "reaches it" : "does NOT reach it")
+                            + ", ends at " + endText
+                            + (path.reachesTarget() || short_ < 0 ? "" : " (" + Math.round(short_) + " blocks short)"))
+                            .formatted(path.reachesTarget() ? Formatting.GREEN : Formatting.YELLOW), false);
+                    if (!path.reachesTarget() && end != null) {
+                        describeSurroundings(source, world, new BlockPos(end.x, end.y, end.z),
+                                "Where the path gives up");
                     }
-                    boolean walkThroughAnyway = state.getCollisionShape(world, pos).isEmpty();
-                    blockers.add(Registries.BLOCK.getId(state.getBlock())
-                            + (walkThroughAnyway ? " (no collision - Lumen passes it anyway)" : " (solid)"));
                 }
             }
         }
-        // "solid" on a wall block is correct and expected; it is only worth reporting
-        // so an actual obstruction can be told apart from ordinary geometry.
-        String summary = blockers.isEmpty()
-                ? "Nothing within 2 blocks is blocking movement."
-                : "Not walkable through (solid ones are normal walls, and containers are "
-                        + "approached from the side rather than entered): "
-                        + blockers.stream().limit(10).reduce((a, b) -> a + ", " + b).orElse("");
-        source.sendFeedback(() -> Text.literal(summary).formatted(Formatting.DARK_GRAY), false);
+        describeSurroundings(source, world, new BlockPos(origin.getX(), nodeY, origin.getZ()), "Around its feet");
         return 1;
+    }
+
+    /** Names the blocks around {@code center} by what the pathfinder makes of them. */
+    private static void describeSurroundings(ServerCommandSource source, World world, BlockPos center,
+                                             String heading) {
+        Set<String> blockers = new LinkedHashSet<>();
+        Set<String> steps = new LinkedHashSet<>();
+        Set<String> passable = new LinkedHashSet<>();
+        for (int dx = -2; dx <= 2; dx++) {
+            for (int dy = 0; dy <= 1; dy++) {
+                for (int dz = -2; dz <= 2; dz++) {
+                    BlockPos pos = center.add(dx, dy, dz);
+                    BlockState state = world.getBlockState(pos);
+                    if (state.isAir()) {
+                        continue;
+                    }
+                    String id = Registries.BLOCK.getId(state.getBlock()).toString();
+                    PathNodeType type = LandPathNodeMaker.getLandNodeType(world, new BlockPos.Mutable(
+                            pos.getX(), pos.getY(), pos.getZ()));
+                    VoxelShape shape = state.getCollisionShape(world, pos);
+                    switch (type) {
+                        case BLOCKED -> {
+                            if (shape.isEmpty()) {
+                                passable.add(id + " (no collision - Lumen passes it anyway)");
+                            } else if (shape.getMax(Direction.Axis.Y) <= 0.6D) {
+                                steps.add(id + " (half block - steps onto it)");
+                            } else {
+                                blockers.add(id + " (solid)");
+                            }
+                        }
+                        case FENCE -> {
+                            if (state.getBlock() instanceof net.minecraft.block.FenceGateBlock) {
+                                steps.add(id + " (gate - Lumen opens it)");
+                            } else {
+                                blockers.add(id + " (fence or wall - cannot cross)");
+                            }
+                        }
+                        case DOOR_IRON_CLOSED -> blockers.add(id + " (iron door - cannot open)");
+                        case DOOR_WOOD_CLOSED, DOOR_OPEN, WALKABLE_DOOR -> steps.add(id + " (door - opens it)");
+                        case LAVA, DAMAGE_FIRE, DAMAGE_CACTUS, DAMAGE_OTHER -> blockers.add(id + " (avoids: "
+                                + type.name().toLowerCase(java.util.Locale.ROOT) + ")");
+                        default -> passable.add(id + " (" + type.name().toLowerCase(java.util.Locale.ROOT) + ")");
+                    }
+                }
+            }
+        }
+        if (blockers.isEmpty() && steps.isEmpty()) {
+            source.sendFeedback(() -> Text.literal(heading + " (" + center.toShortString()
+                    + "): nothing is blocking movement.").formatted(Formatting.DARK_GRAY), false);
+            return;
+        }
+        source.sendFeedback(() -> Text.literal(heading + " (" + center.toShortString() + "):")
+                .formatted(Formatting.DARK_GRAY), false);
+        if (!blockers.isEmpty()) {
+            source.sendFeedback(() -> Text.literal("  impassable (walls are normal; containers are approached "
+                    + "from the side): " + blockers.stream().limit(10).reduce((a, b) -> a + ", " + b).orElse(""))
+                    .formatted(Formatting.DARK_GRAY), false);
+        }
+        if (!steps.isEmpty()) {
+            source.sendFeedback(() -> Text.literal("  walkable: "
+                    + steps.stream().limit(10).reduce((a, b) -> a + ", " + b).orElse(""))
+                    .formatted(Formatting.DARK_GRAY), false);
+        }
     }
 
     private static int follow(CommandContext<ServerCommandSource> context, ServerPlayerEntity target) {
