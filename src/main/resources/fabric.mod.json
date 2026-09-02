@@ -1,0 +1,28 @@
+{
+	"schemaVersion": 1,
+	"id": "lumen",
+	"version": "${version}",
+	"name": "Lumen",
+	"description": "A server-side AI companion NPC driven by a local Ollama model. Lumen talks in chat, follows you around and pathfinds with vanilla navigation, and needs nothing installed on the client.",
+	"authors": [
+		"Dierks"
+	],
+	"contact": {
+		"homepage": "https://github.com/Dierks27/Lumen",
+		"sources": "https://github.com/Dierks27/Lumen",
+		"issues": "https://github.com/Dierks27/Lumen/issues"
+	},
+	"license": "MIT",
+	"environment": "*",
+	"entrypoints": {
+		"main": [
+			"com.lilahcraft.lumen.Lumen"
+		]
+	},
+	"depends": {
+		"fabricloader": ">=0.15.0",
+		"minecraft": "~1.20.1",
+		"java": ">=17",
+		"fabric-api": "*"
+	}
+}
