@@ -120,6 +120,12 @@ public final class LumenConfig {
     /** How far Lumen will look for a container holding what was asked for. */
     public double chestSearchRadius = 16.0D;
 
+    /**
+     * How far away a remembered container is still worth walking to. Larger than the
+     * search radius on purpose: Lumen knows exactly where this one is.
+     */
+    public double memoryRecallRadius = 64.0D;
+
     /** Most stacks Lumen will take out of a container in one errand. */
     public int maxFetchStacks = 3;
 
@@ -248,6 +254,7 @@ public final class LumenConfig {
         inventorySize = (int) clamp(inventorySize, 1, 54);
         pickUpRadius = clamp(pickUpRadius, 0.0D, 32.0D);
         chestSearchRadius = clamp(chestSearchRadius, 0.0D, 64.0D);
+        memoryRecallRadius = clamp(memoryRecallRadius, 0.0D, 256.0D);
         maxFetchStacks = (int) clamp(maxFetchStacks, 1, 27);
         attackDamage = clamp(attackDamage, 0.0D, 100.0D);
         defendRadius = clamp(defendRadius, 0.0D, 64.0D);

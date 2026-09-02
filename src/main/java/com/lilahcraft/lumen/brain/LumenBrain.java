@@ -5,6 +5,7 @@ import com.lilahcraft.lumen.LumenConfig;
 import com.lilahcraft.lumen.entity.LumenEntity;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.network.ServerPlayerEntity;
+import net.minecraft.server.world.ServerWorld;
 import net.minecraft.util.math.BlockPos;
 
 import java.util.ArrayDeque;
@@ -253,7 +254,11 @@ public final class LumenBrain {
         List<ChatMessage> messages = new ArrayList<>();
         messages.add(ChatMessage.system(buildSystemPrompt(config)));
         messages.addAll(history);
-        messages.add(ChatMessage.user(WorldSnapshot.describe(lumen, config) + "\n" + senderName + " says: " + text));
+        String snapshot = WorldSnapshot.describe(lumen, config);
+        String recalled = lumen.getWorld() instanceof ServerWorld world
+                ? Lumen.memory().describe(world.getRegistryKey().getValue(), lumen.getBlockPos(), 6)
+                : "";
+        messages.add(ChatMessage.user(snapshot + recalled + "\n" + senderName + " says: " + text));
         return messages;
     }
 
@@ -278,7 +283,10 @@ public final class LumenBrain {
                 + "the next message: the blocks, mobs, players and items around you, the time, the "
                 + "weather, the biome, what you are carrying. Talk about those. If something is not "
                 + "listed there, you cannot see it - do not mention it, and never invent places, "
-                + "structures, items or things that happened. Saying you are not sure is fine.";
+                + "structures, items or things that happened. Saying you are not sure is fine.\n\n"
+                + "If a [what you remember from before] block is present, those are places you have "
+                + "actually fetched things from and you may talk about them. When someone asks for "
+                + "something you have found before, you already know where to look - say so.";
     }
 
 }

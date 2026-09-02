@@ -51,7 +51,9 @@ import net.minecraft.world.World;
 import org.jetbrains.annotations.Nullable;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -89,6 +91,9 @@ public class LumenEntity extends PathAwareEntity {
     private String fetchQuery;
     private UUID deliverTo;
     private final List<ItemStack> pendingDelivery = new ArrayList<>();
+    /** Containers already checked on this errand, so a retry does not loop back. */
+    private final Set<BlockPos> triedContainers = new HashSet<>();
+    private int fetchAttempts;
 
     private Vec3d lastProgressPos;
     private int stuckTicks;
@@ -231,6 +236,8 @@ public class LumenEntity extends PathAwareEntity {
         this.destination = null;
         this.fetchChest = null;
         this.fetchQuery = null;
+        this.triedContainers.clear();
+        this.fetchAttempts = 0;
         this.stuckTicks = 0;
         this.getNavigation().stop();
         // pendingDelivery survives: whatever Lumen fetched still belongs to whoever
@@ -247,18 +254,52 @@ public class LumenEntity extends PathAwareEntity {
         if (!config.allowChestAccess || !(this.getWorld() instanceof ServerWorld world)) {
             return false;
         }
+        this.fetchQuery = query;
+        this.deliverTo = requester.getUuid();
+        this.triedContainers.clear();
+        this.fetchAttempts = 0;
+        this.followTarget = null;
+        this.destination = null;
+        this.stuckTicks = 0;
+        return targetNextContainer(world);
+    }
+
+    /**
+     * Picks where to look next: somewhere Lumen has found this before, otherwise a
+     * fresh search. Remembered spots that no longer hold the item are forgotten as
+     * they are ruled out, so the memory stays honest as chests get emptied.
+     *
+     * @return false when there is nowhere left to try
+     */
+    private boolean targetNextContainer(ServerWorld world) {
+        LumenConfig config = Lumen.config();
+        Identifier dimension = world.getRegistryKey().getValue();
+
+        for (BlockPos remembered : Lumen.memory().recall(fetchQuery, dimension, this.getBlockPos(),
+                config.memoryRecallRadius, triedContainers)) {
+            if (!world.isChunkLoaded(remembered.getX() >> 4, remembered.getZ() >> 4)) {
+                // Cannot check from here, but Lumen knows the way - go and look.
+                this.mode = Mode.FETCH;
+                this.fetchChest = remembered;
+                return true;
+            }
+            if (world.getBlockEntity(remembered) instanceof Inventory inventory
+                    && ChestFinder.containsMatch(inventory, fetchQuery)) {
+                this.mode = Mode.FETCH;
+                this.fetchChest = remembered;
+                return true;
+            }
+            Lumen.memory().forgetContainer(dimension, remembered);
+            this.triedContainers.add(remembered);
+        }
+
         ChestFinder.Match match = ChestFinder.findContainerWith(
-                world, this.getBlockPos(), config.chestSearchRadius, query);
+                world, this.getBlockPos(), config.chestSearchRadius, fetchQuery, triedContainers);
         if (match == null) {
             return false;
         }
         this.mode = Mode.FETCH;
         this.fetchChest = match.pos();
-        this.fetchQuery = query;
-        this.deliverTo = requester.getUuid();
-        this.followTarget = null;
-        this.destination = null;
-        this.stuckTicks = 0;
         return true;
     }
 
@@ -279,34 +320,51 @@ public class LumenEntity extends PathAwareEntity {
         LumenConfig config = Lumen.config();
         BlockPos chest = this.fetchChest;
         String query = this.fetchQuery;
-        PlayerEntity requester = deliverTo == null ? null : this.getWorld().getPlayerByUuid(deliverTo);
         this.fetchChest = null;
-        this.fetchQuery = null;
-        if (chest == null || query == null) {
+        if (chest == null || query == null || !(this.getWorld() instanceof ServerWorld world)) {
             stopAndIdle();
             return;
         }
+        Identifier dimension = world.getRegistryKey().getValue();
+        this.triedContainers.add(chest);
+        this.fetchAttempts++;
 
         int taken = 0;
-        if (this.getWorld().getBlockEntity(chest) instanceof Inventory inventory) {
-            this.getWorld().playSound(null, chest, SoundEvents.BLOCK_CHEST_OPEN,
-                    SoundCategory.BLOCKS, 0.6F, 1.0F);
+        if (world.getBlockEntity(chest) instanceof Inventory inventory) {
+            world.playSound(null, chest, SoundEvents.BLOCK_CHEST_OPEN, SoundCategory.BLOCKS, 0.6F, 1.0F);
             for (int slot = 0; slot < inventory.size() && taken < config.maxFetchStacks; slot++) {
                 ItemStack stack = inventory.getStack(slot);
                 if (ChestFinder.matches(stack, query)) {
-                    pendingDelivery.add(inventory.removeStack(slot));
-                    taken++;
+                    ItemStack removed = inventory.removeStack(slot);
+                    if (!removed.isEmpty()) {
+                        pendingDelivery.add(removed);
+                        // Learned: this container is where that item lives.
+                        Lumen.memory().rememberContainer(query,
+                                Registries.ITEM.getId(removed.getItem()), dimension, chest);
+                        taken++;
+                    }
                 }
             }
             inventory.markDirty();
-            this.getWorld().playSound(null, chest, SoundEvents.BLOCK_CHEST_CLOSE,
-                    SoundCategory.BLOCKS, 0.6F, 1.0F);
+            world.playSound(null, chest, SoundEvents.BLOCK_CHEST_CLOSE, SoundCategory.BLOCKS, 0.6F, 1.0F);
         }
+
+        PlayerEntity requester = deliverTo == null ? null : world.getPlayerByUuid(deliverTo);
         // Taking from someone's storage is worth an audit line in the server log.
         Lumen.LOGGER.info("Lumen took {} stack(s) matching '{}' from the container at {} for {}",
                 taken, query, chest.toShortString(),
                 requester == null ? "nobody" : requester.getName().getString());
 
+        if (taken == 0) {
+            // The memory was stale, or somebody emptied it. Forget it and look elsewhere,
+            // but only a few times so a wrong query cannot send Lumen on a tour.
+            Lumen.memory().forgetContainer(dimension, chest);
+            if (this.fetchAttempts < 3 && targetNextContainer(world)) {
+                return;
+            }
+        }
+
+        this.fetchQuery = null;
         if (requester != null) {
             followPlayer(requester);
         } else {

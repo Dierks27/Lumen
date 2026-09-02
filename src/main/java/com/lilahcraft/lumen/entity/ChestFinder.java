@@ -16,6 +16,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Finds a nearby container holding what somebody asked for.
@@ -35,7 +36,8 @@ public final class ChestFinder {
     }
 
     @Nullable
-    public static Match findContainerWith(ServerWorld world, BlockPos center, double radius, String query) {
+    public static Match findContainerWith(ServerWorld world, BlockPos center, double radius, String query,
+                                          Set<BlockPos> exclude) {
         if (query == null || query.isBlank() || radius <= 0.0D) {
             return null;
         }
@@ -53,7 +55,8 @@ public final class ChestFinder {
                 for (Map.Entry<BlockPos, BlockEntity> entry : chunk.getBlockEntities().entrySet()) {
                     BlockPos pos = entry.getKey();
                     double distanceSquared = pos.getSquaredDistance(center);
-                    if (distanceSquared > radiusSquared || !(entry.getValue() instanceof Inventory inventory)) {
+                    if (distanceSquared > radiusSquared || exclude.contains(pos)
+                            || !(entry.getValue() instanceof Inventory inventory)) {
                         continue;
                     }
                     Boolean exact = bestMatchIn(inventory, query);
@@ -68,6 +71,11 @@ public final class ChestFinder {
                 .min(Comparator.comparing(Match::exact).reversed()
                         .thenComparingDouble(Match::distanceSquared))
                 .orElse(null);
+    }
+
+    /** Whether this container holds anything matching the query right now. */
+    public static boolean containsMatch(Inventory inventory, String query) {
+        return bestMatchIn(inventory, query) != null;
     }
 
     /** @return TRUE for an exact id match, FALSE for a fuzzy one, null for no match */

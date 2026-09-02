@@ -2,6 +2,7 @@ package com.lilahcraft.lumen;
 
 import com.lilahcraft.lumen.brain.LumenBrain;
 import com.lilahcraft.lumen.command.LumenCommand;
+import com.lilahcraft.lumen.memory.LumenMemory;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
@@ -24,6 +25,7 @@ public final class Lumen implements ModInitializer {
 
     private static final LumenManager MANAGER = new LumenManager();
     private static final LumenBrain BRAIN = new LumenBrain();
+    private static final LumenMemory MEMORY = new LumenMemory();
     private static volatile LumenConfig config = LumenConfig.defaults();
 
     public static LumenConfig config() {
@@ -38,6 +40,11 @@ public final class Lumen implements ModInitializer {
         return BRAIN;
     }
 
+    /** What Lumen has learned and keeps between restarts. */
+    public static LumenMemory memory() {
+        return MEMORY;
+    }
+
     public static LumenConfig reloadConfig() {
         config = LumenConfig.loadOrCreate();
         return config;
@@ -46,6 +53,7 @@ public final class Lumen implements ModInitializer {
     @Override
     public void onInitialize() {
         config = LumenConfig.loadOrCreate();
+        MEMORY.load();
         LOGGER.info("Lumen ready - model {} at {}", config.model, config.ollamaUrl);
 
         CommandRegistrationCallback.EVENT.register(
@@ -63,6 +71,7 @@ public final class Lumen implements ModInitializer {
         ServerLifecycleEvents.SERVER_STOPPING.register(server -> {
             MANAGER.despawn(server);
             BRAIN.shutdown();
+            MEMORY.save();
         });
     }
 

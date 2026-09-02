@@ -60,6 +60,11 @@ public final class LumenCommand {
                         .executes(LumenCommand::inventory))
                 .then(CommandManager.literal("why")
                         .executes(LumenCommand::why))
+                .then(CommandManager.literal("memory")
+                        .executes(LumenCommand::memory))
+                .then(CommandManager.literal("forget")
+                        .requires(LumenCommand::isAdmin)
+                        .executes(LumenCommand::forget))
                 .then(CommandManager.literal("find")
                         .then(CommandManager.argument("item", StringArgumentType.greedyString())
                                 .executes(LumenCommand::find)))
@@ -204,6 +209,31 @@ public final class LumenCommand {
         String summary = lines.isEmpty() ? "nothing at all" : String.join(", ", lines);
         source.sendFeedback(() -> Text.literal(Lumen.config().companionName + " is carrying " + summary)
                 .formatted(Formatting.GRAY), false);
+        return 1;
+    }
+
+    private static int memory(CommandContext<ServerCommandSource> context) {
+        ServerCommandSource source = context.getSource();
+        List<String> lines = Lumen.memory().lines(15);
+        if (lines.isEmpty()) {
+            source.sendFeedback(() -> Text.literal(Lumen.config().companionName
+                    + " has not found anything worth remembering yet.").formatted(Formatting.GRAY), false);
+            return 1;
+        }
+        source.sendFeedback(() -> Text.literal(Lumen.config().companionName + " remembers "
+                + Lumen.memory().size() + " place(s):").formatted(Formatting.AQUA), false);
+        for (String line : lines) {
+            source.sendFeedback(() -> Text.literal("  " + line).formatted(Formatting.GRAY), false);
+        }
+        return 1;
+    }
+
+    private static int forget(CommandContext<ServerCommandSource> context) {
+        ServerCommandSource source = context.getSource();
+        int had = Lumen.memory().size();
+        Lumen.memory().clear();
+        source.sendFeedback(() -> Text.literal("Cleared " + had + " remembered place(s).")
+                .formatted(Formatting.GRAY), true);
         return 1;
     }
 
