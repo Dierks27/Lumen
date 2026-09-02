@@ -55,7 +55,8 @@ public class LumenFetchGoal extends Goal {
         if (chest == null) {
             return;
         }
-        if (lumen.getBlockPos().isWithinDistance(chest, 2.5D)) {
+        // Standing on a neighbouring block leaves Lumen ~1.5 blocks away diagonally.
+        if (lumen.getBlockPos().isWithinDistance(chest, 3.0D)) {
             lumen.collectFromChest();
             return;
         }
@@ -63,9 +64,8 @@ public class LumenFetchGoal extends Goal {
             return;
         }
         this.repathCountdown = this.getTickCount(15);
-        boolean moving = lumen.getNavigation().startMovingTo(
-                chest.getX() + 0.5D, chest.getY(), chest.getZ() + 0.5D,
-                Lumen.config().followSpeedMultiplier);
+        // A chest is a solid block: pathing at it finds no node and reports failure.
+        boolean moving = lumen.moveToBlock(chest, Lumen.config().followSpeedMultiplier);
         if (!moving && lumen.getNavigation().isIdle() && giveUpTicks > 40) {
             // Cannot get to it at all; give up rather than stand there forever.
             lumen.stopAndIdle();

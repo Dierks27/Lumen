@@ -103,6 +103,12 @@ public final class LumenConfig {
 
     public int inventorySize = 27;
 
+    /** Eat from the pack when hurt. Lumen has no hunger bar; food simply heals. */
+    public boolean eatWhenHurt = true;
+
+    /** Eat once health drops below this fraction of maximum. */
+    public double eatHealthFraction = 0.6D;
+
     /** Right-clicking Lumen while holding something hands it over. */
     public boolean acceptItemsFromPlayers = true;
 
@@ -251,7 +257,10 @@ public final class LumenConfig {
         awarenessEntityRadius = clamp(awarenessEntityRadius, 0.0D, 128.0D);
         stuckRepathTicks = (int) clamp(stuckRepathTicks, 20, 1200);
         stuckTeleportTicks = (int) clamp(stuckTeleportTicks, stuckRepathTicks + 20, 2400);
-        inventorySize = (int) clamp(inventorySize, 1, 54);
+        // The inventory is shown in a vanilla container screen, which comes in rows
+        // of nine, so anything else would leave unreachable slots.
+        inventorySize = (int) clamp(Math.round(inventorySize / 9.0D) * 9, 9, 54);
+        eatHealthFraction = clamp(eatHealthFraction, 0.0D, 1.0D);
         pickUpRadius = clamp(pickUpRadius, 0.0D, 32.0D);
         chestSearchRadius = clamp(chestSearchRadius, 0.0D, 64.0D);
         memoryRecallRadius = clamp(memoryRecallRadius, 0.0D, 256.0D);

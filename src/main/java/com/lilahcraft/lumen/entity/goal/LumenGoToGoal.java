@@ -66,9 +66,7 @@ public class LumenGoToGoal extends Goal {
         }
         this.repathCountdown = this.getTickCount(20);
 
-        boolean moving = lumen.getNavigation().startMovingTo(
-                destination.getX() + 0.5D, destination.getY(), destination.getZ() + 0.5D,
-                Lumen.config().followSpeedMultiplier);
+        boolean moving = lumen.moveToBlock(destination, Lumen.config().followSpeedMultiplier);
         if (!moving && lumen.getNavigation().isIdle()) {
             // Unreachable - stop pretending and go back to idling.
             lumen.stopAndIdle();
