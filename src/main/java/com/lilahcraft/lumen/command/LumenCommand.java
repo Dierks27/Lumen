@@ -529,9 +529,14 @@ public final class LumenCommand {
                         }
                         case DOOR_IRON_CLOSED -> blockers.add(id + " (iron door - cannot open)");
                         case DOOR_WOOD_CLOSED, DOOR_OPEN, WALKABLE_DOOR -> steps.add(id + " (door - opens it)");
-                        case LAVA, DAMAGE_FIRE, DAMAGE_CACTUS, DAMAGE_OTHER -> blockers.add(id + " (avoids: "
-                                + type.name().toLowerCase(java.util.Locale.ROOT) + ")");
-                        default -> passable.add(id + " (" + type.name().toLowerCase(java.util.Locale.ROOT) + ")");
+                        default -> {
+                            String name = type.name().toLowerCase(java.util.Locale.ROOT);
+                            if (type == PathNodeType.LAVA || name.startsWith("damage")) {
+                                blockers.add(id + " (avoids: " + name + ")");
+                            } else {
+                                passable.add(id + " (" + name + ")");
+                            }
+                        }
                     }
                 }
             }

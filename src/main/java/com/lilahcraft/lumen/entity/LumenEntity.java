@@ -66,6 +66,7 @@ import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.EntityView;
 import net.minecraft.world.World;
 import org.jetbrains.annotations.Nullable;
 
@@ -311,6 +312,15 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
             return null;
         }
         return this.getWorld().getPlayerByUuid(uuid);
+    }
+
+    /**
+     * The third method of {@code Tameable}, unnamed in the 1.20.1 yarn mappings: the
+     * world the owner is looked up in (Mojang's {@code OwnableEntity#level()}).
+     */
+    @Override
+    public EntityView method_48926() {
+        return this.getWorld();
     }
 
     // ---------------------------------------------------------------- behaviour
