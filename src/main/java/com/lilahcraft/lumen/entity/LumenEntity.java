@@ -442,6 +442,46 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         }
     }
 
+    @Nullable
+    public PlayerEntity getFollowTarget() {
+        if (getMode() != Mode.FOLLOW || followTarget == null) {
+            return null;
+        }
+        PlayerEntity player = this.getWorld().getPlayerByUuid(followTarget);
+        return player != null && player.isAlive() && player.getWorld() == this.getWorld() ? player : null;
+    }
+
+    @Nullable
+    public BlockPos getDestination() {
+        return getMode() == Mode.GO_TO ? destination : null;
+    }
+
+    /** Human readable state, fed to the model as part of the world snapshot. */
+    public String describeActivity() {
+        switch (getMode()) {
+            case FOLLOW -> {
+                PlayerEntity target = getFollowTarget();
+                return target == null ? "standing around" : "following " + target.getName().getString();
+            }
+            case GO_TO -> {
+                BlockPos pos = getDestination();
+                return pos == null ? "standing around"
+                        : "walking to " + pos.getX() + ", " + pos.getY() + ", " + pos.getZ();
+            }
+            case FETCH -> {
+                return fetchQuery == null ? "standing around"
+                        : "going to a nearby container to fetch " + fetchQuery;
+            }
+            case MINE -> {
+                return mineQuery == null ? "standing around"
+                        : "mining " + mineQuery + " (" + minedCount + " so far)";
+            }
+            default -> {
+                return "standing around";
+            }
+        }
+    }
+
     // ---------------------------------------------------------------- inventory
 
     public SimpleInventory getInventory() {
