@@ -47,7 +47,10 @@ server restart.
 
 ## Install
 
-1. Build the jar (or grab it from the `build` workflow artifacts):
+1. Grab `lumen-<version>.jar` from the
+   [latest release](https://github.com/Dierks27/Lumen/releases/latest).
+
+   Or build it yourself:
    ```
    ./gradlew build
    ```
@@ -182,6 +185,17 @@ Hard-won details that shaped this build:
 7. `OLLAMA_NUM_CTX=8192` leaves room for game state plus conversation.
 8. Responses take 5-15s under load - async with a 90s timeout.
 9. Windows Firewall must allow inbound 11434.
+
+## Releases
+
+Pushing a `v*` tag builds the mod and publishes a GitHub release with the jar
+attached:
+
+```
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+Keep `mod_version` in `gradle.properties` in step with the tag.
 
 ## Licence
 
