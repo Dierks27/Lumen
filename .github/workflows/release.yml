@@ -34,7 +34,11 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           if gh release view "$tag" >/dev/null 2>&1; then
             echo "needed=false" >> "$GITHUB_OUTPUT"
-            echo "Release $tag already exists, nothing to do."
+            # The jar is already published, but the notes are a file in this repo and
+            # may have been corrected since. Refreshing them costs a few seconds and
+            # needs no build, so a stale release page can be fixed without a version bump.
+            echo "refresh=true" >> "$GITHUB_OUTPUT"
+            echo "Release $tag already exists; will refresh its notes."
           else
             echo "needed=true" >> "$GITHUB_OUTPUT"
             echo "Release $tag does not exist yet, building it."
@@ -83,3 +87,13 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "Lumen $TAG" \
             --notes-file .github/release-body.md
+
+      - name: Refresh the notes on an existing release
+        if: steps.check.outputs.refresh == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.check.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release edit "$TAG" --notes-file .github/release-body.md
+          echo "Refreshed the notes on $TAG."
