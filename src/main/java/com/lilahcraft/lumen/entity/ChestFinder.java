@@ -73,6 +73,39 @@ public final class ChestFinder {
                 .orElse(null);
     }
 
+    /**
+     * Fills {@code searchable} and {@code skipped} with the block ids of nearby block
+     * entities, split by whether Lumen can read them. Modded storage that does not
+     * implement {@link Inventory} lands in skipped - which is exactly the list needed
+     * to decide what to add support for.
+     */
+    public static void describeNearby(ServerWorld world, BlockPos center, double radius,
+                                      List<String> searchable, List<String> skipped) {
+        double radiusSquared = radius * radius;
+        int chunkRadius = ((int) radius >> 4) + 1;
+        ChunkPos origin = new ChunkPos(center);
+        for (int cx = origin.x - chunkRadius; cx <= origin.x + chunkRadius; cx++) {
+            for (int cz = origin.z - chunkRadius; cz <= origin.z + chunkRadius; cz++) {
+                WorldChunk chunk = world.getChunkManager().getWorldChunk(cx, cz, false);
+                if (chunk == null) {
+                    continue;
+                }
+                for (Map.Entry<BlockPos, BlockEntity> entry : chunk.getBlockEntities().entrySet()) {
+                    if (entry.getKey().getSquaredDistance(center) > radiusSquared) {
+                        continue;
+                    }
+                    String id = Registries.BLOCK.getId(
+                            world.getBlockState(entry.getKey()).getBlock()).toString();
+                    if (entry.getValue() instanceof Inventory) {
+                        searchable.add(id);
+                    } else {
+                        skipped.add(id);
+                    }
+                }
+            }
+        }
+    }
+
     /** Whether this container holds anything matching the query right now. */
     public static boolean containsMatch(Inventory inventory, String query) {
         return bestMatchIn(inventory, query) != null;

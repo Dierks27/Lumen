@@ -40,6 +40,13 @@ ollama run qwen2.5:14b "hello"
 - `/lumen mine <block>` and `/lumen find <item>` send it off to work. Mining never
   breaks containers and is bounded by `maxMineBlocks`; set `allowMining: false` to
   disable it entirely.
+- **Combat is off by default.** v0.3.0 had an aggro leak that killed a player; the
+  path is closed four ways over in v0.3.1, but switching it back on should be your
+  choice. Set `combat: true` when you are ready.
+- `/lumen debug` shows what the model last replied, how the command was understood
+  and what became of it - the first thing to check if an instruction seems ignored.
+- `/lumen containers` lists nearby containers and which of them Lumen can search;
+  `/lumen drop` hands back everything it is carrying.
 - If Lumen gets stuck, `/lumen here` warps it to you and `/lumen why` names the blocks
   around it that vanilla pathfinding refuses to route through - that output is the
   fastest way to find the mod at fault.

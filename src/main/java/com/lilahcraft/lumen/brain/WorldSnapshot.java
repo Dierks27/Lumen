@@ -4,6 +4,7 @@ import com.lilahcraft.lumen.LumenConfig;
 import com.lilahcraft.lumen.entity.LumenEntity;
 import net.minecraft.block.BlockState;
 import net.minecraft.entity.Entity;
+import net.minecraft.entity.EquipmentSlot;
 import net.minecraft.entity.ItemEntity;
 import net.minecraft.entity.LivingEntity;
 import net.minecraft.entity.mob.HostileEntity;
@@ -87,10 +88,9 @@ public final class WorldSnapshot {
                 .append("/").append(Math.round(lumen.getMaxHealth()))
                 .append(". You are ").append(lumen.describeActivity()).append(".\n");
 
-        String carrying = describeCarrying(lumen);
-        if (carrying != null) {
-            out.append("- You are carrying ").append(carrying).append(".\n");
-        }
+        // Always present, even when empty, so "what have you got?" has an answer
+        // instead of the model inventing one.
+        out.append("- You are carrying ").append(describeCarrying(lumen)).append(".\n");
 
         String looking = lookingAt(lumen, world);
         if (looking != null) {
@@ -138,9 +138,12 @@ public final class WorldSnapshot {
 
     private static String describeCarrying(LumenEntity lumen) {
         List<String> parts = new ArrayList<>();
-        ItemStack held = lumen.getMainHandStack();
-        if (!held.isEmpty()) {
-            parts.add(held.getName().getString() + " in hand");
+        for (EquipmentSlot slot : EquipmentSlot.values()) {
+            ItemStack equipped = lumen.getEquippedStack(slot);
+            if (!equipped.isEmpty()) {
+                parts.add(equipped.getName().getString()
+                        + (slot == EquipmentSlot.MAINHAND ? " in hand" : " (" + slot.getName() + ")"));
+            }
         }
         int items = 0;
         Map<String, Integer> counts = new LinkedHashMap<>();
@@ -163,7 +166,7 @@ public final class WorldSnapshot {
         if (!delivering.isEmpty()) {
             parts.add(joinCounts(delivering, 4) + " to hand over to whoever asked for it");
         }
-        return parts.isEmpty() ? null : String.join(", ", parts);
+        return parts.isEmpty() ? "nothing at all" : String.join(", ", parts);
     }
 
     private static void appendEntities(StringBuilder out, LumenEntity lumen, ServerWorld world, LumenConfig config) {
