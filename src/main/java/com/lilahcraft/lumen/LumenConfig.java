@@ -43,6 +43,12 @@ public final class LumenConfig {
 
     public int maxTokens = 300;
 
+    /**
+     * Ask the server to guarantee the reply is valid JSON. Disabled automatically for
+     * the session if the Ollama build rejects it.
+     */
+    public boolean jsonMode = true;
+
     /** Generous: a cold model load plus generation can take a while (see README). */
     public int requestTimeoutSeconds = 90;
 
@@ -133,8 +139,11 @@ public final class LumenConfig {
      */
     public double memoryRecallRadius = 128.0D;
 
-    /** Most stacks Lumen will take out of a container in one errand. */
-    public int maxFetchStacks = 3;
+    /** How many items to fetch when the request does not say. */
+    public int defaultFetchCount = 64;
+
+    /** Hard ceiling on one errand, whatever was asked for. */
+    public int maxFetchItems = 640;
 
     // ------------------------------------------------------------------ mining
 
@@ -286,7 +295,8 @@ public final class LumenConfig {
         maxMineBlocks = (int) clamp(maxMineBlocks, 1, 64);
         chestSearchRadius = clamp(chestSearchRadius, 0.0D, 256.0D);
         memoryRecallRadius = clamp(memoryRecallRadius, 0.0D, 512.0D);
-        maxFetchStacks = (int) clamp(maxFetchStacks, 1, 27);
+        defaultFetchCount = (int) clamp(defaultFetchCount, 1, 2304);
+        maxFetchItems = (int) clamp(maxFetchItems, 1, 2304);
         attackDamage = clamp(attackDamage, 0.0D, 100.0D);
         defendRadius = clamp(defendRadius, 0.0D, 64.0D);
         adminPermissionLevel = (int) clamp(adminPermissionLevel, 0, 4);

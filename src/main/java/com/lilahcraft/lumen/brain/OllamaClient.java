@@ -29,6 +29,9 @@ public final class OllamaClient {
     private final ExecutorService executor;
     private final HttpClient http;
 
+    /** Cleared for the session if the server rejects the JSON response format. */
+    private volatile boolean jsonModeSupported = true;
+
     public OllamaClient(int connectTimeoutSeconds) {
         AtomicInteger counter = new AtomicInteger();
         this.executor = Executors.newFixedThreadPool(2, runnable -> {
@@ -52,7 +55,38 @@ public final class OllamaClient {
      *
      * @return the assistant's raw content, completed exceptionally on transport errors
      */
+    /**
+     * Sends a chat completion, asking the server to guarantee valid JSON where it can.
+     *
+     * <p>Older Ollama builds reject {@code response_format}; the first 400 disables it
+     * for the session and the request is retried without, rather than the companion
+     * simply going quiet.
+     */
     public CompletableFuture<String> complete(LumenConfig config, List<ChatMessage> messages) {
+        boolean useJsonMode = config.jsonMode && jsonModeSupported;
+        return send(config, messages, useJsonMode).exceptionallyCompose(error -> {
+            if (useJsonMode && isBadRequest(error)) {
+                jsonModeSupported = false;
+                Lumen.LOGGER.warn("Ollama rejected response_format; continuing without it. "
+                        + "Set jsonMode false in the config to skip this on future starts.");
+                return send(config, messages, false);
+            }
+            return CompletableFuture.failedFuture(error);
+        });
+    }
+
+    private static boolean isBadRequest(Throwable error) {
+        for (Throwable cause = error; cause != null; cause = cause.getCause()) {
+            String message = cause.getMessage();
+            if (message != null && message.contains("HTTP 400")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private CompletableFuture<String> send(LumenConfig config, List<ChatMessage> messages,
+                                           boolean jsonMode) {
         JsonObject body = new JsonObject();
         body.addProperty("model", config.model);
         body.addProperty("temperature", config.temperature);
@@ -67,6 +101,14 @@ public final class OllamaClient {
             array.add(entry);
         }
         body.add("messages", array);
+
+        if (jsonMode) {
+            // Guarantees the reply parses as JSON. It does not guarantee the fields are
+            // there - the prompt does that - but it removes a whole class of failure.
+            JsonObject format = new JsonObject();
+            format.addProperty("type", "json_object");
+            body.add("response_format", format);
+        }
 
         HttpRequest request;
         try {

@@ -17,6 +17,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Finds a nearby container holding what somebody asked for.
@@ -29,6 +31,55 @@ import java.util.Set;
 public final class ChestFinder {
 
     private ChestFinder() {
+    }
+
+    /**
+     * How much of what.
+     *
+     * <p>{@code count} is a plain number of items. {@code stacks} is non-zero when the
+     * amount was given in stacks, and has to be resolved against the item itself: a
+     * stack is as many as fit in one slot, which is 64 for most things but 16 for ender
+     * pearls and eggs, and 1 for tools and armour. Resolving it early would mean asking
+     * for "a stack of ender pearls" and trying to take 64 of them.
+     */
+    public record Request(int count, double stacks, String query) {
+    }
+
+    /**
+     * Reads a quantity off the front of a request.
+     *
+     * <p>Handles "10 stone", "a stack of cobblestone", "all the sticks", "half a stack
+     * of iron" - the ways someone actually asks - and falls back to {@code defaultCount}
+     * when no amount is given.
+     */
+    public static Request parseRequest(String argument, int defaultCount) {
+        String text = argument == null ? "" : argument.trim().toLowerCase(Locale.ROOT);
+        if (text.isEmpty()) {
+            return new Request(defaultCount, 0.0D, "");
+        }
+        Matcher all = Pattern.compile("^all(?:\\s+(?:of\\s+)?(?:the\\s+)?)?(.*)$").matcher(text);
+        if (all.matches()) {
+            return new Request(Integer.MAX_VALUE, 0.0D, all.group(1).trim());
+        }
+        Matcher halfStack = Pattern.compile("^half\\s+(?:a\\s+|the\\s+)?stacks?\\s+(?:of\\s+)?(.*)$")
+                .matcher(text);
+        if (halfStack.matches()) {
+            return new Request(0, 0.5D, halfStack.group(1).trim());
+        }
+        Matcher stack = Pattern.compile("^(?:a\\s+|one\\s+)?stacks?\\s+(?:of\\s+)?(.*)$").matcher(text);
+        if (stack.matches()) {
+            return new Request(0, 1.0D, stack.group(1).trim());
+        }
+        Matcher stacksOf = Pattern.compile("^(\\d{1,3})\\s+stacks?\\s+(?:of\\s+)?(.*)$").matcher(text);
+        if (stacksOf.matches()) {
+            return new Request(0, Integer.parseInt(stacksOf.group(1)), stacksOf.group(2).trim());
+        }
+        Matcher counted = Pattern.compile("^(\\d{1,5})\\s+(?:of\\s+)?(.*)$").matcher(text);
+        if (counted.matches()) {
+            int count = Math.max(1, Integer.parseInt(counted.group(1)));
+            return new Request(count, 0.0D, counted.group(2).trim());
+        }
+        return new Request(defaultCount, 0.0D, text);
     }
 
     /** A container that holds a match, and whether the match was on the exact item id. */
