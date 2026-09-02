@@ -22,7 +22,7 @@ Restart Ollama, allow inbound TCP **11434** through the firewall, and pre-warm t
 model — the first load takes 15-45 seconds:
 
 ```
-ollama run llama3.1:8b
+ollama run qwen2.5:14b "hello"
 ```
 
 ## Notes
@@ -31,8 +31,13 @@ ollama run llama3.1:8b
   default, configurable) so that unmodified clients can render it. There is no
   Steve skin yet — see the README for why.
 - Lumen is not saved to the world. Re-run `/lumen spawn` after a server restart.
-- `chatTrigger` defaults to `name`, so Lumen only answers when a message mentions
-  it. Set it to `always` if you want it to reply to everything.
+- `chatTrigger` defaults to `always`, so Lumen answers everything. Set it to `name`
+  if that gets noisy and it will only reply when a message mentions it.
+- Lumen remembers where it found things in `config/lumen/memory.json`, so it survives
+  restarts. `/lumen memory` shows what it knows, `/lumen forget` clears it.
+- If Lumen gets stuck, `/lumen here` warps it to you and `/lumen why` names the blocks
+  around it that vanilla pathfinding refuses to route through - that output is the
+  fastest way to find the mod at fault.
 - Set `logRawResponses: true` if the model drifts from the expected JSON format —
   that log is where you will see it.
 

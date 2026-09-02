@@ -6,7 +6,6 @@ import com.lilahcraft.lumen.entity.LumenEntity;
 import net.minecraft.entity.ai.goal.Goal;
 import net.minecraft.entity.ai.pathing.EntityNavigation;
 import net.minecraft.entity.player.PlayerEntity;
-import net.minecraft.util.math.BlockPos;
 
 import java.util.EnumSet;
 
@@ -80,7 +79,7 @@ public class LumenFollowGoal extends Goal {
         LumenConfig config = Lumen.config();
         double distanceSquared = lumen.squaredDistanceTo(target);
         if (distanceSquared > config.teleportDistance * config.teleportDistance) {
-            teleportNear(target);
+            lumen.teleportNear(target.getBlockPos());
             return;
         }
 
@@ -89,34 +88,8 @@ public class LumenFollowGoal extends Goal {
             // Nothing walkable between here and there; only warp once it is far enough
             // away to be obviously stuck rather than briefly blocked by a fence.
             if (distanceSquared > 12.0D * 12.0D) {
-                teleportNear(target);
+                lumen.teleportNear(target.getBlockPos());
             }
         }
-    }
-
-    /** Places Lumen on a free block next to the player, if one can be found. */
-    private void teleportNear(PlayerEntity player) {
-        BlockPos base = player.getBlockPos();
-        for (int attempt = 0; attempt < 12; attempt++) {
-            int dx = lumen.getRandom().nextInt(5) - 2;
-            int dy = lumen.getRandom().nextInt(3) - 1;
-            int dz = lumen.getRandom().nextInt(5) - 2;
-            BlockPos candidate = base.add(dx, dy, dz);
-            if (isFree(candidate)) {
-                lumen.getNavigation().stop();
-                lumen.refreshPositionAndAngles(candidate.getX() + 0.5D, candidate.getY(), candidate.getZ() + 0.5D,
-                        lumen.getYaw(), lumen.getPitch());
-                return;
-            }
-        }
-    }
-
-    private boolean isFree(BlockPos pos) {
-        if (!lumen.getWorld().isChunkLoaded(pos.getX() >> 4, pos.getZ() >> 4)) {
-            return false;
-        }
-        return lumen.getWorld().getBlockState(pos).getCollisionShape(lumen.getWorld(), pos).isEmpty()
-                && lumen.getWorld().getBlockState(pos.up()).getCollisionShape(lumen.getWorld(), pos.up()).isEmpty()
-                && !lumen.getWorld().getBlockState(pos.down()).getCollisionShape(lumen.getWorld(), pos.down()).isEmpty();
     }
 }
