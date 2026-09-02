@@ -10,6 +10,7 @@ import com.lilahcraft.lumen.entity.goal.LumenPickUpItemGoal;
 import com.lilahcraft.lumen.entity.goal.LumenWanderGoal;
 import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
+import net.minecraft.block.FenceGateBlock;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.EntityType;
 import net.minecraft.entity.EquipmentSlot;
@@ -43,6 +44,7 @@ import net.minecraft.screen.GenericContainerScreenHandler;
 import net.minecraft.screen.NamedScreenHandlerFactory;
 import net.minecraft.screen.ScreenHandler;
 import net.minecraft.server.world.ServerWorld;
+import net.minecraft.state.property.Properties;
 import net.minecraft.sound.SoundCategory;
 import net.minecraft.sound.SoundEvent;
 import net.minecraft.sound.SoundEvents;
@@ -116,6 +118,9 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
     private int pickUpCooldown;
     private int eatCooldown;
     private int equipCooldown;
+    private BlockPos openedGate;
+    private int gateCloseTimer;
+    private int gateScanCooldown;
 
     public LumenEntity(EntityType<? extends PathAwareEntity> entityType, World world) {
         super(entityType, world);
@@ -396,7 +401,13 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         }
     }
 
-    /** Hands fetched items over once Lumen is back beside whoever asked for them. */
+    /**
+     * Hands fetched items over once Lumen is back beside whoever asked.
+     *
+     * <p>They go into the pack rather than onto the ground: dropped items despawn,
+     * fall through blocks and get lost. Lumen is a walking chest - right-click to take
+     * things out. Only what will not fit is dropped.
+     */
     private void deliverIfClose() {
         if (pendingDelivery.isEmpty() || deliverTo == null) {
             return;
@@ -406,58 +417,28 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
                 || this.squaredDistanceTo(requester) > 9.0D) {
             return;
         }
-        int delivered = 0;
+        int stored = 0;
+        int dropped = 0;
         for (ItemStack stack : pendingDelivery) {
-            if (!stack.isEmpty()) {
-                this.dropStack(stack);
-                delivered += stack.getCount();
+            if (stack.isEmpty()) {
+                continue;
+            }
+            ItemStack leftover = getInventory().addStack(stack);
+            if (leftover.isEmpty()) {
+                stored++;
+            } else {
+                this.dropStack(leftover);
+                dropped++;
             }
         }
         pendingDelivery.clear();
         this.deliverTo = null;
-        if (delivered > 0) {
-            requester.sendMessage(Text.literal(Lumen.config().companionName + " drops "
-                    + delivered + " item(s) for you.").formatted(Formatting.AQUA), false);
-        }
-    }
-
-    @Nullable
-    public PlayerEntity getFollowTarget() {
-        if (getMode() != Mode.FOLLOW || followTarget == null) {
-            return null;
-        }
-        PlayerEntity player = this.getWorld().getPlayerByUuid(followTarget);
-        return player != null && player.isAlive() && player.getWorld() == this.getWorld() ? player : null;
-    }
-
-    @Nullable
-    public BlockPos getDestination() {
-        return getMode() == Mode.GO_TO ? destination : null;
-    }
-
-    /** Human readable state, fed to the model as part of the world snapshot. */
-    public String describeActivity() {
-        switch (getMode()) {
-            case FOLLOW -> {
-                PlayerEntity target = getFollowTarget();
-                return target == null ? "standing around" : "following " + target.getName().getString();
-            }
-            case GO_TO -> {
-                BlockPos pos = getDestination();
-                return pos == null ? "standing around"
-                        : "walking to " + pos.getX() + ", " + pos.getY() + ", " + pos.getZ();
-            }
-            case FETCH -> {
-                return fetchQuery == null ? "standing around"
-                        : "going to a nearby container to fetch " + fetchQuery;
-            }
-            case MINE -> {
-                return mineQuery == null ? "standing around"
-                        : "mining " + mineQuery + " (" + minedCount + " so far)";
-            }
-            default -> {
-                return "standing around";
-            }
+        if (stored > 0 || dropped > 0) {
+            String note = dropped == 0
+                    ? "got it - right-click me to take it"
+                    : "my pack is full, so some of it is on the ground";
+            requester.sendMessage(Text.literal(Lumen.config().companionName + ": " + note)
+                    .formatted(Formatting.AQUA), false);
         }
     }
 
@@ -612,6 +593,62 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
             this.eatCooldown = 100;
             return;
         }
+    }
+
+    /**
+     * Opens a fence gate Lumen is walking into, and closes it again behind. Vanilla
+     * mobs cannot do this at all - only the pathfinder relaxation in
+     * LumenPathNodeMaker makes a closed gate routable in the first place.
+     */
+    private void handleFenceGates() {
+        if (!Lumen.config().canOpenDoors) {
+            return;
+        }
+        if (openedGate != null && --this.gateCloseTimer <= 0) {
+            setGateOpen(openedGate, false);
+            this.openedGate = null;
+        }
+        if (this.getNavigation().isIdle() || --this.gateScanCooldown > 0) {
+            return;
+        }
+        this.gateScanCooldown = 5;
+        BlockPos origin = this.getBlockPos();
+        for (int dx = -1; dx <= 1; dx++) {
+            for (int dz = -1; dz <= 1; dz++) {
+                for (int dy = 0; dy <= 1; dy++) {
+                    BlockPos candidate = origin.add(dx, dy, dz);
+                    if (setGateOpen(candidate, true)) {
+                        this.openedGate = candidate;
+                        this.gateCloseTimer = 120;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /** @return true if this actually was a gate that changed state */
+    private boolean setGateOpen(BlockPos pos, boolean open) {
+        World world = this.getWorld();
+        if (!world.isChunkLoaded(pos.getX() >> 4, pos.getZ() >> 4)) {
+            return false;
+        }
+        BlockState state = world.getBlockState(pos);
+        if (!(state.getBlock() instanceof FenceGateBlock) || !state.contains(Properties.OPEN)
+                || state.get(Properties.OPEN) == open) {
+            return false;
+        }
+        world.setBlockState(pos, state.with(Properties.OPEN, open), Block.NOTIFY_LISTENERS);
+        world.playSound(null, pos,
+                open ? SoundEvents.BLOCK_FENCE_GATE_OPEN : SoundEvents.BLOCK_FENCE_GATE_CLOSE,
+                SoundCategory.BLOCKS, 1.0F, 1.0F);
+        return true;
+    }
+
+    /** True while Lumen is on a task a passing remark should not cancel. */
+    public boolean isOnErrand() {
+        Mode current = getMode();
+        return current == Mode.FETCH || current == Mode.MINE || current == Mode.GO_TO;
     }
 
     // ------------------------------------------------------------------- mining
@@ -984,6 +1021,7 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
             this.setTarget(null);
         }
         updateStuckState();
+        handleFenceGates();
         collectNearbyItems();
         deliverIfClose();
         eatIfHurt();

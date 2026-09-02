@@ -2,6 +2,8 @@ package com.lilahcraft.lumen.command;
 
 import com.lilahcraft.lumen.Lumen;
 import com.lilahcraft.lumen.LumenConfig;
+import com.lilahcraft.lumen.brain.LumenBrain;
+import com.lilahcraft.lumen.entity.ChestFinder;
 import com.lilahcraft.lumen.entity.LumenEntity;
 import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.arguments.StringArgumentType;
@@ -16,6 +18,7 @@ import net.minecraft.item.ItemStack;
 import net.minecraft.registry.Registries;
 import net.minecraft.server.command.CommandManager;
 import net.minecraft.server.command.ServerCommandSource;
+import net.minecraft.server.world.ServerWorld;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.text.Text;
 import net.minecraft.util.Formatting;
@@ -62,6 +65,10 @@ public final class LumenCommand {
                         .executes(LumenCommand::drop))
                 .then(CommandManager.literal("why")
                         .executes(LumenCommand::why))
+                .then(CommandManager.literal("debug")
+                        .executes(LumenCommand::debug))
+                .then(CommandManager.literal("containers")
+                        .executes(LumenCommand::containers))
                 .then(CommandManager.literal("memory")
                         .executes(LumenCommand::memory))
                 .then(CommandManager.literal("forget")
@@ -217,6 +224,75 @@ public final class LumenCommand {
         return 1;
     }
 
+    /**
+     * Shows what the model last said and what became of it. "The command did not
+     * execute" and "the model never sent one" look identical from chat; this tells
+     * them apart.
+     */
+    private static int debug(CommandContext<ServerCommandSource> context) {
+        ServerCommandSource source = context.getSource();
+        LumenBrain.CommandTrace trace = Lumen.brain().lastTrace();
+        String raw = Lumen.brain().lastRawContent();
+
+        source.sendFeedback(() -> Text.literal("Last model reply: "
+                + (raw == null ? "(none yet)" : abbreviate(raw))).formatted(Formatting.DARK_GRAY), false);
+        if (trace == null) {
+            source.sendFeedback(() -> Text.literal("No command has been routed yet.")
+                    .formatted(Formatting.GRAY), false);
+        } else {
+            source.sendFeedback(() -> Text.literal("command field: \"" + trace.raw() + "\"")
+                    .formatted(Formatting.GRAY), false);
+            source.sendFeedback(() -> Text.literal("understood as: \"" + trace.parsed() + "\"")
+                    .formatted(Formatting.GRAY), false);
+            source.sendFeedback(() -> Text.literal("result: " + trace.outcome())
+                    .formatted(Formatting.AQUA), false);
+        }
+        source.sendFeedback(() -> Text.literal(Lumen.brain().isBusy()
+                ? "A request is in flight right now." : "Idle, no request in flight.")
+                .formatted(Formatting.DARK_GRAY), false);
+        return 1;
+    }
+
+    /**
+     * Lists nearby containers and whether Lumen can search them. Modded storage that
+     * does not implement Inventory shows up here as unsearchable, which is the
+     * information needed to decide what to support next.
+     */
+    private static int containers(CommandContext<ServerCommandSource> context) {
+        ServerCommandSource source = context.getSource();
+        LumenEntity lumen = requireLumen(source);
+        if (lumen == null) {
+            return 0;
+        }
+        if (!(lumen.getWorld() instanceof ServerWorld world)) {
+            return 0;
+        }
+        double radius = Lumen.config().chestSearchRadius;
+        List<String> searchable = new ArrayList<>();
+        List<String> skipped = new ArrayList<>();
+        ChestFinder.describeNearby(world, lumen.getBlockPos(), radius, searchable, skipped);
+
+        source.sendFeedback(() -> Text.literal("Within " + Math.round(radius) + " blocks: "
+                + searchable.size() + " searchable, " + skipped.size() + " not")
+                .formatted(Formatting.AQUA), false);
+        if (!searchable.isEmpty()) {
+            source.sendFeedback(() -> Text.literal("  searchable: "
+                    + String.join(", ", searchable.stream().distinct().limit(8).toList()))
+                    .formatted(Formatting.GRAY), false);
+        }
+        if (!skipped.isEmpty()) {
+            source.sendFeedback(() -> Text.literal("  NOT searchable: "
+                    + String.join(", ", skipped.stream().distinct().limit(8).toList()))
+                    .formatted(Formatting.YELLOW), false);
+        }
+        return 1;
+    }
+
+    private static String abbreviate(String value) {
+        String flat = value.replace('\n', ' ').trim();
+        return flat.length() <= 160 ? flat : flat.substring(0, 157) + "...";
+    }
+
     /** Hands everything back: pack, worn gear and anything not yet delivered. */
     private static int drop(CommandContext<ServerCommandSource> context) {
         ServerCommandSource source = context.getSource();
@@ -335,9 +411,12 @@ public final class LumenCommand {
                 }
             }
         }
+        // "solid" on a wall block is correct and expected; it is only worth reporting
+        // so an actual obstruction can be told apart from ordinary geometry.
         String summary = blockers.isEmpty()
                 ? "Nothing within 2 blocks is blocking movement."
-                : "Blocks vanilla will not path through: "
+                : "Not walkable through (solid ones are normal walls, and containers are "
+                        + "approached from the side rather than entered): "
                         + blockers.stream().limit(10).reduce((a, b) -> a + ", " + b).orElse("");
         source.sendFeedback(() -> Text.literal(summary).formatted(Formatting.DARK_GRAY), false);
         return 1;

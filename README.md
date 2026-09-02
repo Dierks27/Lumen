@@ -75,6 +75,18 @@ Because Lumen wears a borrowed type, it is never written to the region file - ot
 it would come back after a restart as a real villager. Re-run `/lumen spawn` after a
 server restart.
 
+## Combat
+
+**Off by default.** v0.3.0 shipped an aggro leak that killed a player: `RevengeGoal`
+retaliates against whoever last damaged Lumen with no filter at all, so one stray swing
+during a shared fight turned it on the player. That goal is gone, and a player can no
+longer become a target through any path - `setTarget` refuses one outright, `tryAttack`
+refuses to swing at one, the defend predicate excludes them, and aggro drops the tick
+the target dies.
+
+Set `combat: true` to switch it back on. It is opt-in rather than default because a bug
+in this area costs someone their inventory.
+
 ## Mining
 
 `lumen go mine some iron`, or `/lumen mine iron`. Lumen finds the nearest matching
@@ -94,6 +106,14 @@ fenced in:
   inventory screen.
 - **Bounded.** `maxMineBlocks` per errand, `miningRadius` for the search, and
   `allowMining: false` turns the whole thing off.
+- **The tool is checked before setting out**, so "I'd need a pickaxe" is said up front
+  rather than after standing there playing the whole break animation. Put one in its
+  pack first.
+- **Drops are banked only after the block actually breaks.** Doing it the other way
+  round meant a refused break still handed over items - items from nothing.
+
+Mining and fetching are separate: `mine` breaks blocks, `find` searches containers.
+Neither silently becomes the other.
 
 ## Pathfinding and modded blocks
 
@@ -189,9 +209,9 @@ curl http://192.168.50.51:11434/v1/models
 | `miningRadius` / `miningHeight` | `12` / `8` | How far it looks for something to mine. |
 | `maxMineBlocks` | `8` | Blocks broken per errand before it brings the haul back. |
 | `eatWhenHurt` / `eatHealthFraction` | `true` / `0.6` | Eat from the pack below this much health. |
-| `chestSearchRadius` / `memoryRecallRadius` | `16` / `64` | Cold search vs. walking to a remembered container. |
+| `chestSearchRadius` / `memoryRecallRadius` | `48` / `128` | Cold search vs. walking to a remembered container. |
 | `maxFetchStacks` | `3` | Stacks taken per errand. |
-| `combat` / `attackDamage` / `defendRadius` | `true` / `3.0` / `12` | Defends itself and whoever it follows. |
+| `combat` / `attackDamage` / `defendRadius` | `false` / `3.0` / `12` | Off by default - see [Combat](#combat). |
 | `awarenessBlockRadius` / `awarenessEntityRadius` | `8` / `24` | How much world goes into the prompt. |
 | `maxHealth` / `movementSpeed` / `followRange` | `20` / `0.4` / `48` | Attributes. |
 | `followStartDistance` / `followStopDistance` | `4.0` / `2.5` | Follow hysteresis. |
@@ -248,6 +268,9 @@ misbehave anyway.
 | `/lumen mine <block>` | everyone | Go break blocks of that kind and bring them back |
 | `/lumen inventory` | everyone | What Lumen is carrying and wearing |
 | `/lumen memory` | everyone | Places Lumen remembers finding things |
+| `/lumen drop` | everyone | Hand back everything it is carrying |
+| `/lumen debug` | everyone | What the model last said, and what became of it |
+| `/lumen containers` | everyone | Nearby containers, and which are searchable |
 | `/lumen why` | everyone | Why Lumen is not moving, and what is blocking it |
 | `/lumen spawn` / `despawn` / `reload` / `forget` | level 2 | |
 
@@ -258,9 +281,10 @@ and out of.
 ## Roadmap
 
 **Next**
+- A selection wand for area mining and quarrying
 - Named places (`remember this as home`) and going back to them
+- Modded storage that does not implement `Inventory` (`/lumen containers` shows which)
 - Crafting from what is in the pack
-- Farming: planting, harvesting, replanting
 
 **Phase 3 - polish**
 - Player model + custom skin from `config/lumen/skins/`. This needs the fake

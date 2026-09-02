@@ -7,6 +7,7 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.util.math.BlockPos;
+import org.jetbrains.annotations.Nullable;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -32,6 +33,9 @@ public final class LumenBrain {
     /** Free-form notes that survive within a session, e.g. a remembered home. */
     private BlockPos home;
 
+    private volatile CommandTrace lastTrace;
+    private volatile String lastRawContent;
+
     public synchronized void reset() {
         history.clear();
     }
@@ -54,6 +58,17 @@ public final class LumenBrain {
 
     public boolean isBusy() {
         return busy.get();
+    }
+
+    @Nullable
+    public CommandTrace lastTrace() {
+        return lastTrace;
+    }
+
+    /** The raw text the model last returned, for /lumen debug. */
+    @Nullable
+    public String lastRawContent() {
+        return lastRawContent;
     }
 
     private synchronized OllamaClient client(LumenConfig config) {
@@ -140,6 +155,7 @@ public final class LumenBrain {
     /** Runs on the server thread. */
     private void applyResponse(MinecraftServer server, String senderName, String content) {
         LumenConfig config = Lumen.config();
+        this.lastRawContent = content;
         LumenResponse response = LumenResponse.parse(content);
         if (response == null) {
             Lumen.LOGGER.warn("Ollama returned an empty response");
@@ -156,6 +172,9 @@ public final class LumenBrain {
         }
         if (response.hasCommand()) {
             executeCommand(server, senderName, response.command());
+        } else {
+            this.lastTrace = new CommandTrace("<none>", "", "the model sent no command field");
+            Lumen.LOGGER.info("model returned no command field");
         }
     }
 
@@ -180,72 +199,151 @@ public final class LumenBrain {
      * Translates the {@code command} field into entity state. Unknown commands are
      * logged and ignored - the model inventing verbs must never break the game.
      */
+    /** What the last model command did. Surfaced by /lumen debug. */
+    public record CommandTrace(String raw, String parsed, String outcome) {
+    }
+
+    /**
+     * Turns the model's {@code command} field into an action.
+     *
+     * <p>Small models are inconsistent about shape: they emit {@code find_iron_ore},
+     * {@code "go mine some iron"}, {@code `come`}, trailing full stops, and leading
+     * filler. Everything is normalised down to a verb plus an argument before
+     * dispatch, and every decision is logged - "it did not execute" is otherwise
+     * impossible to tell apart from "it was never asked to".
+     */
     public void executeCommand(MinecraftServer server, String senderName, String rawCommand) {
+        String parsed = normaliseCommand(rawCommand);
+        String outcome = route(server, senderName, parsed);
+        this.lastTrace = new CommandTrace(rawCommand, parsed, outcome);
+        Lumen.LOGGER.info("command '{}' parsed as '{}' -> {}", rawCommand, parsed, outcome);
+    }
+
+    private String route(MinecraftServer server, String senderName, String command) {
         LumenEntity lumen = Lumen.manager().get(server);
         if (lumen == null) {
-            return;
+            return "ignored, not spawned";
         }
-        String command = rawCommand.trim().toLowerCase(Locale.ROOT);
-        if (command.startsWith("/")) {
-            command = command.substring(1);
-        }
-
-        if (command.isEmpty() || command.equals("none") || command.equals("idle")
-                || command.equals("stay") || command.equals("stop") || command.equals("wait")) {
-            lumen.stopAndIdle();
-            return;
+        if (command.isEmpty()) {
+            return "nothing to do";
         }
 
-        if (command.startsWith("follow")) {
-            String target = command.substring("follow".length()).trim();
-            ServerPlayerEntity player = resolvePlayer(server, target.isEmpty() ? senderName : target, senderName);
-            if (player != null) {
+        String[] parts = command.split(" ", 2);
+        String verb = parts[0];
+        String argument = stripFiller(parts.length > 1 ? parts[1] : "");
+
+        switch (verb) {
+            case "idle", "none", "nothing", "relax", "chill", "wander", "explore" -> {
+                // A conversational "idle" must not throw away an errand. Chatting while
+                // Lumen fetches used to cancel the fetch, which is what made it look
+                // like it could not hold a thought.
+                if (lumen.isOnErrand()) {
+                    return "kept working: " + lumen.describeActivity();
+                }
+                lumen.stopAndIdle();
+                return "idling";
+            }
+            case "stay", "stop", "wait", "halt", "hold" -> {
+                lumen.stopAndIdle();
+                return "stopped";
+            }
+            case "follow" -> {
+                ServerPlayerEntity player = resolvePlayer(server,
+                        argument.isEmpty() ? senderName : argument, senderName);
+                if (player == null) {
+                    return "no such player: " + argument;
+                }
                 lumen.followPlayer(player);
-            } else {
-                Lumen.LOGGER.debug("Cannot follow unknown player '{}'", target);
+                return "following " + player.getName().getString();
             }
-            return;
-        }
-
-        if (command.equals("come") || command.equals("come here") || command.startsWith("goto ")
-                || command.startsWith("come to")) {
-            ServerPlayerEntity player = resolvePlayer(server, senderName, senderName);
-            if (player != null) {
+            case "come", "goto", "here", "approach" -> {
+                ServerPlayerEntity player = resolvePlayer(server, senderName, senderName);
+                if (player == null) {
+                    return "no such player: " + senderName;
+                }
                 lumen.goTo(player.getBlockPos());
+                return "walking to " + player.getName().getString();
             }
-            return;
+            case "find", "fetch", "get", "bring", "grab", "collect", "search" -> {
+                if (argument.isEmpty()) {
+                    return "no item named";
+                }
+                ServerPlayerEntity requester = resolvePlayer(server, senderName, senderName);
+                if (requester == null) {
+                    return "no such player: " + senderName;
+                }
+                if (!lumen.startFetch(requester, argument)) {
+                    Lumen.broadcast(server, "i can't find any " + argument + " in anything nearby");
+                    return "nothing nearby holds " + argument;
+                }
+                return "fetching " + argument;
+            }
+            case "mine", "dig", "chop", "break", "harvest" -> {
+                if (argument.isEmpty()) {
+                    return "no block named";
+                }
+                ServerPlayerEntity requester = resolvePlayer(server, senderName, senderName);
+                if (requester == null) {
+                    return "no such player: " + senderName;
+                }
+                String refusal = lumen.startMining(requester, argument);
+                if (refusal != null) {
+                    Lumen.broadcast(server, refusal);
+                    return "refused: " + refusal;
+                }
+                return "mining " + argument;
+            }
+            case "drop", "give", "hand" -> {
+                int dropped = lumen.dropEverything();
+                Lumen.broadcast(server, dropped == 0 ? "i'm not carrying anything" : "here you go");
+                return "dropped " + dropped + " stack(s)";
+            }
+            default -> {
+                return "unrecognised verb '" + verb + "'";
+            }
         }
+    }
 
-        if (command.startsWith("find") || command.startsWith("fetch") || command.startsWith("get ")) {
-            String query = command.replaceFirst("^(find|fetch|get)", "").trim();
-            // Models like to pad the object: "find me some iron" -> "iron".
-            query = query.replaceFirst("^(me|us)\\b", "").trim();
-            query = query.replaceFirst("^(some|a|an|the)\\b", "").trim();
-            ServerPlayerEntity requester = resolvePlayer(server, senderName, senderName);
-            if (!query.isEmpty() && requester != null && lumen.startFetch(requester, query)) {
-                return;
-            }
-            Lumen.LOGGER.debug("Nothing nearby holds '{}'", query);
-            return;
+    /**
+     * Reduces whatever the model produced to "verb argument".
+     *
+     * <p>Handles code fences and quotes around the value, a leading slash, underscores
+     * instead of spaces, trailing punctuation and leading filler words.
+     */
+    static String normaliseCommand(String raw) {
+        if (raw == null) {
+            return "";
         }
-
-        if (command.startsWith("mine") || command.startsWith("dig") || command.startsWith("chop")) {
-            String query = command.replaceFirst("^(mine|dig|chop)", "").trim();
-            query = query.replaceFirst("^(me|us)\\b", "").trim();
-            query = query.replaceFirst("^(some|a|an|the|down)\\b", "").trim();
-            ServerPlayerEntity requester = resolvePlayer(server, senderName, senderName);
-            if (query.isEmpty() || requester == null) {
-                return;
-            }
-            String refusal = lumen.startMining(requester, query);
-            if (refusal != null) {
-                // Say why rather than standing there doing nothing.
-                Lumen.broadcast(server, refusal);
-            }
-            return;
+        String text = raw.trim().toLowerCase(Locale.ROOT);
+        text = text.replaceAll("^[`\"'\\[(]+", "").replaceAll("[`\"'\\])]+$", "");
+        if (text.startsWith("/")) {
+            text = text.substring(1);
         }
+        text = text.replace('_', ' ');
+        text = text.replaceAll("[.!,;:]+$", "");
+        text = text.replaceAll("\\s+", " ").trim();
+        // "go mine iron", "please come", "lumen, follow me"
+        for (int i = 0; i < 3; i++) {
+            String stripped = text.replaceFirst("^(go|please|now|lumen|hey)\\b[, ]*", "").trim();
+            if (stripped.equals(text)) {
+                break;
+            }
+            text = stripped;
+        }
+        return text;
+    }
 
-        Lumen.LOGGER.debug("Ignoring unknown command from the model: '{}'", rawCommand);
+    /** "me some iron" -> "iron". */
+    static String stripFiller(String argument) {
+        String text = argument.trim();
+        for (int i = 0; i < 5; i++) {
+            String stripped = text.replaceFirst("^(me|us|some|any|a|an|the|down|up|for|of|to)\\b", "").trim();
+            if (stripped.equals(text)) {
+                break;
+            }
+            text = stripped;
+        }
+        return text;
     }
 
     private static ServerPlayerEntity resolvePlayer(MinecraftServer server, String name, String fallbackName) {
@@ -292,7 +390,10 @@ public final class LumenBrain {
                 + "  find <item>     - go through nearby chests and barrels for that item and "
                 + "bring it back to whoever asked\n"
                 + "  mine <block>    - go break blocks of that kind nearby and bring them back\n"
+                + "  drop            - hand over everything you are carrying\n"
                 + "Use exactly one command. If nothing needs to change, use \"idle\".\n"
+                + "Name things in plain words - \"iron\", \"oak planks\", \"coal\" - never a mod "
+                + "item id. Partial words match, so \"iron\" finds iron ingots and iron ore.\n"
                 + "The \"message\" field is the only thing players see: keep it to one or two short "
                 + "sentences, lowercase and casual, like typing in chat. Never mention JSON, commands "
                 + "or that you are an AI.\n\n"
