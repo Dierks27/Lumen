@@ -14,6 +14,8 @@ public class LumenFetchGoal extends Goal {
     private BlockPos chest;
     private int repathCountdown;
     private int giveUpTicks;
+    /** Consecutive attempts that produced no path going anywhere. */
+    private int noRouteRounds;
 
     public LumenFetchGoal(LumenEntity lumen) {
         this.lumen = lumen;
@@ -36,6 +38,7 @@ public class LumenFetchGoal extends Goal {
     public void start() {
         this.repathCountdown = 0;
         this.giveUpTicks = 0;
+        this.noRouteRounds = 0;
     }
 
     @Override
@@ -66,9 +69,14 @@ public class LumenFetchGoal extends Goal {
         this.repathCountdown = this.getTickCount(15);
         // A chest is a solid block: pathing at it finds no node and reports failure.
         boolean moving = lumen.moveToBlock(chest, Lumen.config().followSpeedMultiplier);
-        if (!moving && lumen.getNavigation().isIdle() && giveUpTicks > 40) {
-            // Cannot get to it at all; give up rather than stand there forever.
-            lumen.stopAndIdle();
+        if (moving) {
+            this.noRouteRounds = 0;
+            return;
+        }
+        // Three rounds with nowhere to go is a verdict, not a hiccup. Move on to the
+        // next container rather than standing here in silence.
+        if (++this.noRouteRounds >= 3 || (lumen.getNavigation().isIdle() && giveUpTicks > 60)) {
+            lumen.fetchUnreachable();
         }
     }
 }

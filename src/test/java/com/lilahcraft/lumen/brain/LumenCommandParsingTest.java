@@ -115,6 +115,27 @@ class LumenCommandParsingTest {
     }
 
     @Test
+    @DisplayName("asking for something back is a give")
+    void infersGiveBack() {
+        assertEquals("give me the sword", LumenBrain.inferCommandFromRequest("give me the sword"));
+        assertEquals("give me the sword back", LumenBrain.inferCommandFromRequest("can i have the sword back"));
+        assertEquals("hand me my pickaxe", LumenBrain.inferCommandFromRequest("hand me my pickaxe"));
+    }
+
+    @Test
+    @DisplayName("the amount the player said survives a command that dropped it")
+    void keepsAmountFromChat() {
+        // "grab me 12 redstone" came back from the model as "find redstone" and 48 were taken.
+        assertEquals(12, LumenBrain.resolveFetchRequest("redstone", "grab me 12 redstone", 64).count());
+        assertEquals("redstone", LumenBrain.resolveFetchRequest("redstone", "grab me 12 redstone", 64).query());
+        // A command that names its own amount wins over the sentence.
+        assertEquals(5, LumenBrain.resolveFetchRequest("5 redstone", "grab me 12 redstone", 64).count());
+        // Nothing said either way: the default.
+        assertEquals(64, LumenBrain.resolveFetchRequest("redstone", "get me some redstone", 64).count());
+        assertEquals(1.0D, LumenBrain.resolveFetchRequest("stone", "bring a stack of stone please", 64).stacks());
+    }
+
+    @Test
     @DisplayName("ordinary conversation is not mistaken for an instruction")
     void doesNotInferFromChatter() {
         assertNull(LumenBrain.inferCommandFromRequest("nice build buddy"));

@@ -30,18 +30,44 @@ specific code.
 - Ask for something fetched before and Lumen goes straight back to that container
 - Memories that turn out wrong are forgotten and the search starts again
 
+**Fetching**
+- Takes the amount you asked for and stops: *"grab me 12 redstone"* is 12, not the
+  chest. "a dozen", "a couple", "a stack", "half a stack", "3 stacks", "all" and
+  "x12" all count, and if the model drops the number from its command the amount is
+  read back off what you said
+- *"stone"* means stone. Matching is tiered - the exact item first, then whole words
+  (*"oak log"* finds dark oak logs, not oak planks), then substrings - and only the
+  best tier in a container is touched, so a stack of stone no longer comes back as
+  30 stone and 42 cobblestone
+- Only containers it can actually walk to. Every candidate gets a real path test, so
+  the cabinet on the floor above is off limits unless there are stairs
+- Storage networks count: anything that exposes items through the Fabric transfer
+  API - Tom's Storage inventory connectors, drawers, most modded storage - is
+  searched alongside plain chests
+- Honest about shortfalls: *"found 9 white wool but you asked for 12 - that's all I
+  could find"*, then it walks back to you with it
+
 **Moving**
-- Opens and walks through wooden doors
+- Opens and walks through wooden doors and fence gates, and closes them behind it -
+  including doors you opened and walked through ahead of it
 - A relaxed path node maker walks through modded blocks that have no collision box
   but report themselves as solid (see [Pathfinding](#pathfinding-and-modded-blocks))
-- Stuck detection re-paths and, as a last resort, warps - no more despawn/respawn
+- Stuck detection re-paths and, as a last resort, warps - no more despawn/respawn.
+  A path that goes nowhere counts as no path, so "cannot get back inside" is
+  answered by a warp in a few seconds rather than eight
 - Follows, goes to a spot, wanders when idle
 
 **Doing things**
 - A real inventory: right-click Lumen (empty handed, or sneaking) to open its pack as
-  an ordinary chest screen and hand over tools, armour, weapons and food. It wears or
-  wields anything better than what it has, picks things up off the ground, and drops
-  the lot on death
+  an ordinary chest screen and hand over tools, armour, weapons and food. The bottom
+  row of that screen is what it is holding and wearing - main hand, off hand, helmet,
+  chestplate, leggings, boots - so a sword it equipped can be taken straight back. It
+  wears or wields anything better than what it has, picks things up off the ground,
+  and drops the lot on death
+- *"give me the sword"*, `/lumen give sword`, `/lumen drop`: items go straight into
+  your inventory, never onto the floor. (On the floor they were Lumen's again within
+  a tick - the loot goblin loop.) If your inventory is full the rest is set down at
+  your feet and Lumen leaves it alone
 - Fetches from chests, barrels and modded containers: *"lumen find me some iron"*
 - Mines on request: *"lumen go mine some iron"* - walks to the ore, breaks it at the
   speed its tool allows, and brings the haul back
@@ -111,6 +137,11 @@ fenced in:
   pack first.
 - **Drops are banked only after the block actually breaks.** Doing it the other way
   round meant a refused break still handed over items - items from nothing.
+- **Inside a claim, it breaks blocks as you.** The block break is done in the name of
+  whoever asked, and Lumen reports itself as owned by that player (the same
+  `Tameable` hook a wolf uses), so Open Parties and Claims and mods like it apply your
+  permissions rather than refusing a stray mob. If it still cannot break something,
+  the message says which player it tried as - check that player's claim permissions.
 
 Mining and fetching are separate: `mine` breaks blocks, `find` searches containers.
 Neither silently becomes the other.
@@ -132,10 +163,17 @@ cables, pipes, plants. `LumenPathNodeMaker` says: if the pathfinder calls it BLO
 it cannot actually be collided with, treat it as open. One non-recursive shape lookup,
 so it cannot recurse into a stack overflow the way Automatone did.
 
-When Lumen still gets stuck, **`/lumen why`** names the blocks around it that vanilla
-refuses to route through, and whether the relaxation lets it through anyway. In a 375
-mod pack that output is the fastest way from "he is stuck" to the mod at fault - please
-paste it into an issue.
+When Lumen still gets stuck, **`/lumen why`** runs a real path test to wherever it is
+trying to get to (or to you, when idle) and reports whether the path reaches, where it
+ends, and what surrounds that spot. It then names the blocks around Lumen's feet by the
+verdict vanilla pathfinding gives each one: walls are "solid", slabs, stairs and carpets
+are "half block - steps onto it", doors and gates are things it opens, and blocks with
+no collision box are ones it walks through anyway. In a 375 mod pack that output is
+the fastest way from "he is stuck" to the mod at fault - please paste it into an issue.
+
+A note on slabs: they are half blocks and Lumen steps onto them like a villager does.
+An earlier `/lumen why` listed the slab floor Lumen was standing on as "solid", which
+was the diagnostic being unhelpful rather than the pathfinder refusing slabs.
 
 ## Install
 
@@ -201,7 +239,7 @@ curl http://192.168.50.51:11434/v1/models
 | `appearanceEntity` | `minecraft:villager` | Vanilla type clients render. |
 | `canOpenDoors` | `true` | Path through and open wooden doors. |
 | `stuckRepathTicks` / `stuckTeleportTicks` | `60` / `160` | No-progress thresholds before re-pathing, then warping. |
-| `inventorySize` | `27` | 27 or 54 - the two sizes a vanilla chest screen can show. |
+| `inventorySize` | `27` | 27 or 45 pack slots; the screen adds an equipment row underneath, so it shows as a 9x4 or 9x6 chest. |
 | `acceptItemsFromPlayers` / `pickUpItems` | `true` | Right-click handover, ground pickup. |
 | `dropInventoryOnDeath` | `true` | |
 | `allowChestAccess` | `true` | Let Lumen take requested items out of containers. |
@@ -268,22 +306,26 @@ misbehave anyway.
 | `/lumen mine <block>` | everyone | Go break blocks of that kind and bring them back |
 | `/lumen inventory` | everyone | What Lumen is carrying and wearing |
 | `/lumen memory` | everyone | Places Lumen remembers finding things |
-| `/lumen drop` | everyone | Hand back everything it is carrying |
+| `/lumen drop` | everyone | Hand back everything it is carrying, straight into your inventory |
+| `/lumen give [item]` | everyone | Hand back one thing: `/lumen give sword`. No item means everything |
 | `/lumen debug` | everyone | What the model last said, and what became of it |
 | `/lumen containers` | everyone | Nearby containers, and which are searchable |
-| `/lumen why` | everyone | Why Lumen is not moving, and what is blocking it |
+| `/lumen why` | everyone | A path test to its target, and what is blocking it |
 | `/lumen spawn` / `despawn` / `reload` / `forget` | level 2 | |
 
 Right-clicking Lumen with something in hand gives it that item. Right-clicking empty
 handed - or while sneaking - opens its pack as a chest screen you can move things in
-and out of.
+and out of. The bottom row is what it is holding and wearing.
 
 ## Roadmap
 
 **Next**
 - A selection wand for area mining and quarrying
+- A task queue with priorities, so a second request waits instead of cancelling
 - Named places (`remember this as home`) and going back to them
-- Modded storage that does not implement `Inventory` (`/lumen containers` shows which)
+- Learned memory beyond container locations, carried across restarts
+- Storage that exposes items through neither `Inventory` nor the Fabric transfer API
+  (`/lumen containers` shows which)
 - Crafting from what is in the pack
 
 **Phase 3 - polish**

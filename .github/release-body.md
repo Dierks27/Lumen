@@ -45,11 +45,20 @@ ollama run qwen2.5:14b "hello"
   choice. Set `combat: true` when you are ready.
 - `/lumen debug` shows what the model last replied, how the command was understood
   and what became of it - the first thing to check if an instruction seems ignored.
-- `/lumen containers` lists nearby containers and which of them Lumen can search;
-  `/lumen drop` hands back everything it is carrying.
-- If Lumen gets stuck, `/lumen here` warps it to you and `/lumen why` names the blocks
-  around it that vanilla pathfinding refuses to route through - that output is the
-  fastest way to find the mod at fault.
+- `/lumen containers` lists nearby containers and which of them Lumen can search.
+  Storage networks that expose items through the Fabric transfer API - Tom's Storage
+  inventory connectors included - are searchable.
+- `/lumen drop` and `/lumen give <item>` hand things back straight into your
+  inventory, never onto the floor. "give me the sword" in chat does the same. The
+  pack screen's bottom row shows what Lumen is holding and wearing.
+- Fetching takes the amount you asked for and stops, matches the exact item before
+  look-alikes (stone is not cobblestone), only uses containers it can walk to, and
+  says plainly when it found fewer than you asked for.
+- If Lumen gets stuck, `/lumen here` warps it to you and `/lumen why` runs a path test
+  to its target and names what is around it - that output is the fastest way to find
+  the mod at fault.
+- Inside a claim, blocks are broken in the name of whoever asked, so Open Parties and
+  Claims applies that player's permissions.
 - Set `logRawResponses: true` if the model drifts from the expected JSON format —
   that log is where you will see it.
 

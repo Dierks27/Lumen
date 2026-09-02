@@ -2,6 +2,7 @@ package com.lilahcraft.lumen.brain;
 
 import com.lilahcraft.lumen.Lumen;
 import com.lilahcraft.lumen.LumenConfig;
+import com.lilahcraft.lumen.entity.ChestFinder;
 import com.lilahcraft.lumen.entity.LumenEntity;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.network.ServerPlayerEntity;
@@ -171,14 +172,14 @@ public final class LumenBrain {
             Lumen.broadcast(server, response.message());
         }
         if (response.hasCommand()) {
-            executeCommand(server, senderName, response.command());
+            executeCommand(server, senderName, response.command(), playerText);
         } else {
             // The model chatted but sent no command. Rather than saying "on it" and then
             // standing there, work the intent out of what was actually asked.
             String inferred = inferCommandFromRequest(playerText);
             if (inferred != null) {
                 Lumen.LOGGER.info("model sent no command field; inferred '{}' from the request", inferred);
-                executeCommand(server, senderName, inferred);
+                executeCommand(server, senderName, inferred, playerText);
                 this.lastTrace = new CommandTrace("<none - inferred from your message>",
                         inferred, this.lastTrace == null ? "?" : this.lastTrace.outcome());
             } else {
@@ -223,13 +224,38 @@ public final class LumenBrain {
      * impossible to tell apart from "it was never asked to".
      */
     public void executeCommand(MinecraftServer server, String senderName, String rawCommand) {
+        executeCommand(server, senderName, rawCommand, null);
+    }
+
+    /**
+     * @param playerText what the player actually said, so an amount the model left out
+     *                   of its command can be read back off the request
+     */
+    public void executeCommand(MinecraftServer server, String senderName, String rawCommand,
+                               @Nullable String playerText) {
         String parsed = normaliseCommand(rawCommand);
-        String outcome = route(server, senderName, parsed);
+        String outcome = route(server, senderName, parsed, playerText);
         this.lastTrace = new CommandTrace(rawCommand, parsed, outcome);
         Lumen.LOGGER.info("command '{}' parsed as '{}' -> {}", rawCommand, parsed, outcome);
     }
 
-    private String route(MinecraftServer server, String senderName, String command) {
+    /**
+     * The amount for a fetch: what the command says, and when the command names no
+     * amount, what the player said. qwen2.5 routinely turns "grab me 12 redstone" into
+     * {@code find redstone}; taking 64 of them - or the whole chest - is what made
+     * quantities look ignored in v0.5.
+     */
+    static ChestFinder.Request resolveFetchRequest(String argument, @Nullable String playerText,
+                                                   int defaultCount) {
+        ChestFinder.Request request = ChestFinder.parseRequest(argument, defaultCount);
+        if (request.explicit() || playerText == null) {
+            return request;
+        }
+        ChestFinder.Request fromChat = ChestFinder.quantityIn(playerText);
+        return fromChat == null ? request : fromChat.applyAmountTo(request);
+    }
+
+    private String route(MinecraftServer server, String senderName, String command, @Nullable String playerText) {
         LumenEntity lumen = Lumen.manager().get(server);
         if (lumen == null) {
             return "ignored, not spawned";
@@ -282,11 +308,20 @@ public final class LumenBrain {
                 if (requester == null) {
                     return "no such player: " + senderName;
                 }
-                if (!lumen.startFetch(requester, argument)) {
-                    Lumen.broadcast(server, "i can't find any " + argument + " in anything nearby");
-                    return "nothing nearby holds " + argument;
+                ChestFinder.Request request = resolveFetchRequest(argument, playerText,
+                        Lumen.config().defaultFetchCount);
+                String wanted = ChestFinder.describeRequest(request);
+                if (!lumen.startFetch(requester, request)) {
+                    if (lumen.fetchSawUnreachable()) {
+                        Lumen.broadcast(server, "i can see some " + request.query()
+                                + " in a container but i can't get to it");
+                        return "found " + request.query() + " but no container holding it is reachable";
+                    }
+                    Lumen.broadcast(server, "i can't find any " + request.query() + " in anything nearby");
+                    return "nothing nearby holds " + request.query();
                 }
-                return "fetching " + argument;
+                return "fetching " + wanted + (request.explicit() && !ChestFinder.parseRequest(argument, 0).explicit()
+                        ? " (amount taken from your message)" : "");
             }
             case "mine", "dig", "chop", "break", "harvest" -> {
                 if (argument.isEmpty()) {
@@ -303,10 +338,25 @@ public final class LumenBrain {
                 }
                 return "mining " + argument;
             }
-            case "drop", "give", "hand" -> {
-                int dropped = lumen.dropEverything();
-                Lumen.broadcast(server, dropped == 0 ? "i'm not carrying anything" : "here you go");
-                return "dropped " + dropped + " stack(s)";
+            case "drop", "give", "hand", "return", "pass" -> {
+                ServerPlayerEntity requester = resolvePlayer(server, senderName, senderName);
+                if (requester == null) {
+                    return "no such player: " + senderName;
+                }
+                boolean everything = ChestFinder.meansEverything(argument);
+                if (!everything && !lumen.isCarrying(argument)) {
+                    Lumen.broadcast(server, "i don't have any " + argument);
+                    return "not carrying " + argument;
+                }
+                // Straight into their inventory, never onto the floor - dropping it meant
+                // Lumen picked it back up before anyone else could.
+                LumenEntity.HandoverResult result = lumen.requestHandover(requester, everything ? null : argument);
+                if (result == null) {
+                    Lumen.broadcast(server, "coming over with " + (everything ? "your things" : "the " + argument));
+                    return "walking over to hand over " + (everything ? "everything" : argument);
+                }
+                Lumen.broadcast(server, LumenEntity.describeHandover(result, everything ? "" : argument));
+                return "handed over " + result.stacks() + " stack(s)";
             }
             default -> {
                 return "unrecognised verb '" + verb + "'";
@@ -347,7 +397,7 @@ public final class LumenBrain {
     private static final java.util.Set<String> ACTION_VERBS = java.util.Set.of(
             "follow", "come", "goto", "here", "approach", "find", "fetch", "get", "bring",
             "grab", "collect", "search", "mine", "dig", "chop", "break", "harvest", "drop",
-            "give", "hand", "stay", "stop", "wait", "halt", "hold");
+            "give", "hand", "return", "pass", "stay", "stop", "wait", "halt", "hold");
 
     /**
      * Last resort when the model chats but omits the command field: read the intent
@@ -372,6 +422,8 @@ public final class LumenBrain {
                     .replaceFirst("^(can|could|would|will)\\s+you\\b", "")
                     .replaceFirst("^(please|just)\\b", "")
                     .replaceFirst("^(i\\s+want\\s+you\\s+to|i\\s+need\\s+you\\s+to)\\b", "")
+                    .replaceFirst("^(can|could|may)\\s+i\\s+(have|get)\\b", "give me")
+                    .replaceFirst("^(i\\s+want|i\\s+need)\\s+(the|my|that)\\b(.*)\\bback$", "give me $2$3")
                     .trim();
             if (peeled.equals(text)) {
                 break;
@@ -456,17 +508,22 @@ public final class LumenBrain {
                 + "  come            - walk to whoever just spoke\n"
                 + "  find <item>     - search nearby containers and bring it back\n"
                 + "  mine <block>    - break blocks of that kind and bring them back\n"
+                + "  give <item>     - hand that item straight to whoever asked (\"give sword\")\n"
                 + "  drop            - hand over everything you are carrying\n"
                 + "Name things in plain words - \"iron\", \"oak planks\", \"coal\" - never a mod item "
                 + "id. Partial words match, so \"iron\" finds iron ingots and iron ore. A number or "
                 + "\"all\" or \"a stack\" before the item sets how much: \"find 10 stone\", "
                 + "\"find a stack of oak planks\". A stack is however many fit in one "
-                + "inventory slot - 64 for most things, fewer for some.\n\n"
+                + "inventory slot - 64 for most things, fewer for some. Always copy the amount "
+                + "the player asked for into the command: \"grab me 12 redstone\" is "
+                + "\"find 12 redstone\", \"a dozen wool\" is \"find 12 wool\".\n\n"
                 + "Examples of complete replies:\n"
                 + "{\"reason\":\"they want iron\",\"command\":\"find iron\","
                 + "\"message\":\"on it, i'll check the chests\"}\n"
                 + "{\"reason\":\"they asked for a lot of stone\",\"command\":\"find 64 stone\","
                 + "\"message\":\"heading off to grab it\"}\n"
+                + "{\"reason\":\"they want their sword back\",\"command\":\"give sword\","
+                + "\"message\":\"sure, here\"}\n"
                 + "{\"reason\":\"just chatting\",\"command\":\"idle\","
                 + "\"message\":\"thanks! i like how the roof came out\"}\n"
                 + "{\"reason\":\"they called me over\",\"command\":\"come\","

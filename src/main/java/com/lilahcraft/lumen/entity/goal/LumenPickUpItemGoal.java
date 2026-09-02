@@ -14,6 +14,8 @@ import java.util.List;
 /**
  * Walks over to dropped items and collects them. Sits below the follow and attack
  * goals, so Lumen only detours for loot when it is not busy keeping up or fighting.
+ * Items Lumen itself put down for a player are not loot - see
+ * {@link LumenEntity#wantsToPickUp}.
  */
 public class LumenPickUpItemGoal extends Goal {
 
@@ -39,7 +41,7 @@ public class LumenPickUpItemGoal extends Goal {
     @Override
     public boolean shouldContinue() {
         LumenConfig config = Lumen.config();
-        if (target == null || !target.isAlive() || target.isRemoved()) {
+        if (target == null || !target.isAlive() || target.isRemoved() || !lumen.wantsToPickUp(target)) {
             return false;
         }
         // A little slack over the search radius so Lumen finishes a trip it started.
@@ -79,8 +81,7 @@ public class LumenPickUpItemGoal extends Goal {
 
     private ItemEntity findNearestItem(double radius) {
         Box box = lumen.getBoundingBox().expand(radius);
-        List<ItemEntity> items = lumen.getWorld().getEntitiesByClass(ItemEntity.class, box,
-                item -> item.isAlive() && !item.cannotPickup());
+        List<ItemEntity> items = lumen.getWorld().getEntitiesByClass(ItemEntity.class, box, lumen::wantsToPickUp);
         return items.stream()
                 .min(Comparator.comparingDouble(lumen::squaredDistanceTo))
                 .orElse(null);

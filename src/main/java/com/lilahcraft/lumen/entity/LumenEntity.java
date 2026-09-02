@@ -2,6 +2,7 @@ package com.lilahcraft.lumen.entity;
 
 import com.lilahcraft.lumen.Lumen;
 import com.lilahcraft.lumen.LumenConfig;
+import com.lilahcraft.lumen.entity.ai.LumenNavigation;
 import com.lilahcraft.lumen.entity.goal.LumenFetchGoal;
 import com.lilahcraft.lumen.entity.goal.LumenFollowGoal;
 import com.lilahcraft.lumen.entity.goal.LumenGoToGoal;
@@ -10,12 +11,17 @@ import com.lilahcraft.lumen.entity.goal.LumenPickUpItemGoal;
 import com.lilahcraft.lumen.entity.goal.LumenWanderGoal;
 import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
+import net.minecraft.block.DoorBlock;
 import net.minecraft.block.FenceGateBlock;
+import net.minecraft.block.enums.DoubleBlockHalf;
+import net.minecraft.enchantment.EnchantmentHelper;
+import net.minecraft.enchantment.Enchantments;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.EntityType;
 import net.minecraft.entity.EquipmentSlot;
 import net.minecraft.entity.ItemEntity;
 import net.minecraft.entity.LivingEntity;
+import net.minecraft.entity.Tameable;
 import net.minecraft.entity.ai.goal.ActiveTargetGoal;
 import net.minecraft.entity.ai.goal.EscapeDangerGoal;
 import net.minecraft.entity.ai.goal.LongDoorInteractGoal;
@@ -24,21 +30,19 @@ import net.minecraft.entity.ai.goal.LookAtEntityGoal;
 import net.minecraft.entity.ai.goal.MeleeAttackGoal;
 import net.minecraft.entity.ai.goal.SwimGoal;
 import net.minecraft.entity.ai.pathing.EntityNavigation;
-import com.lilahcraft.lumen.entity.ai.LumenNavigation;
 import net.minecraft.entity.ai.pathing.MobNavigation;
+import net.minecraft.entity.ai.pathing.Path;
+import net.minecraft.entity.ai.pathing.PathNode;
 import net.minecraft.entity.ai.pathing.PathNodeType;
 import net.minecraft.entity.attribute.EntityAttributeInstance;
 import net.minecraft.entity.attribute.EntityAttributeModifier;
-import net.minecraft.enchantment.EnchantmentHelper;
-import net.minecraft.enchantment.Enchantments;
 import net.minecraft.entity.attribute.EntityAttributes;
 import net.minecraft.entity.effect.StatusEffects;
 import net.minecraft.entity.mob.HostileEntity;
 import net.minecraft.entity.mob.PathAwareEntity;
 import net.minecraft.entity.player.PlayerEntity;
-import net.minecraft.inventory.Inventory;
-import net.minecraft.inventory.SimpleInventory;
 import net.minecraft.entity.player.PlayerInventory;
+import net.minecraft.inventory.SimpleInventory;
 import net.minecraft.item.FoodComponent;
 import net.minecraft.item.ItemStack;
 import net.minecraft.nbt.NbtCompound;
@@ -46,11 +50,13 @@ import net.minecraft.registry.Registries;
 import net.minecraft.screen.GenericContainerScreenHandler;
 import net.minecraft.screen.NamedScreenHandlerFactory;
 import net.minecraft.screen.ScreenHandler;
+import net.minecraft.screen.ScreenHandlerType;
+import net.minecraft.screen.SimpleNamedScreenHandlerFactory;
 import net.minecraft.server.world.ServerWorld;
-import net.minecraft.state.property.Properties;
 import net.minecraft.sound.SoundCategory;
 import net.minecraft.sound.SoundEvent;
 import net.minecraft.sound.SoundEvents;
+import net.minecraft.state.property.Properties;
 import net.minecraft.text.Text;
 import net.minecraft.util.ActionResult;
 import net.minecraft.util.Formatting;
@@ -58,14 +64,19 @@ import net.minecraft.util.Hand;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
+import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.EntityView;
 import net.minecraft.world.World;
 import org.jetbrains.annotations.Nullable;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 
@@ -78,8 +89,12 @@ import java.util.UUID;
  * so that unmodified clients spawn and render something sensible, while all of the
  * behaviour below runs only on the server. The flip side is that Lumen must never be
  * written to disk as that vanilla type, hence {@link #saveSelfNbt(NbtCompound)}.
+ *
+ * <p>Implements {@link Tameable} so that claim and protection mods which look up a
+ * mob's owner - Open Parties and Claims does, through {@code OwnableEntity} - treat
+ * what Lumen does as done by the player directing it.
  */
-public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFactory {
+public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFactory, Tameable {
 
     public enum Mode {
         /** Hang around, wander a bit, pick things up. */
@@ -94,9 +109,15 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         MINE
     }
 
+    /** How many candidate containers get a real path test before Lumen settles. */
+    private static final int MAX_PATH_TESTS = 8;
+
     private Mode mode;
     private UUID followTarget;
     private BlockPos destination;
+
+    /** Whoever spawned Lumen, or last told it what to do. */
+    private UUID ownerUuid;
 
     // Lazily built: MobEntity's constructor runs initGoals() before our field
     // initialisers, so anything a goal might touch has to be created on demand.
@@ -109,10 +130,22 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
     /** Containers already checked on this errand, so a retry does not loop back. */
     private final Set<BlockPos> triedContainers = new HashSet<>();
     private int fetchAttempts;
-    /** How many items this errand is for. */
+    /** How many items are still wanted on this errand. */
     private int fetchWanted;
+    /** How many were asked for in the first place, for the report at the end. */
+    private int fetchRequested;
     /** Non-zero while the amount is still expressed in stacks, pending the real item. */
     private double fetchStacks;
+    /** Items taken so far this errand. */
+    private int fetchTaken;
+    /** The first thing taken this errand: later containers are held to the same item. */
+    private ItemStack fetchSample = ItemStack.EMPTY;
+    /** The weakest match tier still acceptable: once real stone is in hand, cobble is not. */
+    private int fetchMinScore;
+    /** A match was seen that Lumen could not path to - worth saying so at the end. */
+    private boolean fetchSawUnreachable;
+    /** What to hand over once Lumen reaches the player, or null. "*" means everything. */
+    private String pendingHandover;
 
     private BlockPos mineTarget;
     private String mineQuery;
@@ -123,11 +156,17 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
     private Vec3d lastProgressPos;
     private int stuckTicks;
     private int pickUpCooldown;
+    /** Until this tick, nothing on the floor is picked up - it was just handed over. */
+    private int pickUpSuppressedUntil;
+    /** Items Lumen itself put down, and the tick after which it may forget about them. */
+    private final Map<UUID, Integer> ownDrops = new HashMap<>();
     private int eatCooldown;
     private int equipCooldown;
     private BlockPos openedGate;
     private int gateCloseTimer;
     private int gateScanCooldown;
+    /** Doors and gates Lumen has walked into, and how many ticks since it was last in them. */
+    private final Map<BlockPos, Integer> passages = new HashMap<>();
 
     public LumenEntity(EntityType<? extends PathAwareEntity> entityType, World world) {
         super(entityType, world);
@@ -223,6 +262,8 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         this.goalSelector.add(0, new SwimGoal(this));
         if (Lumen.config().canOpenDoors) {
             // true: close it again after passing through, rather than leaving it open.
+            // Only covers doors Lumen opened itself; doors a player left open are
+            // closed by handlePassages() below.
             this.goalSelector.add(1, new LongDoorInteractGoal(this, true));
         }
         this.goalSelector.add(1, new EscapeDangerGoal(this, 1.3D));
@@ -243,6 +284,45 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
                 this::shouldDefendAgainst));
     }
 
+    // ------------------------------------------------------------------- owner
+
+    /** Records who Lumen answers to. Set on spawn and refreshed by every instruction. */
+    public void setOwner(@Nullable PlayerEntity player) {
+        if (player != null) {
+            this.ownerUuid = player.getUuid();
+        }
+    }
+
+    /**
+     * The player whose permissions Lumen acts under: whoever gave the current errand,
+     * otherwise whoever spawned it. Claim mods read this to decide whether a block
+     * Lumen breaks or a chest it opens is allowed.
+     */
+    @Nullable
+    @Override
+    public UUID getOwnerUuid() {
+        return deliverTo != null ? deliverTo : ownerUuid;
+    }
+
+    @Nullable
+    @Override
+    public LivingEntity getOwner() {
+        UUID uuid = getOwnerUuid();
+        if (uuid == null || this.getWorld() == null) {
+            return null;
+        }
+        return this.getWorld().getPlayerByUuid(uuid);
+    }
+
+    /**
+     * The third method of {@code Tameable}, unnamed in the 1.20.1 yarn mappings: the
+     * world the owner is looked up in (Mojang's {@code OwnableEntity#level()}).
+     */
+    @Override
+    public EntityView method_48926() {
+        return this.getWorld();
+    }
+
     // ---------------------------------------------------------------- behaviour
 
     public Mode getMode() {
@@ -255,6 +335,7 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         this.followTarget = player.getUuid();
         this.destination = null;
         this.stuckTicks = 0;
+        setOwner(player);
     }
 
     public void goTo(BlockPos pos) {
@@ -288,18 +369,33 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
      * @return false when nothing nearby has it, so the caller can say so
      */
     public boolean startFetch(PlayerEntity requester, String query) {
+        return startFetch(requester, ChestFinder.parseRequest(query, Lumen.config().defaultFetchCount));
+    }
+
+    /**
+     * Sends Lumen off to fetch a parsed request.
+     *
+     * @return false when nothing nearby has it - {@link #fetchSawUnreachable()} then
+     *         says whether that is because there was none, or none Lumen could get to
+     */
+    public boolean startFetch(PlayerEntity requester, ChestFinder.Request request) {
         LumenConfig config = Lumen.config();
         if (!config.allowChestAccess || !(this.getWorld() instanceof ServerWorld world)) {
             return false;
         }
-        ChestFinder.Request request = ChestFinder.parseRequest(query, config.defaultFetchCount);
         if (request.query().isEmpty()) {
             return false;
         }
         this.fetchQuery = request.query();
         this.fetchWanted = Math.min(request.count(), config.maxFetchItems);
+        this.fetchRequested = request.isEverything() ? Integer.MAX_VALUE : this.fetchWanted;
         this.fetchStacks = request.stacks();
+        this.fetchTaken = 0;
+        this.fetchSample = ItemStack.EMPTY;
+        this.fetchMinScore = ChestFinder.SUBSTRING_MATCH;
+        this.fetchSawUnreachable = false;
         this.deliverTo = requester.getUuid();
+        setOwner(requester);
         this.triedContainers.clear();
         this.fetchAttempts = 0;
         this.followTarget = null;
@@ -308,16 +404,27 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         return targetNextContainer(world);
     }
 
+    /** True when the last search found a match Lumen had no path to. */
+    public boolean fetchSawUnreachable() {
+        return fetchSawUnreachable;
+    }
+
     /**
      * Picks where to look next: somewhere Lumen has found this before, otherwise a
      * fresh search. Remembered spots that no longer hold the item are forgotten as
      * they are ruled out, so the memory stays honest as chests get emptied.
+     *
+     * <p>Every candidate gets a real path test before it is chosen. A 48 block
+     * spherical search finds cabinets on the floor above and chests behind walls,
+     * and v0.5 reached straight through the ceiling into them. Now the container
+     * must be somewhere Lumen can walk to and stand beside.
      *
      * @return false when there is nowhere left to try
      */
     private boolean targetNextContainer(ServerWorld world) {
         LumenConfig config = Lumen.config();
         Identifier dimension = world.getRegistryKey().getValue();
+        ItemStack sameAs = fetchSample.isEmpty() ? null : fetchSample;
 
         for (BlockPos remembered : Lumen.memory().recall(fetchQuery, dimension, this.getBlockPos(),
                 config.memoryRecallRadius, triedContainers)) {
@@ -327,24 +434,65 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
                 this.fetchChest = remembered;
                 return true;
             }
-            if (world.getBlockEntity(remembered) instanceof Inventory inventory
-                    && ChestFinder.containsMatch(inventory, fetchQuery)) {
-                this.mode = Mode.FETCH;
-                this.fetchChest = remembered;
-                return true;
+            ContainerAccess access = ContainerAccess.at(world, remembered);
+            if (access != null && ChestFinder.scoreContainer(access.contents(), fetchQuery, sameAs)
+                    >= Math.max(ChestFinder.SUBSTRING_MATCH, fetchMinScore)) {
+                if (isReachable(remembered)) {
+                    this.mode = Mode.FETCH;
+                    this.fetchChest = remembered;
+                    return true;
+                }
+                this.fetchSawUnreachable = true;
+                this.triedContainers.add(remembered);
+                continue;
             }
             Lumen.memory().forgetContainer(dimension, remembered);
             this.triedContainers.add(remembered);
         }
 
-        ChestFinder.Match match = ChestFinder.findContainerWith(
-                world, this.getBlockPos(), config.chestSearchRadius, fetchQuery, triedContainers);
-        if (match == null) {
+        List<ChestFinder.Match> matches = ChestFinder.findContainersWith(
+                world, this.getBlockPos(), config.chestSearchRadius, fetchQuery, fetchMinScore, sameAs,
+                triedContainers);
+        int tested = 0;
+        for (ChestFinder.Match match : matches) {
+            if (tested++ >= MAX_PATH_TESTS) {
+                break;
+            }
+            if (isReachable(match.pos())) {
+                this.mode = Mode.FETCH;
+                this.fetchChest = match.pos();
+                return true;
+            }
+            this.fetchSawUnreachable = true;
+        }
+        return false;
+    }
+
+    /**
+     * Whether Lumen can actually walk to a spot beside {@code target}, by asking the
+     * pathfinder rather than guessing from distance.
+     */
+    public boolean isReachable(BlockPos target) {
+        BlockPos approach = canStandAt(target) ? target : findApproach(target);
+        if (approach == null) {
             return false;
         }
-        this.mode = Mode.FETCH;
-        this.fetchChest = match.pos();
-        return true;
+        if (this.getBlockPos().isWithinDistance(approach, 1.5D)) {
+            return true;
+        }
+        if (!this.isOnGround()) {
+            // The pathfinder refuses to plan mid-air; do not condemn the container for it.
+            return true;
+        }
+        Path path = this.getNavigation().findPathTo(approach, 1);
+        if (path == null) {
+            return false;
+        }
+        if (path.reachesTarget()) {
+            return true;
+        }
+        PathNode end = path.getEnd();
+        return end != null && approach.isWithinDistance(new BlockPos(end.x, end.y, end.z), 2.0D);
     }
 
     @Nullable
@@ -354,6 +502,33 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
 
     public List<ItemStack> getPendingDelivery() {
         return pendingDelivery;
+    }
+
+    /** What Lumen is trying to fetch right now, or null. */
+    @Nullable
+    public String getFetchQuery() {
+        return fetchQuery;
+    }
+
+    /**
+     * Called by the fetch goal when the container it was walking to turned out to be
+     * unreachable after all. Moves on to the next candidate rather than idling in
+     * silence, which is what v0.5 did.
+     */
+    public void fetchUnreachable() {
+        BlockPos chest = this.fetchChest;
+        this.fetchChest = null;
+        if (chest == null || !(this.getWorld() instanceof ServerWorld world)) {
+            stopAndIdle();
+            return;
+        }
+        this.triedContainers.add(chest);
+        this.fetchSawUnreachable = true;
+        this.fetchAttempts++;
+        if (this.fetchAttempts < 6 && fetchQuery != null && targetNextContainer(world)) {
+            return;
+        }
+        finishFetch(world);
     }
 
     /**
@@ -374,35 +549,11 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         this.fetchAttempts++;
 
         int taken = 0;
-        if (world.getBlockEntity(chest) instanceof Inventory inventory) {
+        ContainerAccess access = ContainerAccess.at(world, chest);
+        if (access != null) {
             world.playSound(null, chest, SoundEvents.BLOCK_CHEST_OPEN, SoundCategory.BLOCKS, 0.6F, 1.0F);
-            int remaining = Math.max(1, this.fetchWanted);
-            for (int slot = 0; slot < inventory.size() && remaining > 0; slot++) {
-                ItemStack stack = inventory.getStack(slot);
-                if (!ChestFinder.matches(stack, query)) {
-                    continue;
-                }
-                if (this.fetchStacks > 0.0D) {
-                    // Now that the actual item is in hand, a "stack" has a real size:
-                    // 64 for most things, 16 for ender pearls, 1 for a pickaxe.
-                    remaining = (int) Math.max(1, Math.ceil(this.fetchStacks * stack.getMaxCount()));
-                    remaining = Math.min(remaining, Lumen.config().maxFetchItems);
-                    this.fetchWanted = remaining;
-                    this.fetchStacks = 0.0D;
-                }
-                // Take only as many as were asked for, splitting the stack if need be.
-                ItemStack removed = inventory.removeStack(slot, Math.min(remaining, stack.getCount()));
-                if (!removed.isEmpty()) {
-                    remaining -= removed.getCount();
-                    taken += removed.getCount();
-                    pendingDelivery.add(removed);
-                    // Learned: this container is where that item lives.
-                    Lumen.memory().rememberContainer(query,
-                            Registries.ITEM.getId(removed.getItem()), dimension, chest);
-                }
-            }
-            this.fetchWanted = remaining;
-            inventory.markDirty();
+            taken = takeFrom(access, query, dimension, chest, config);
+            access.finish();
             world.playSound(null, chest, SoundEvents.BLOCK_CHEST_CLOSE, SoundCategory.BLOCKS, 0.6F, 1.0F);
         }
 
@@ -413,19 +564,124 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
                 requester == null ? "nobody" : requester.getName().getString());
 
         // Keep going to the next container while there is still some of the order left.
-        if (taken > 0 && this.fetchWanted > 0 && this.fetchAttempts < 5 && targetNextContainer(world)) {
+        if (taken > 0 && this.fetchWanted > 0 && this.fetchAttempts < 6 && targetNextContainer(world)) {
             return;
         }
         if (taken == 0) {
             // The memory was stale, or somebody emptied it. Forget it and look elsewhere,
             // but only a few times so a wrong query cannot send Lumen on a tour.
             Lumen.memory().forgetContainer(dimension, chest);
-            if (this.fetchAttempts < 3 && targetNextContainer(world)) {
+            if (this.fetchAttempts < 4 && targetNextContainer(world)) {
                 return;
             }
         }
+        finishFetch(world);
+    }
 
+    /**
+     * Takes what was asked for out of one container, and no more.
+     *
+     * <p>Only the best match tier present is touched: "stone" takes stone and leaves
+     * the cobblestone alone, and only falls back to cobblestone in a container that
+     * has no stone at all - and not even then once real stone is already in hand.
+     * Within the tier, whatever was taken earlier this errand goes first, so an order
+     * for wool does not come back as a rainbow.
+     */
+    private int takeFrom(ContainerAccess access, String query, Identifier dimension, BlockPos chest,
+                         LumenConfig config) {
+        List<ItemStack> contents = access.contents();
+        ItemStack sameAs = fetchSample.isEmpty() ? null : fetchSample;
+        int tier = ChestFinder.scoreContainer(contents, query, sameAs);
+        if (tier < Math.max(ChestFinder.SUBSTRING_MATCH, fetchMinScore)) {
+            return 0;
+        }
+        // Distinct item kinds in this container at the winning tier, familiar ones first.
+        List<ItemStack> kinds = new ArrayList<>();
+        for (ItemStack stack : contents) {
+            boolean familiar = sameAs != null && ItemStack.canCombine(stack, sameAs);
+            if (!familiar && ChestFinder.matchScore(stack, query) != tier) {
+                continue;
+            }
+            boolean seen = false;
+            for (ItemStack kind : kinds) {
+                if (ItemStack.canCombine(kind, stack)) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) {
+                if (familiar) {
+                    kinds.add(0, stack);
+                } else {
+                    kinds.add(stack);
+                }
+            }
+        }
+
+        int taken = 0;
+        int remaining = Math.max(1, this.fetchWanted);
+        for (ItemStack kind : kinds) {
+            if (remaining <= 0) {
+                break;
+            }
+            if (this.fetchStacks > 0.0D) {
+                // Now that the actual item is in hand, a "stack" has a real size:
+                // 64 for most things, 16 for ender pearls, 1 for a pickaxe.
+                remaining = (int) Math.max(1, Math.ceil(this.fetchStacks * kind.getMaxCount()));
+                remaining = Math.min(remaining, config.maxFetchItems);
+                this.fetchWanted = remaining;
+                this.fetchRequested = remaining;
+                this.fetchStacks = 0.0D;
+            }
+            // One stack's worth per call, so a big order comes out as proper stacks.
+            for (int round = 0; remaining > 0 && round < 64; round++) {
+                ItemStack removed = access.take(kind, remaining);
+                if (removed.isEmpty()) {
+                    break;
+                }
+                remaining -= removed.getCount();
+                taken += removed.getCount();
+                this.fetchTaken += removed.getCount();
+                if (this.fetchSample.isEmpty()) {
+                    this.fetchSample = removed.copyWithCount(1);
+                }
+                // Once something real has been taken, nothing weaker counts any more.
+                this.fetchMinScore = Math.max(this.fetchMinScore, tier);
+                pendingDelivery.add(removed);
+                // Learned: this container is where that item lives.
+                Lumen.memory().rememberContainer(query, Registries.ITEM.getId(removed.getItem()), dimension, chest);
+            }
+        }
+        this.fetchWanted = remaining;
+        return taken;
+    }
+
+    /**
+     * Ends the errand: says how it went, in words that do not read as failure when
+     * nine of twelve were found, then heads back to whoever asked.
+     */
+    private void finishFetch(ServerWorld world) {
+        String query = this.fetchQuery == null ? "that" : this.fetchQuery;
+        String what = this.fetchSample.isEmpty() ? query : ChestFinder.plainName(this.fetchSample);
+        PlayerEntity requester = deliverTo == null ? null : world.getPlayerByUuid(deliverTo);
         this.fetchQuery = null;
+        this.fetchChest = null;
+        this.fetchStacks = 0.0D;
+
+        String line;
+        if (this.fetchTaken == 0) {
+            line = this.fetchSawUnreachable
+                    ? "i can see some " + query + " in a container but i can't get to it"
+                    : "i couldn't find any " + query + " in anything nearby";
+        } else if (this.fetchRequested != Integer.MAX_VALUE && this.fetchTaken < this.fetchRequested) {
+            line = "found " + this.fetchTaken + " " + what + " but you asked for " + this.fetchRequested
+                    + " - that's all i could find" + (this.fetchSawUnreachable ? " that i could get to" : "")
+                    + ". bringing it over";
+        } else {
+            line = "got " + this.fetchTaken + " " + what + ", bringing it over";
+        }
+        Lumen.broadcast(world.getServer(), line);
+
         if (requester != null) {
             followPlayer(requester);
         } else {
@@ -441,34 +697,63 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
      * things out. Only what will not fit is dropped.
      */
     private void deliverIfClose() {
-        if (pendingDelivery.isEmpty() || deliverTo == null) {
+        if (deliverTo == null || (pendingDelivery.isEmpty() && pendingHandover == null)) {
+            return;
+        }
+        // Not while the errand is still running: handing over half an order in passing
+        // would forget who asked before the rest was collected.
+        if (getMode() == Mode.FETCH || getMode() == Mode.MINE) {
             return;
         }
         PlayerEntity requester = this.getWorld().getPlayerByUuid(deliverTo);
-        if (requester == null || requester.getWorld() != this.getWorld()
-                || this.squaredDistanceTo(requester) > 9.0D) {
+        if (requester == null || requester.getWorld() != this.getWorld()) {
+            return;
+        }
+        // The follow goal stops short of the player, so "close" has to be at least as
+        // far as it stops, or Lumen stands 3.5 blocks away holding the goods forever.
+        double reach = Math.max(3.0D, Lumen.config().followStartDistance);
+        if (this.squaredDistanceTo(requester) > reach * reach) {
+            return;
+        }
+        if (pendingHandover != null) {
+            String query = pendingHandover;
+            this.pendingHandover = null;
+            HandoverResult result = handOver(requester, "*".equals(query) ? null : query);
+            Lumen.broadcast(this.getWorld().getServer(), describeHandover(result, "*".equals(query) ? "" : query));
+        }
+        if (pendingDelivery.isEmpty()) {
+            if (pendingHandover == null) {
+                this.deliverTo = null;
+            }
             return;
         }
         int stored = 0;
         int dropped = 0;
+        int count = 0;
+        ItemStack first = ItemStack.EMPTY;
         for (ItemStack stack : pendingDelivery) {
             if (stack.isEmpty()) {
                 continue;
             }
+            if (first.isEmpty()) {
+                first = stack.copyWithCount(1);
+            }
+            count += stack.getCount();
             ItemStack leftover = getInventory().addStack(stack);
             if (leftover.isEmpty()) {
                 stored++;
             } else {
-                this.dropStack(leftover);
+                putDown(leftover, requester);
                 dropped++;
             }
         }
         pendingDelivery.clear();
         this.deliverTo = null;
         if (stored > 0 || dropped > 0) {
+            String what = first.isEmpty() ? "it" : count + " " + ChestFinder.plainName(first);
             String note = dropped == 0
-                    ? "got it - right-click me to take it"
-                    : "my pack is full, so some of it is on the ground";
+                    ? "here's your " + what + " - right-click me to take it"
+                    : "my pack is full, so some of your " + what + " is on the ground by you";
             requester.sendMessage(Text.literal(Lumen.config().companionName + ": " + note)
                     .formatted(Formatting.AQUA), false);
         }
@@ -488,12 +773,23 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         return getMode() == Mode.GO_TO ? destination : null;
     }
 
+    /** True while Lumen is walking back to somebody with something for them. */
+    public boolean isReturningWithGoods() {
+        return deliverTo != null && (!pendingDelivery.isEmpty() || pendingHandover != null);
+    }
+
     /** Human readable state, fed to the model as part of the world snapshot. */
     public String describeActivity() {
         switch (getMode()) {
             case FOLLOW -> {
                 PlayerEntity target = getFollowTarget();
-                return target == null ? "standing around" : "following " + target.getName().getString();
+                if (target == null) {
+                    return "standing around";
+                }
+                if (isReturningWithGoods()) {
+                    return "bringing " + describePending() + " back to " + target.getName().getString();
+                }
+                return "following " + target.getName().getString();
             }
             case GO_TO -> {
                 BlockPos pos = getDestination();
@@ -514,6 +810,17 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         }
     }
 
+    private String describePending() {
+        if (pendingDelivery.isEmpty()) {
+            return "something";
+        }
+        int count = 0;
+        for (ItemStack stack : pendingDelivery) {
+            count += stack.getCount();
+        }
+        return count + " " + ChestFinder.plainName(pendingDelivery.get(0));
+    }
+
     // ---------------------------------------------------------------- inventory
 
     public SimpleInventory getInventory() {
@@ -524,19 +831,25 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
     }
 
     /**
-     * Opens Lumen's pack as an ordinary vanilla container screen. Because it is a
-     * vanilla screen the client already knows how to draw it, so this works on an
-     * unmodified client - the same reason Lumen borrows a vanilla entity type.
+     * Opens Lumen's pack as an ordinary vanilla container screen, with a bottom row
+     * showing what it is holding and wearing. Because it is a vanilla screen the
+     * client already knows how to draw it, so this works on an unmodified client -
+     * the same reason Lumen borrows a vanilla entity type.
      */
     @Override
     public ScreenHandler createMenu(int syncId, PlayerInventory playerInventory, PlayerEntity player) {
-        SimpleInventory pack = getInventory();
-        // Only the chest sizes take an existing inventory: createGeneric9x1/2/4/5 build
-        // their own, so a pack of any other size could not be shown at all. The config
-        // is clamped to 27 or 54 to match.
-        return pack.size() > 27
-                ? GenericContainerScreenHandler.createGeneric9x6(syncId, playerInventory, pack)
-                : GenericContainerScreenHandler.createGeneric9x3(syncId, playerInventory, pack);
+        LumenPackInventory view = new LumenPackInventory(this, getInventory());
+        // The pack is 27 or 45 slots, so with the equipment row the screen is 9x4 or
+        // 9x6 - both shapes a vanilla client can draw.
+        ScreenHandlerType<GenericContainerScreenHandler> type = view.rows() >= 6
+                ? ScreenHandlerType.GENERIC_9X6 : ScreenHandlerType.GENERIC_9X4;
+        return new GenericContainerScreenHandler(type, syncId, playerInventory, view, view.rows());
+    }
+
+    /** The pack screen, titled so the equipment row explains itself. */
+    private void openPack(PlayerEntity player) {
+        player.openHandledScreen(new SimpleNamedScreenHandlerFactory(this::createMenu,
+                Text.literal(Lumen.config().companionName + " - bottom row: hand, offhand, armour")));
     }
 
     /** "3 items" style summary for /lumen status and the world snapshot. */
@@ -610,6 +923,203 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         return bonus;
     }
 
+    // ------------------------------------------------------------- handing over
+
+    /** What a handover did. */
+    public record HandoverResult(int stacks, int items, String what, boolean droppedSome) {
+    }
+
+    static boolean meansEverything(@Nullable String query) {
+        return ChestFinder.meansEverything(query);
+    }
+
+    /**
+     * Asks Lumen to hand something over. If the player is close it happens now;
+     * otherwise Lumen walks over and does it on arrival, through {@link #deliverIfClose()}.
+     *
+     * @param query what to hand over, or null / "everything" for the lot
+     * @return the result if it happened now, or null if Lumen is on its way
+     */
+    @Nullable
+    public HandoverResult requestHandover(PlayerEntity player, @Nullable String query) {
+        String wanted = meansEverything(query) ? null : query.trim();
+        double reach = Math.max(3.0D, Lumen.config().followStartDistance);
+        if (this.squaredDistanceTo(player) <= reach * reach && player.getWorld() == this.getWorld()) {
+            return handOver(player, wanted);
+        }
+        this.pendingHandover = wanted == null ? "*" : wanted;
+        this.deliverTo = player.getUuid();
+        followPlayer(player);
+        return null;
+    }
+
+    /** Whether Lumen has anything at all that answers to {@code query} (null for anything). */
+    public boolean isCarrying(@Nullable String query) {
+        String wanted = meansEverything(query) ? null : query.trim();
+        return !carriedMatching(wanted).isEmpty();
+    }
+
+    /** One place an item lives on Lumen, so it can be taken from there. */
+    private interface Carried {
+        ItemStack peek();
+
+        ItemStack remove();
+    }
+
+    private List<Carried> carriedMatching(@Nullable String query) {
+        List<Carried> all = new ArrayList<>();
+        SimpleInventory inv = getInventory();
+        for (int slot = 0; slot < inv.size(); slot++) {
+            int index = slot;
+            all.add(new Carried() {
+                public ItemStack peek() {
+                    return inv.getStack(index);
+                }
+
+                public ItemStack remove() {
+                    return inv.removeStack(index);
+                }
+            });
+        }
+        for (EquipmentSlot slot : LumenPackInventory.EQUIPMENT) {
+            all.add(new Carried() {
+                public ItemStack peek() {
+                    return getEquippedStack(slot);
+                }
+
+                public ItemStack remove() {
+                    ItemStack worn = getEquippedStack(slot);
+                    equipStack(slot, ItemStack.EMPTY);
+                    return worn;
+                }
+            });
+        }
+        for (int i = 0; i < pendingDelivery.size(); i++) {
+            int index = i;
+            all.add(new Carried() {
+                public ItemStack peek() {
+                    return pendingDelivery.get(index);
+                }
+
+                public ItemStack remove() {
+                    ItemStack stack = pendingDelivery.get(index);
+                    pendingDelivery.set(index, ItemStack.EMPTY);
+                    return stack;
+                }
+            });
+        }
+        List<Carried> matching = new ArrayList<>();
+        if (query == null) {
+            for (Carried carried : all) {
+                if (!carried.peek().isEmpty()) {
+                    matching.add(carried);
+                }
+            }
+            return matching;
+        }
+        int best = ChestFinder.NO_MATCH;
+        for (Carried carried : all) {
+            best = Math.max(best, ChestFinder.matchScore(carried.peek(), query));
+        }
+        if (best == ChestFinder.NO_MATCH) {
+            return matching;
+        }
+        for (Carried carried : all) {
+            if (ChestFinder.matchScore(carried.peek(), query) == best) {
+                matching.add(carried);
+            }
+        }
+        return matching;
+    }
+
+    /**
+     * Puts items straight into the player's inventory - never on the ground, where
+     * Lumen's own pickup would have them back before the player could bend down.
+     * Whatever the player has no room for is set down beside them, and Lumen ignores
+     * it. Covers the pack, what is worn and held, and anything fetched but not yet
+     * delivered.
+     */
+    public HandoverResult handOver(PlayerEntity player, @Nullable String query) {
+        List<Carried> matching = carriedMatching(query);
+        int stacks = 0;
+        int items = 0;
+        boolean droppedSome = false;
+        ItemStack first = ItemStack.EMPTY;
+        for (Carried carried : matching) {
+            ItemStack stack = carried.remove();
+            if (stack.isEmpty()) {
+                continue;
+            }
+            if (first.isEmpty()) {
+                first = stack.copyWithCount(1);
+            }
+            stacks++;
+            items += stack.getCount();
+            if (!player.getInventory().insertStack(stack) || !stack.isEmpty()) {
+                if (!stack.isEmpty()) {
+                    putDown(stack, player);
+                    droppedSome = true;
+                }
+            }
+        }
+        pendingDelivery.removeIf(ItemStack::isEmpty);
+        if (pendingDelivery.isEmpty() && pendingHandover == null) {
+            this.deliverTo = null;
+        }
+        String what = first.isEmpty() ? "" : (stacks == 1 && items == 1
+                ? ChestFinder.plainName(first) : items + " " + ChestFinder.plainName(first)
+                + (stacks > 1 && query == null ? " and more" : ""));
+        return new HandoverResult(stacks, items, what, droppedSome);
+    }
+
+    /** The chat line for a handover that just happened. */
+    public static String describeHandover(HandoverResult result, String query) {
+        if (result.stacks() == 0) {
+            return query == null || query.isBlank() ? "i'm not carrying anything"
+                    : "i don't have any " + query.trim();
+        }
+        String line = "here you go" + (result.what().isEmpty() ? "" : " - " + result.what());
+        if (result.droppedSome()) {
+            line += ". your bag is full so some of it's on the ground by you";
+        }
+        return line;
+    }
+
+    /**
+     * Sets a stack down at the player's feet in a way Lumen will not pick straight
+     * back up: it remembers the item entity, and stops collecting anything at all for
+     * a while - the drop merges with others on the floor, changing its identity.
+     */
+    private void putDown(ItemStack stack, PlayerEntity player) {
+        if (stack.isEmpty()) {
+            return;
+        }
+        ItemEntity item = new ItemEntity(player.getWorld(), player.getX(), player.getY() + 0.3D, player.getZ(),
+                stack);
+        item.setPickupDelay(0);
+        item.setOwner(player.getUuid()); // only they can pick it up for a good while
+        item.setVelocity(0.0D, 0.1D, 0.0D);
+        player.getWorld().spawnEntity(item);
+        ignoreDrop(item);
+    }
+
+    /** Marks an item on the ground as Lumen's own doing, not loot. */
+    public void ignoreDrop(ItemEntity item) {
+        this.ownDrops.put(item.getUuid(), this.age + 20 * 60 * 5);
+        this.pickUpSuppressedUntil = this.age + 20 * 10;
+    }
+
+    /** Whether an item on the ground is fair game, rather than something Lumen just put down. */
+    public boolean wantsToPickUp(ItemEntity item) {
+        if (!Lumen.config().pickUpItems || !item.isAlive() || item.cannotPickup()) {
+            return false;
+        }
+        if (this.age < this.pickUpSuppressedUntil) {
+            return false;
+        }
+        return !ownDrops.containsKey(item.getUuid());
+    }
+
     /** Picks up anything Lumen is standing on top of. */
     private void collectNearbyItems() {
         LumenConfig config = Lumen.config();
@@ -617,9 +1127,12 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
             return;
         }
         this.pickUpCooldown = 10;
+        if (!ownDrops.isEmpty()) {
+            int now = this.age;
+            ownDrops.values().removeIf(expiry -> expiry < now);
+        }
         Box box = this.getBoundingBox().expand(1.0D, 0.5D, 1.0D);
-        List<ItemEntity> items = this.getWorld().getEntitiesByClass(ItemEntity.class, box,
-                item -> item.isAlive() && !item.cannotPickup());
+        List<ItemEntity> items = this.getWorld().getEntitiesByClass(ItemEntity.class, box, this::wantsToPickUp);
         for (ItemEntity item : items) {
             ItemStack stack = item.getStack();
             int accepted = give(stack);
@@ -667,18 +1180,25 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         }
     }
 
+    // ------------------------------------------------------------ doors and gates
+
     /**
-     * Opens a fence gate Lumen is walking into, and closes it again behind. Vanilla
-     * mobs cannot do this at all - only the pathfinder relaxation in
-     * LumenPathNodeMaker makes a closed gate routable in the first place.
+     * Opens a fence gate Lumen is walking into. Vanilla mobs cannot do this at all -
+     * only the pathfinder relaxation in LumenPathNodeMaker makes a closed gate
+     * routable in the first place. Closing is handled by {@link #handlePassages()},
+     * with a timer here as a fallback for a gate opened but never walked through.
      */
     private void handleFenceGates() {
         if (!Lumen.config().canOpenDoors) {
             return;
         }
         if (openedGate != null && --this.gateCloseTimer <= 0) {
-            setGateOpen(openedGate, false);
-            this.openedGate = null;
+            if (isInside(openedGate)) {
+                this.gateCloseTimer = 10; // still in it; look again shortly
+            } else {
+                setGateOpen(openedGate, false);
+                this.openedGate = null;
+            }
         }
         if (this.getNavigation().isIdle() || --this.gateScanCooldown > 0) {
             return;
@@ -717,10 +1237,111 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         return true;
     }
 
+    /**
+     * Closes doors and gates behind Lumen, including ones it did not open.
+     *
+     * <p>The vanilla door goal only ever closes a door it opened itself, and when
+     * Lumen follows a player through a doorway the player opened it. So every door or
+     * gate Lumen's body overlaps while moving is noted, and once Lumen is clear of it
+     * for half a second - and nobody else is standing in it - it is shut.
+     */
+    private void handlePassages() {
+        if (!Lumen.config().canOpenDoors) {
+            return;
+        }
+        World world = this.getWorld();
+        Box box = this.getBoundingBox();
+        Set<BlockPos> inside = new HashSet<>();
+        for (BlockPos pos : BlockPos.iterate(MathHelper.floor(box.minX), MathHelper.floor(box.minY),
+                MathHelper.floor(box.minZ), MathHelper.floor(box.maxX - 1.0E-6D),
+                MathHelper.floor(box.maxY - 1.0E-6D), MathHelper.floor(box.maxZ - 1.0E-6D))) {
+            BlockPos base = passageBase(world.getBlockState(pos), pos);
+            if (base != null) {
+                inside.add(base);
+            }
+        }
+        for (BlockPos pos : inside) {
+            passages.put(pos, 0);
+        }
+        if (passages.isEmpty()) {
+            return;
+        }
+        Iterator<Map.Entry<BlockPos, Integer>> iterator = passages.entrySet().iterator();
+        while (iterator.hasNext()) {
+            Map.Entry<BlockPos, Integer> entry = iterator.next();
+            BlockPos pos = entry.getKey();
+            if (inside.contains(pos)) {
+                continue;
+            }
+            int ticks = entry.getValue() + 1;
+            entry.setValue(ticks);
+            if (ticks > 100) {
+                iterator.remove(); // somebody keeps standing in it; not our problem
+                continue;
+            }
+            if (ticks < 10) {
+                continue;
+            }
+            if (this.squaredDistanceTo(pos.getX() + 0.5D, this.getY(), pos.getZ() + 0.5D) < 1.0D) {
+                continue; // still brushing against it
+            }
+            if (tryClosePassage(pos)) {
+                iterator.remove();
+            }
+        }
+    }
+
+    /** The lower door half or the gate block, if this is an open door or gate Lumen can use. */
+    @Nullable
+    private static BlockPos passageBase(BlockState state, BlockPos pos) {
+        if (state.getBlock() instanceof DoorBlock && DoorBlock.canOpenByHand(state)
+                && state.contains(DoorBlock.OPEN) && state.get(DoorBlock.OPEN)) {
+            return state.contains(DoorBlock.HALF) && state.get(DoorBlock.HALF) == DoubleBlockHalf.UPPER
+                    ? pos.down().toImmutable() : pos.toImmutable();
+        }
+        if (state.getBlock() instanceof FenceGateBlock && state.contains(Properties.OPEN)
+                && state.get(Properties.OPEN)) {
+            return pos.toImmutable();
+        }
+        return null;
+    }
+
+    /** @return true when the passage is closed now, or is gone and can be forgotten */
+    private boolean tryClosePassage(BlockPos pos) {
+        World world = this.getWorld();
+        if (!world.isChunkLoaded(pos.getX() >> 4, pos.getZ() >> 4)) {
+            return true;
+        }
+        BlockState state = world.getBlockState(pos);
+        boolean door = state.getBlock() instanceof DoorBlock;
+        boolean gate = state.getBlock() instanceof FenceGateBlock;
+        if (!door && !gate) {
+            return true;
+        }
+        if (!state.contains(Properties.OPEN) || !state.get(Properties.OPEN)) {
+            return true; // already shut, by the player or the door goal
+        }
+        // Never shut it on somebody: the player is usually a step behind or ahead.
+        Box doorway = new Box(pos).stretch(0.0D, 1.0D, 0.0D).expand(0.2D, 0.0D, 0.2D);
+        if (!world.getOtherEntities(this, doorway, entity -> entity instanceof LivingEntity).isEmpty()) {
+            return false;
+        }
+        if (door) {
+            ((DoorBlock) state.getBlock()).setOpen(this, world, state, pos, false);
+            return true;
+        }
+        return setGateOpen(pos, false);
+    }
+
+    private boolean isInside(BlockPos pos) {
+        return this.getBoundingBox().intersects(new Box(pos));
+    }
+
     /** True while Lumen is on a task a passing remark should not cancel. */
     public boolean isOnErrand() {
         Mode current = getMode();
-        return current == Mode.FETCH || current == Mode.MINE || current == Mode.GO_TO;
+        return current == Mode.FETCH || current == Mode.MINE || current == Mode.GO_TO
+                || (current == Mode.FOLLOW && isReturningWithGoods());
     }
 
     // ------------------------------------------------------------------- mining
@@ -741,6 +1362,7 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         }
         this.mineQuery = query;
         this.deliverTo = requester.getUuid();
+        setOwner(requester);
         this.minedCount = 0;
         this.minedPositions.clear();
         this.followTarget = null;
@@ -829,15 +1451,22 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         // which is items from nothing and the block still standing.
         List<ItemStack> drops = Block.getDroppedStacks(state, world, target,
                 world.getBlockEntity(target), this, tool);
-        if (!world.breakBlock(target, false, this)) {
+        // The break is done in the name of whoever asked. Claim mods check the entity
+        // handed to breakBlock: a mob is refused inside a claim, its owner is not.
+        PlayerEntity requester = deliverTo == null ? null : world.getPlayerByUuid(deliverTo);
+        Entity breaker = requester != null && requester.getWorld() == world ? requester : this;
+        if (!world.breakBlock(target, false, breaker)) {
             String blockId = Registries.BLOCK.getId(state.getBlock()).toString();
-            Lumen.LOGGER.warn("world.breakBlock refused {} at {} (chunk loaded: {}); "
+            Lumen.LOGGER.warn("world.breakBlock refused {} at {} as {} (chunk loaded: {}); "
                             + "drops not banked. Most likely a protection or claim mod.",
-                    blockId, target.toShortString(),
+                    blockId, target.toShortString(), breaker.getName().getString(),
                     world.isChunkLoaded(target.getX() >> 4, target.getZ() >> 4));
             finishMining();
-            return "something won't let me break that " + state.getBlock().getName().getString()
-                    .toLowerCase(Locale.ROOT);
+            String blockName = state.getBlock().getName().getString().toLowerCase(Locale.ROOT);
+            return requester == null
+                    ? "something won't let me break that " + blockName
+                    : "something won't let me break that " + blockName + " - i tried as "
+                            + requester.getName().getString() + ", so check the claim permissions there";
         }
         for (ItemStack drop : drops) {
             if (!drop.isEmpty()) {
@@ -939,7 +1568,8 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
     /**
      * Modded blocks and awkward geometry strand vanilla navigation. Rather than
      * needing a despawn/respawn, notice that Lumen wants to move and is not moving,
-     * re-path, and warp as a last resort.
+     * re-path, and warp as a last resort. Standing with no path at all counts double,
+     * so "there is no route" is answered in a few seconds, not eight.
      */
     private void updateStuckState() {
         LumenConfig config = Lumen.config();
@@ -954,8 +1584,8 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
             this.stuckTicks = 0;
             return;
         }
-        this.stuckTicks++;
-        if (this.stuckTicks == config.stuckRepathTicks) {
+        this.stuckTicks += this.getNavigation().isIdle() ? 2 : 1;
+        if (this.stuckTicks == config.stuckRepathTicks || this.stuckTicks == config.stuckRepathTicks + 1) {
             this.getNavigation().recalculatePath();
             this.getJumpControl().setActive();
         } else if (this.stuckTicks >= config.stuckTeleportTicks) {
@@ -1001,7 +1631,7 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
 
     /** Puts Lumen on a free block near {@code base}. No-op if nowhere sensible is free. */
     public boolean teleportNear(BlockPos base) {
-        for (int attempt = 0; attempt < 16; attempt++) {
+        for (int attempt = 0; attempt < 24; attempt++) {
             int dx = this.getRandom().nextInt(5) - 2;
             int dy = this.getRandom().nextInt(3) - 1;
             int dz = this.getRandom().nextInt(5) - 2;
@@ -1067,7 +1697,8 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
     /**
      * Walks toward a block by aiming at a standable neighbour of it.
      *
-     * @return false when the navigator could not produce a path
+     * @return false when the navigator could not produce a path that goes anywhere -
+     *         either none at all, or one that stops where Lumen already stands
      */
     public boolean moveToBlock(BlockPos target, double speed) {
         // Only detour to a neighbour when the target itself cannot be stood in - a
@@ -1081,8 +1712,49 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
                 goal = approach;
             }
         }
-        return this.getNavigation().startMovingTo(
+        boolean started = this.getNavigation().startMovingTo(
                 goal.getX() + 0.5D, goal.getY(), goal.getZ() + 0.5D, speed);
+        return started && !pathGoesNowhere();
+    }
+
+    /**
+     * True when the current path does not reach its target and ends where Lumen
+     * already is - the pathfinder's way of saying "no route", which vanilla reports
+     * as success. Following it means standing still and looking busy.
+     */
+    public boolean pathGoesNowhere() {
+        Path path = this.getNavigation().getCurrentPath();
+        if (path == null) {
+            return true;
+        }
+        if (path.reachesTarget()) {
+            return false;
+        }
+        PathNode end = path.getEnd();
+        return end != null && this.getBlockPos().isWithinDistance(new BlockPos(end.x, end.y, end.z), 1.5D);
+    }
+
+    /** Where Lumen is currently trying to get to, for /lumen why. Null when idle. */
+    @Nullable
+    public BlockPos currentTarget() {
+        switch (getMode()) {
+            case FOLLOW -> {
+                PlayerEntity target = getFollowTarget();
+                return target == null ? null : target.getBlockPos();
+            }
+            case GO_TO -> {
+                return destination;
+            }
+            case FETCH -> {
+                return fetchChest;
+            }
+            case MINE -> {
+                return mineTarget;
+            }
+            default -> {
+                return null;
+            }
+        }
     }
 
     /**
@@ -1143,6 +1815,7 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         }
         updateStuckState();
         handleFenceGates();
+        handlePassages();
         collectNearbyItems();
         deliverIfClose();
         eatIfHurt();
@@ -1164,7 +1837,7 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
 
         // Empty handed, or sneaking so you can open it while holding something.
         if (offered.isEmpty() || player.isSneaking()) {
-            player.openHandledScreen(this);
+            openPack(player);
             return ActionResult.SUCCESS;
         }
 
@@ -1184,14 +1857,15 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
             return ActionResult.SUCCESS;
         }
 
-        player.openHandledScreen(this);
+        openPack(player);
         return ActionResult.SUCCESS;
     }
 
     /**
      * Puts everything Lumen is carrying on the ground: pack, worn gear and anything
      * fetched but not yet handed over. Used by despawn, which previously deleted the
-     * lot, and by /lumen drop.
+     * lot. Players get things back through {@link #handOver} instead - this is the
+     * path for when there is no player to hand them to.
      *
      * @return how many stacks were dropped
      */
@@ -1201,7 +1875,7 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         for (int slot = 0; slot < pack.size(); slot++) {
             ItemStack stack = pack.getStack(slot);
             if (!stack.isEmpty()) {
-                this.dropStack(stack);
+                dropAndIgnore(stack);
                 dropped++;
             }
         }
@@ -1209,19 +1883,26 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         for (EquipmentSlot slot : EquipmentSlot.values()) {
             ItemStack equipped = this.getEquippedStack(slot);
             if (!equipped.isEmpty()) {
-                this.dropStack(equipped);
+                dropAndIgnore(equipped);
                 this.equipStack(slot, ItemStack.EMPTY);
                 dropped++;
             }
         }
         for (ItemStack stack : pendingDelivery) {
             if (!stack.isEmpty()) {
-                this.dropStack(stack);
+                dropAndIgnore(stack);
                 dropped++;
             }
         }
         pendingDelivery.clear();
         return dropped;
+    }
+
+    private void dropAndIgnore(ItemStack stack) {
+        ItemEntity item = this.dropStack(stack);
+        if (item != null) {
+            ignoreDrop(item);
+        }
     }
 
     @Override

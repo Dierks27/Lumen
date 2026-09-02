@@ -14,6 +14,7 @@ public class LumenGoToGoal extends Goal {
     private BlockPos destination;
     private int repathCountdown;
     private int giveUpTicks;
+    private int noRouteRounds;
 
     public LumenGoToGoal(LumenEntity lumen) {
         this.lumen = lumen;
@@ -42,6 +43,7 @@ public class LumenGoToGoal extends Goal {
     public void start() {
         this.repathCountdown = 0;
         this.giveUpTicks = 0;
+        this.noRouteRounds = 0;
     }
 
     @Override
@@ -67,8 +69,17 @@ public class LumenGoToGoal extends Goal {
         this.repathCountdown = this.getTickCount(20);
 
         boolean moving = lumen.moveToBlock(destination, Lumen.config().followSpeedMultiplier);
-        if (!moving && lumen.getNavigation().isIdle()) {
-            // Unreachable - stop pretending and go back to idling.
+        if (moving) {
+            this.noRouteRounds = 0;
+            return;
+        }
+        if (++this.noRouteRounds < 3) {
+            return;
+        }
+        // No route at all. "Come" is a request to be there, so warp if it is close
+        // enough to be reasonable, and give up honestly otherwise.
+        double warp = Lumen.config().teleportDistance;
+        if (!lumen.getBlockPos().isWithinDistance(destination, warp) || !lumen.teleportNear(destination)) {
             lumen.stopAndIdle();
         }
     }
