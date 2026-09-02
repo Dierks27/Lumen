@@ -38,10 +38,15 @@ specific code.
 - Follows, goes to a spot, wanders when idle
 
 **Doing things**
-- A 27 slot pack: hand items over by right-clicking, picks things up off the ground,
-  wears or wields anything better than what it has, drops it all on death
+- A real inventory: right-click Lumen (empty handed, or sneaking) to open its pack as
+  an ordinary chest screen and hand over tools, armour, weapons and food. It wears or
+  wields anything better than what it has, picks things up off the ground, and drops
+  the lot on death
 - Fetches from chests, barrels and modded containers: *"lumen find me some iron"*
-- Defends itself and whoever it is following against hostile mobs
+- Mines on request: *"lumen go mine some iron"* - walks to the ore, breaks it at the
+  speed its tool allows, and brings the haul back
+- Defends itself and whoever it is following against hostile mobs, and eats from its
+  pack when hurt
 
 ## Server-side only, and what that costs
 
@@ -69,6 +74,26 @@ mechanism with different trade-offs (no vanilla goal AI or navigation). See
 Because Lumen wears a borrowed type, it is never written to the region file - otherwise
 it would come back after a restart as a real villager. Re-run `/lumen spawn` after a
 server restart.
+
+## Mining
+
+`lumen go mine some iron`, or `/lumen mine iron`. Lumen finds the nearest matching
+block it can actually reach, walks to a neighbouring space, and breaks it at roughly
+the speed a player holding the same tool would manage - with the vanilla cracking
+overlay, so you can watch it work. The drops are banked for whoever asked rather than
+scattered on the floor, and the tool takes durability.
+
+Since this is the one feature that changes the world without being watched, it is
+fenced in:
+
+- **Containers are never broken.** Any block with a block entity is skipped, so
+  chests, furnaces and modded machines are safe.
+- **Ore wins ties.** "mine iron" heads for iron ore, not the iron blocks in a wall.
+- **No tool, no mining.** A block that needs a pickaxe Lumen does not have ends the
+  errand with a message rather than silently failing. Give it a pickaxe through its
+  inventory screen.
+- **Bounded.** `maxMineBlocks` per errand, `miningRadius` for the search, and
+  `allowMining: false` turns the whole thing off.
 
 ## Pathfinding and modded blocks
 
@@ -156,10 +181,14 @@ curl http://192.168.50.51:11434/v1/models
 | `appearanceEntity` | `minecraft:villager` | Vanilla type clients render. |
 | `canOpenDoors` | `true` | Path through and open wooden doors. |
 | `stuckRepathTicks` / `stuckTeleportTicks` | `60` / `160` | No-progress thresholds before re-pathing, then warping. |
-| `inventorySize` | `27` | |
+| `inventorySize` | `27` | 27 or 54 - the two sizes a vanilla chest screen can show. |
 | `acceptItemsFromPlayers` / `pickUpItems` | `true` | Right-click handover, ground pickup. |
 | `dropInventoryOnDeath` | `true` | |
 | `allowChestAccess` | `true` | Let Lumen take requested items out of containers. |
+| `allowMining` | `true` | Let Lumen break blocks on request. |
+| `miningRadius` / `miningHeight` | `12` / `8` | How far it looks for something to mine. |
+| `maxMineBlocks` | `8` | Blocks broken per errand before it brings the haul back. |
+| `eatWhenHurt` / `eatHealthFraction` | `true` / `0.6` | Eat from the pack below this much health. |
 | `chestSearchRadius` / `memoryRecallRadius` | `16` / `64` | Cold search vs. walking to a remembered container. |
 | `maxFetchStacks` | `3` | Stacks taken per errand. |
 | `combat` / `attackDamage` / `defendRadius` | `true` / `3.0` / `12` | Defends itself and whoever it follows. |
@@ -216,20 +245,22 @@ misbehave anyway.
 | `/lumen come` / `stay` / `follow [player]` | everyone | Manual control, no LLM involved |
 | `/lumen here` | everyone | Warp Lumen to you - the escape hatch when pathing loses |
 | `/lumen find <item>` | everyone | Fetch an item from a nearby container |
+| `/lumen mine <block>` | everyone | Go break blocks of that kind and bring them back |
 | `/lumen inventory` | everyone | What Lumen is carrying and wearing |
 | `/lumen memory` | everyone | Places Lumen remembers finding things |
 | `/lumen why` | everyone | Why Lumen is not moving, and what is blocking it |
 | `/lumen spawn` / `despawn` / `reload` / `forget` | level 2 | |
 
-Right-clicking Lumen hands over whatever you are holding, or reports what it is doing
-if your hand is empty.
+Right-clicking Lumen with something in hand gives it that item. Right-clicking empty
+handed - or while sneaking - opens its pack as a chest screen you can move things in
+and out of.
 
 ## Roadmap
 
-**Next - productive work**
-- Mining, chopping and gathering on request
+**Next**
 - Named places (`remember this as home`) and going back to them
 - Crafting from what is in the pack
+- Farming: planting, harvesting, replanting
 
 **Phase 3 - polish**
 - Player model + custom skin from `config/lumen/skins/`. This needs the fake

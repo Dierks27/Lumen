@@ -26,7 +26,9 @@ jobs:
         uses: gradle/actions/wrapper-validation@v4
 
       - name: Build
-        run: ./gradlew build --stacktrace --no-daemon
+        # No --stacktrace: on a compile failure it buries the javac error under
+        # hundreds of lines of Gradle internals, which is the output people read.
+        run: ./gradlew build --no-daemon
 
       - name: Upload jar
         uses: actions/upload-artifact@v4

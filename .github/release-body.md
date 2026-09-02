@@ -35,6 +35,11 @@ ollama run qwen2.5:14b "hello"
   if that gets noisy and it will only reply when a message mentions it.
 - Lumen remembers where it found things in `config/lumen/memory.json`, so it survives
   restarts. `/lumen memory` shows what it knows, `/lumen forget` clears it.
+- Right-click Lumen empty handed (or while sneaking) to open its pack and give it
+  tools, armour, weapons and food. Give it a pickaxe before asking it to mine.
+- `/lumen mine <block>` and `/lumen find <item>` send it off to work. Mining never
+  breaks containers and is bounded by `maxMineBlocks`; set `allowMining: false` to
+  disable it entirely.
 - If Lumen gets stuck, `/lumen here` warps it to you and `/lumen why` names the blocks
   around it that vanilla pathfinding refuses to route through - that output is the
   fastest way to find the mod at fault.

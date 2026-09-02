@@ -5,8 +5,11 @@ import com.lilahcraft.lumen.LumenConfig;
 import com.lilahcraft.lumen.entity.goal.LumenFetchGoal;
 import com.lilahcraft.lumen.entity.goal.LumenFollowGoal;
 import com.lilahcraft.lumen.entity.goal.LumenGoToGoal;
+import com.lilahcraft.lumen.entity.goal.LumenMineGoal;
 import com.lilahcraft.lumen.entity.goal.LumenPickUpItemGoal;
 import com.lilahcraft.lumen.entity.goal.LumenWanderGoal;
+import net.minecraft.block.Block;
+import net.minecraft.block.BlockState;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.EntityType;
 import net.minecraft.entity.EquipmentSlot;
@@ -32,9 +35,14 @@ import net.minecraft.entity.mob.PathAwareEntity;
 import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.inventory.Inventory;
 import net.minecraft.inventory.SimpleInventory;
+import net.minecraft.entity.player.PlayerInventory;
+import net.minecraft.item.FoodComponent;
 import net.minecraft.item.ItemStack;
 import net.minecraft.nbt.NbtCompound;
 import net.minecraft.registry.Registries;
+import net.minecraft.screen.GenericContainerScreenHandler;
+import net.minecraft.screen.NamedScreenHandlerFactory;
+import net.minecraft.screen.ScreenHandler;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.sound.SoundCategory;
 import net.minecraft.sound.SoundEvent;
@@ -53,6 +61,7 @@ import org.jetbrains.annotations.Nullable;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 import java.util.UUID;
 
@@ -66,7 +75,7 @@ import java.util.UUID;
  * behaviour below runs only on the server. The flip side is that Lumen must never be
  * written to disk as that vanilla type, hence {@link #saveSelfNbt(NbtCompound)}.
  */
-public class LumenEntity extends PathAwareEntity {
+public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFactory {
 
     public enum Mode {
         /** Hang around, wander a bit, pick things up. */
@@ -76,7 +85,9 @@ public class LumenEntity extends PathAwareEntity {
         /** Walk to a fixed position, then go back to idling. */
         GO_TO,
         /** Walk to a container, take what was asked for, then bring it back. */
-        FETCH
+        FETCH,
+        /** Break blocks of a requested kind, then bring the haul back. */
+        MINE
     }
 
     private Mode mode;
@@ -95,9 +106,17 @@ public class LumenEntity extends PathAwareEntity {
     private final Set<BlockPos> triedContainers = new HashSet<>();
     private int fetchAttempts;
 
+    private BlockPos mineTarget;
+    private String mineQuery;
+    private int minedCount;
+    /** Blocks already broken or ruled out this errand, so the search moves on. */
+    private final Set<BlockPos> minedPositions = new HashSet<>();
+
     private Vec3d lastProgressPos;
     private int stuckTicks;
     private int pickUpCooldown;
+    private int eatCooldown;
+    private int equipCooldown;
 
     public LumenEntity(EntityType<? extends PathAwareEntity> entityType, World world) {
         super(entityType, world);
@@ -198,6 +217,7 @@ public class LumenEntity extends PathAwareEntity {
         this.goalSelector.add(2, new LumenFollowGoal(this));
         this.goalSelector.add(3, new LumenGoToGoal(this));
         this.goalSelector.add(3, new LumenFetchGoal(this));
+        this.goalSelector.add(3, new LumenMineGoal(this));
         this.goalSelector.add(4, new MeleeAttackGoal(this, 1.2D, true));
         this.goalSelector.add(5, new LumenPickUpItemGoal(this));
         this.goalSelector.add(6, new LumenWanderGoal(this, 0.7D));
@@ -238,6 +258,9 @@ public class LumenEntity extends PathAwareEntity {
         this.fetchQuery = null;
         this.triedContainers.clear();
         this.fetchAttempts = 0;
+        this.mineTarget = null;
+        this.mineQuery = null;
+        this.minedPositions.clear();
         this.stuckTicks = 0;
         this.getNavigation().stop();
         // pendingDelivery survives: whatever Lumen fetched still belongs to whoever
@@ -427,6 +450,10 @@ public class LumenEntity extends PathAwareEntity {
                 return fetchQuery == null ? "standing around"
                         : "going to a nearby container to fetch " + fetchQuery;
             }
+            case MINE -> {
+                return mineQuery == null ? "standing around"
+                        : "mining " + mineQuery + " (" + minedCount + " so far)";
+            }
             default -> {
                 return "standing around";
             }
@@ -440,6 +467,22 @@ public class LumenEntity extends PathAwareEntity {
             inventory = new SimpleInventory(Math.max(1, Lumen.config().inventorySize));
         }
         return inventory;
+    }
+
+    /**
+     * Opens Lumen's pack as an ordinary vanilla container screen. Because it is a
+     * vanilla screen the client already knows how to draw it, so this works on an
+     * unmodified client - the same reason Lumen borrows a vanilla entity type.
+     */
+    @Override
+    public ScreenHandler createMenu(int syncId, PlayerInventory playerInventory, PlayerEntity player) {
+        SimpleInventory pack = getInventory();
+        // Only the chest sizes take an existing inventory: createGeneric9x1/2/4/5 build
+        // their own, so a pack of any other size could not be shown at all. The config
+        // is clamped to 27 or 54 to match.
+        return pack.size() > 27
+                ? GenericContainerScreenHandler.createGeneric9x6(syncId, playerInventory, pack)
+                : GenericContainerScreenHandler.createGeneric9x3(syncId, playerInventory, pack);
     }
 
     /** "3 items" style summary for /lumen status and the world snapshot. */
@@ -536,6 +579,154 @@ public class LumenEntity extends PathAwareEntity {
         }
     }
 
+    /**
+     * Eats something from the pack when hurt. Lumen has no hunger bar, so food is
+     * simply a heal - which is the only way it recovers health at all.
+     */
+    private void eatIfHurt() {
+        LumenConfig config = Lumen.config();
+        if (!config.eatWhenHurt || --this.eatCooldown > 0) {
+            return;
+        }
+        this.eatCooldown = 40;
+        if (this.getHealth() >= this.getMaxHealth() * config.eatHealthFraction) {
+            return;
+        }
+        SimpleInventory pack = getInventory();
+        for (int slot = 0; slot < pack.size(); slot++) {
+            ItemStack stack = pack.getStack(slot);
+            if (stack.isEmpty()) {
+                continue;
+            }
+            FoodComponent food = stack.getItem().getFoodComponent();
+            if (food == null) {
+                continue;
+            }
+            this.heal(Math.max(1.0F, food.getHunger() / 2.0F));
+            this.playSound(SoundEvents.ENTITY_GENERIC_EAT, 0.8F, 1.0F);
+            stack.decrement(1);
+            if (stack.isEmpty()) {
+                pack.setStack(slot, ItemStack.EMPTY);
+            }
+            this.eatCooldown = 100;
+            return;
+        }
+    }
+
+    // ------------------------------------------------------------------- mining
+
+    /**
+     * Sends Lumen off to break blocks matching {@code query} and bring them back.
+     *
+     * @return false when nothing suitable is in range, so the caller can say so
+     */
+    public boolean startMining(PlayerEntity requester, String query) {
+        LumenConfig config = Lumen.config();
+        if (!config.allowMining || !(this.getWorld() instanceof ServerWorld world)) {
+            return false;
+        }
+        this.mineQuery = query;
+        this.deliverTo = requester.getUuid();
+        this.minedCount = 0;
+        this.minedPositions.clear();
+        this.followTarget = null;
+        this.destination = null;
+        this.stuckTicks = 0;
+        return targetNextBlock(world);
+    }
+
+    private boolean targetNextBlock(ServerWorld world) {
+        LumenConfig config = Lumen.config();
+        BlockPos next = MineFinder.findNearest(world, this, mineQuery,
+                config.miningRadius, config.miningHeight, minedPositions);
+        if (next == null) {
+            return false;
+        }
+        this.mode = Mode.MINE;
+        this.mineTarget = next;
+        return true;
+    }
+
+    @Nullable
+    public BlockPos getMineTarget() {
+        return getMode() == Mode.MINE ? mineTarget : null;
+    }
+
+    /**
+     * Breaks the block Lumen has been standing at, banks the drops for delivery, and
+     * lines up the next one.
+     *
+     * @return a message to relay if the errand ended, otherwise null to keep going
+     */
+    @Nullable
+    public String breakTargetBlock() {
+        LumenConfig config = Lumen.config();
+        BlockPos target = this.mineTarget;
+        if (target == null || !(this.getWorld() instanceof ServerWorld world)) {
+            finishMining();
+            return null;
+        }
+        this.minedPositions.add(target);
+        this.mineTarget = null;
+
+        BlockState state = world.getBlockState(target);
+        if (!MineFinder.isMineable(world, state, target)) {
+            return continueOrFinish(world);
+        }
+
+        ItemStack tool = this.getMainHandStack();
+        if (state.isToolRequired() && !tool.isSuitableFor(state)) {
+            String needed = tool.isEmpty() ? "a tool" : "a better tool";
+            finishMining();
+            return "can't break " + state.getBlock().getName().getString().toLowerCase(Locale.ROOT)
+                    + " without " + needed;
+        }
+
+        for (ItemStack drop : Block.getDroppedStacks(state, world, target, world.getBlockEntity(target), this, tool)) {
+            if (!drop.isEmpty()) {
+                pendingDelivery.add(drop);
+            }
+        }
+        // drops=false: the drops are already banked above, so they go to whoever asked
+        // instead of scattering on the floor.
+        world.breakBlock(target, false, this);
+        world.setBlockBreakingInfo(this.getId(), target, -1);
+        this.swingHand(Hand.MAIN_HAND);
+        if (!tool.isEmpty()) {
+            tool.damage(1, this, holder -> holder.sendEquipmentBreakStatus(EquipmentSlot.MAINHAND));
+        }
+        this.minedCount++;
+
+        if (this.minedCount >= config.maxMineBlocks) {
+            finishMining();
+            return null;
+        }
+        return continueOrFinish(world);
+    }
+
+    private String continueOrFinish(ServerWorld world) {
+        if (!targetNextBlock(world)) {
+            finishMining();
+        }
+        return null;
+    }
+
+    /** Ends the errand and heads back to whoever asked, carrying the haul. */
+    public void finishMining() {
+        this.mineTarget = null;
+        this.mineQuery = null;
+        this.minedPositions.clear();
+        if (this.getWorld() instanceof ServerWorld world) {
+            world.setBlockBreakingInfo(this.getId(), this.getBlockPos(), -1);
+        }
+        PlayerEntity requester = deliverTo == null ? null : this.getWorld().getPlayerByUuid(deliverTo);
+        if (requester != null) {
+            followPlayer(requester);
+        } else {
+            stopAndIdle();
+        }
+    }
+
     // ------------------------------------------------------------------- combat
 
     /** Only fight things that threaten Lumen or the player it is looking after. */
@@ -620,8 +811,12 @@ public class LumenEntity extends PathAwareEntity {
                 return target != null && !this.getBlockPos().isWithinDistance(target, 2.0D) ? target : null;
             }
             case FETCH -> {
-                return fetchChest != null && !this.getBlockPos().isWithinDistance(fetchChest, 2.5D)
+                return fetchChest != null && !this.getBlockPos().isWithinDistance(fetchChest, 3.0D)
                         ? fetchChest : null;
+            }
+            case MINE -> {
+                return mineTarget != null && !this.getBlockPos().isWithinDistance(mineTarget, 4.0D)
+                        ? mineTarget : null;
             }
             default -> {
                 return null;
@@ -636,7 +831,7 @@ public class LumenEntity extends PathAwareEntity {
             int dy = this.getRandom().nextInt(3) - 1;
             int dz = this.getRandom().nextInt(5) - 2;
             BlockPos candidate = base.add(dx, dy, dz);
-            if (isFreeToStandIn(candidate)) {
+            if (canStandAt(candidate)) {
                 this.getNavigation().stop();
                 this.refreshPositionAndAngles(candidate.getX() + 0.5D, candidate.getY(), candidate.getZ() + 0.5D,
                         this.getYaw(), this.getPitch());
@@ -648,7 +843,8 @@ public class LumenEntity extends PathAwareEntity {
         return false;
     }
 
-    private boolean isFreeToStandIn(BlockPos pos) {
+    /** Somewhere Lumen could actually stand: room for feet and head, solid floor. */
+    public boolean canStandAt(BlockPos pos) {
         World world = this.getWorld();
         if (!world.isChunkLoaded(pos.getX() >> 4, pos.getZ() >> 4)) {
             return false;
@@ -656,6 +852,53 @@ public class LumenEntity extends PathAwareEntity {
         return world.getBlockState(pos).getCollisionShape(world, pos).isEmpty()
                 && world.getBlockState(pos.up()).getCollisionShape(world, pos.up()).isEmpty()
                 && !world.getBlockState(pos.down()).getCollisionShape(world, pos.down()).isEmpty();
+    }
+
+    /**
+     * A spot next to {@code target} that Lumen can stand on.
+     *
+     * <p>Needed because you cannot path *into* a chest, a furnace or any other solid
+     * block: the pathfinder finds no node at that position, returns no path, and the
+     * caller concludes the target is unreachable. Walking to a neighbour and reaching
+     * from there is what a player does.
+     *
+     * @return the nearest standable neighbour, or null if the target is walled in
+     */
+    @Nullable
+    public BlockPos findApproach(BlockPos target) {
+        BlockPos best = null;
+        double bestDistance = Double.MAX_VALUE;
+        for (int dx = -1; dx <= 1; dx++) {
+            for (int dz = -1; dz <= 1; dz++) {
+                for (int dy = -1; dy <= 1; dy++) {
+                    if (dx == 0 && dz == 0 && dy == 0) {
+                        continue;
+                    }
+                    BlockPos candidate = target.add(dx, dy, dz);
+                    if (!canStandAt(candidate)) {
+                        continue;
+                    }
+                    double distance = candidate.getSquaredDistance(this.getBlockPos());
+                    if (distance < bestDistance) {
+                        bestDistance = distance;
+                        best = candidate;
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
+    /**
+     * Walks toward a block by aiming at a standable neighbour of it.
+     *
+     * @return false when the navigator could not produce a path
+     */
+    public boolean moveToBlock(BlockPos target, double speed) {
+        BlockPos approach = findApproach(target);
+        BlockPos goal = approach == null ? target : approach;
+        return this.getNavigation().startMovingTo(
+                goal.getX() + 0.5D, goal.getY(), goal.getZ() + 0.5D, speed);
     }
 
     // --------------------------------------------------------------- lifecycle
@@ -676,6 +919,13 @@ public class LumenEntity extends PathAwareEntity {
         updateStuckState();
         collectNearbyItems();
         deliverIfClose();
+        eatIfHurt();
+        // Picks up gear a player just dropped into the screen, without needing a hook
+        // on the screen closing.
+        if (--this.equipCooldown <= 0) {
+            this.equipCooldown = 40;
+            equipBetterGear();
+        }
     }
 
     @Override
@@ -686,7 +936,13 @@ public class LumenEntity extends PathAwareEntity {
         LumenConfig config = Lumen.config();
         ItemStack offered = player.getStackInHand(hand);
 
-        if (!offered.isEmpty() && config.acceptItemsFromPlayers) {
+        // Empty handed, or sneaking so you can open it while holding something.
+        if (offered.isEmpty() || player.isSneaking()) {
+            player.openHandledScreen(this);
+            return ActionResult.SUCCESS;
+        }
+
+        if (config.acceptItemsFromPlayers) {
             int accepted = give(offered);
             if (accepted <= 0) {
                 player.sendMessage(Text.literal(config.companionName + " has no room for that.")
@@ -702,8 +958,7 @@ public class LumenEntity extends PathAwareEntity {
             return ActionResult.SUCCESS;
         }
 
-        player.sendMessage(Text.literal(config.companionName + " is " + describeActivity()
-                + " (carrying " + countCarriedStacks() + " stacks).").formatted(Formatting.GRAY), false);
+        player.openHandledScreen(this);
         return ActionResult.SUCCESS;
     }
 

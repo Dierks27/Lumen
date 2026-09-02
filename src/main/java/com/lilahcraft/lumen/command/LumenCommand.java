@@ -68,6 +68,9 @@ public final class LumenCommand {
                 .then(CommandManager.literal("find")
                         .then(CommandManager.argument("item", StringArgumentType.greedyString())
                                 .executes(LumenCommand::find)))
+                .then(CommandManager.literal("mine")
+                        .then(CommandManager.argument("block", StringArgumentType.greedyString())
+                                .executes(LumenCommand::mine)))
                 .then(CommandManager.literal("follow")
                         .executes(context -> follow(context, context.getSource().getPlayerOrThrow()))
                         .then(CommandManager.argument("player", EntityArgumentType.player())
@@ -256,6 +259,29 @@ public final class LumenCommand {
         }
         source.sendFeedback(() -> Text.literal(Lumen.config().companionName
                 + " goes looking for " + query + ".").formatted(Formatting.AQUA), false);
+        return 1;
+    }
+
+    private static int mine(CommandContext<ServerCommandSource> context) throws CommandSyntaxException {
+        ServerCommandSource source = context.getSource();
+        ServerPlayerEntity player = source.getPlayerOrThrow();
+        LumenEntity lumen = requireLumen(source);
+        if (lumen == null) {
+            return 0;
+        }
+        if (!Lumen.config().allowMining) {
+            source.sendError(Text.literal("Mining is turned off in the config."));
+            return 0;
+        }
+        String query = StringArgumentType.getString(context, "block");
+        if (!lumen.startMining(player, query)) {
+            source.sendError(Text.literal("Nothing matching \"" + query + "\" within "
+                    + Math.round(Lumen.config().miningRadius) + " blocks that "
+                    + Lumen.config().companionName + " can reach."));
+            return 0;
+        }
+        source.sendFeedback(() -> Text.literal(Lumen.config().companionName
+                + " goes off to mine " + query + ".").formatted(Formatting.AQUA), false);
         return 1;
     }
 
