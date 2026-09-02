@@ -188,14 +188,16 @@ Hard-won details that shaped this build:
 
 ## Releases
 
-Pushing a `v*` tag builds the mod and publishes a GitHub release with the jar
-attached:
+`mod_version` in `gradle.properties` is the single source of truth. When a push
+names a version that has no release yet, the `release` workflow builds the mod,
+tags the commit and publishes a GitHub release with the jar attached. So cutting
+a release is just:
 
 ```
-git tag v0.2.0 && git push origin v0.2.0
+mod_version=0.2.0
 ```
 
-Keep `mod_version` in `gradle.properties` in step with the tag.
+Pushes that do not change the version finish the check in a few seconds and stop.
 
 ## Licence
 

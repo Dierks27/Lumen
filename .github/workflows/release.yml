@@ -1,13 +1,13 @@
 name: release
 
+# Cuts a release whenever mod_version in gradle.properties names a version that
+# does not have one yet, so bumping the version is all it takes to ship a build.
+# The check runs before the build, so ordinary pushes cost a few seconds.
 on:
   push:
+    branches: ["**"]
     tags: ["v*"]
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "Version tag to publish, e.g. v0.1.0. Created at the selected ref if it does not exist."
-        required: true
 
 permissions:
   contents: write
@@ -16,24 +16,48 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      # Checks out the tag for a tag push, or the selected branch for a manual run.
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Work out whether a release is needed
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^mod_version=//p' gradle.properties | tr -d '[:space:]')
+          if [ -z "$version" ]; then
+            echo "mod_version is missing from gradle.properties" >&2
+            exit 1
+          fi
+          tag="v$version"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            echo "Release $tag already exists, nothing to do."
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+            echo "Release $tag does not exist yet, building it."
+          fi
+
       - name: Set up JDK 17
+        if: steps.check.outputs.needed == 'true'
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
       - name: Validate Gradle wrapper
+        if: steps.check.outputs.needed == 'true'
         uses: gradle/actions/wrapper-validation@v4
 
       - name: Build
+        if: steps.check.outputs.needed == 'true'
         run: ./gradlew build --stacktrace --no-daemon
 
       - name: Locate the mod jar
         id: jar
+        if: steps.check.outputs.needed == 'true'
         run: |
           set -euo pipefail
           # build/libs holds the remapped mod jar and the sources jar; we ship the former.
@@ -47,20 +71,15 @@ jobs:
           echo "Publishing ${jars[0]}"
 
       - name: Publish release
+        if: steps.check.outputs.needed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          TAG: ${{ steps.check.outputs.tag }}
           JAR: ${{ steps.jar.outputs.path }}
         run: |
           set -euo pipefail
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG already exists, replacing its assets."
-            gh release upload "$TAG" "$JAR" --clobber
-          else
-            # --target creates the tag at this commit when it does not exist yet,
-            # which is how a release gets cut without pushing a tag by hand.
-            gh release create "$TAG" "$JAR" \
-              --target "$GITHUB_SHA" \
-              --title "Lumen $TAG" \
-              --notes-file .github/release-body.md
-          fi
+          # --target creates the tag at this commit; no tag has to be pushed by hand.
+          gh release create "$TAG" "$JAR" \
+            --target "$GITHUB_SHA" \
+            --title "Lumen $TAG" \
+            --notes-file .github/release-body.md
