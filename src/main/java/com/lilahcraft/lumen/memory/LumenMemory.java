@@ -143,7 +143,7 @@ public final class LumenMemory {
         double maxSquared = maxDistance * maxDistance;
         return data.containers.stream()
                 .filter(entry -> entry.dimension.equals(dimension.toString()))
-                .filter(entry -> looksLike(entry, normalised))
+                .filter(entry -> looksLike(entry.query, entry.itemId, normalised))
                 .filter(entry -> entry.pos().getSquaredDistance(near) <= maxSquared)
                 .filter(entry -> !exclude.contains(entry.pos()))
                 .sorted(Comparator.comparingInt((KnownContainer entry) -> entry.hits).reversed()
@@ -202,20 +202,33 @@ public final class LumenMemory {
         data.containers = new ArrayList<>(data.containers.subList(0, MAX_ENTRIES));
     }
 
-    /** A memory is worth trying if it was filed under this query or holds a matching item. */
-    private static boolean looksLike(KnownContainer entry, String normalisedQuery) {
-        return entry.query.equals(normalisedQuery)
-                || entry.query.contains(normalisedQuery)
-                || entry.itemId.toLowerCase(Locale.ROOT).contains(normalisedQuery);
+    /**
+     * A memory is worth trying if it was filed under this request or holds a matching
+     * item. Package private and free of Minecraft types so it can be unit tested.
+     */
+    static boolean looksLike(String entryQuery, String entryItemId, String normalisedQuery) {
+        if (normalisedQuery.isEmpty()) {
+            return false;
+        }
+        if (entryQuery.equals(normalisedQuery) || entryQuery.contains(normalisedQuery)) {
+            return true;
+        }
+        // Path only: matching the whole id would make "create" hit every item from
+        // createaddition, and "minecraft" hit literally everything.
+        return itemPath(entryItemId).contains(normalisedQuery);
     }
 
     private static String prettyItem(String itemId) {
-        int colon = itemId.indexOf(':');
-        String path = colon < 0 ? itemId : itemId.substring(colon + 1);
-        return path.replace('_', ' ');
+        return itemPath(itemId).replace('_', ' ');
     }
 
-    private static String normalise(String query) {
+    /** The item id without its mod namespace, lowercased. */
+    private static String itemPath(String itemId) {
+        int colon = itemId.indexOf(':');
+        return (colon < 0 ? itemId : itemId.substring(colon + 1)).toLowerCase(Locale.ROOT);
+    }
+
+    static String normalise(String query) {
         return query == null ? "" : query.trim().toLowerCase(Locale.ROOT).replace(' ', '_');
     }
 }

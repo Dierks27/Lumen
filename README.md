@@ -7,16 +7,41 @@ no cloud, no API keys, nothing leaves the LAN.
 Built for Dierks' *Homestead* modded server (~375 mods), but it has no modpack
 specific code.
 
-## What works today (Phase 1)
+## What works today
 
-- `/lumen spawn` / `/lumen despawn` - Lumen appears next to you and starts following
-- Talks to players in chat, routed through Ollama (`llama3.1:8b` by default)
-- Vanilla pathfinding, so modded blocks are handled natively
-- Commands from the model: `idle`, `follow <player>`, `come`
-- Manual overrides: `/lumen follow [player]`, `/lumen come`, `/lumen stay`
+**Talking**
+- Chat goes through Ollama (`qwen2.5:14b` by default) and comes back as a
+  `{reason, command, message}` object
 - Everything Lumen says is a **system message**, so `NoChatReports` cannot swallow it
-- Malformed or partial JSON from the model degrades to a plain chat line - it never crashes
-- Config at `config/lumen.json`, hot reloadable with `/lumen reload`
+- Malformed or partial JSON degrades to a plain chat line - it never crashes
+- Conversation history, including lines Lumen overheard but did not answer
+
+**Knowing where it is**
+- Every prompt carries what Lumen can actually see: biome, time, weather, light,
+  what it is standing on and looking at, nearby players, hostiles, animals, ground
+  items, and the blocks in range
+- Blocks that glow or hold a block entity are always called out, so modded ores and
+  machines get noticed without the mod having to be known
+- The system prompt states that anything absent from that list is not visible, which
+  is the lever against invented detail
+
+**Remembering**
+- Where things were found is kept in `config/lumen/memory.json` and survives restarts
+- Ask for something fetched before and Lumen goes straight back to that container
+- Memories that turn out wrong are forgotten and the search starts again
+
+**Moving**
+- Opens and walks through wooden doors
+- A relaxed path node maker walks through modded blocks that have no collision box
+  but report themselves as solid (see [Pathfinding](#pathfinding-and-modded-blocks))
+- Stuck detection re-paths and, as a last resort, warps - no more despawn/respawn
+- Follows, goes to a spot, wanders when idle
+
+**Doing things**
+- A 27 slot pack: hand items over by right-clicking, picks things up off the ground,
+  wears or wields anything better than what it has, drops it all on death
+- Fetches from chests, barrels and modded containers: *"lumen find me some iron"*
+- Defends itself and whoever it is following against hostile mobs
 
 ## Server-side only, and what that costs
 
@@ -44,6 +69,28 @@ mechanism with different trade-offs (no vanilla goal AI or navigation). See
 Because Lumen wears a borrowed type, it is never written to the region file - otherwise
 it would come back after a restart as a real villager. Re-run `/lumen spawn` after a
 server restart.
+
+## Pathfinding and modded blocks
+
+Baritone cannot drive Lumen, and it is worth being clear why. Standard Baritone is a
+**client** mod: it controls `Minecraft.getInstance().player` through client tick and
+input hooks, and the 1.20.1 build is a Forge jar. It will not load on a Fabric server,
+and there is no player client for it to attach to. That stays true for the Phase 3
+fake-player route, because a fake `ServerPlayerEntity` is still server side. Automatone
+is the fork that *does* drive server-side mobs - and it is the one that blows the stack
+on modded blocks.
+
+So Lumen fixes the actual symptom instead. Vanilla decides whether a block can be walked
+through with `AbstractBlock#canPathfindThrough`, which mods routinely leave reporting
+their block as solid even when it has no collision box at all - decorative clutter,
+cables, pipes, plants. `LumenPathNodeMaker` says: if the pathfinder calls it BLOCKED but
+it cannot actually be collided with, treat it as open. One non-recursive shape lookup,
+so it cannot recurse into a stack overflow the way Automatone did.
+
+When Lumen still gets stuck, **`/lumen why`** names the blocks around it that vanilla
+refuses to route through, and whether the relaxation lets it through anyway. In a 375
+mod pack that output is the fastest way from "he is stuck" to the mod at fault - please
+paste it into an issue.
 
 ## Install
 
@@ -79,7 +126,7 @@ setx OLLAMA_NUM_CTX 8192        # room for world state + conversation history
 Then restart Ollama and pre-warm the model - **the first load takes 15-45 seconds**:
 
 ```
-ollama run llama3.1:8b
+ollama run qwen2.5:14b "hello"
 ```
 
 On Windows, allow inbound TCP **11434** through the firewall, or the server will only
@@ -98,24 +145,35 @@ curl http://192.168.50.51:11434/v1/models
 | `enabled` | `true` | Master switch for the LLM. Lumen still walks around when off. |
 | `companionName` | `Lumen` | Name in chat and above its head. |
 | `ollamaUrl` | `http://192.168.50.51:11434/v1/chat/completions` | Full endpoint URL. |
-| `model` | `llama3.1:8b` | Ollama model tag. |
+| `model` | `qwen2.5:14b` | Ollama model tag. |
 | `temperature` | `0.8` | |
 | `maxTokens` | `300` | Keeps replies chat-sized. |
 | `requestTimeoutSeconds` | `90` | Generous on purpose; loaded models still take 5-15s. |
 | `personality` | *(see below)* | The system prompt. |
-| `chatTrigger` | `name` | `name`, `prefix`, `always` or `never`. |
+| `chatTrigger` | `always` | `name`, `prefix`, `always` or `never`. |
 | `triggerPrefix` | `!lumen` | Used by `prefix` (and always accepted). |
-| `maxHistoryMessages` | `16` | Conversation turns kept as context. |
+| `maxHistoryMessages` | `24` | Chat lines kept as context. |
 | `appearanceEntity` | `minecraft:villager` | Vanilla type clients render. |
+| `canOpenDoors` | `true` | Path through and open wooden doors. |
+| `stuckRepathTicks` / `stuckTeleportTicks` | `60` / `160` | No-progress thresholds before re-pathing, then warping. |
+| `inventorySize` | `27` | |
+| `acceptItemsFromPlayers` / `pickUpItems` | `true` | Right-click handover, ground pickup. |
+| `dropInventoryOnDeath` | `true` | |
+| `allowChestAccess` | `true` | Let Lumen take requested items out of containers. |
+| `chestSearchRadius` / `memoryRecallRadius` | `16` / `64` | Cold search vs. walking to a remembered container. |
+| `maxFetchStacks` | `3` | Stacks taken per errand. |
+| `combat` / `attackDamage` / `defendRadius` | `true` / `3.0` / `12` | Defends itself and whoever it follows. |
+| `awarenessBlockRadius` / `awarenessEntityRadius` | `8` / `24` | How much world goes into the prompt. |
 | `maxHealth` / `movementSpeed` / `followRange` | `20` / `0.4` / `48` | Attributes. |
 | `followStartDistance` / `followStopDistance` | `4.0` / `2.5` | Follow hysteresis. |
 | `teleportDistance` | `24` | Past this, Lumen warps to you instead of pathing. |
 | `logRawResponses` | `false` | Logs the raw LLM body. The fastest way to debug prompts. |
 | `adminPermissionLevel` | `2` | Level for `spawn`, `despawn`, `reload`. |
 
-`chatTrigger` defaults to `name`, so Lumen only answers when a message mentions it
-("lumen, come here"). `always` is fun and very chatty; an 8B model takes several
-seconds per line and only one request is in flight at a time.
+`chatTrigger` defaults to `always`, so Lumen answers everything. Set it to `name` if
+that gets noisy - it will then only answer when a message mentions it. Either way only
+one request is in flight at a time; lines that arrive while Lumen is thinking are
+remembered rather than dropped.
 
 ### Personality
 
@@ -156,20 +214,30 @@ misbehave anyway.
 | `/lumen` or `/lumen status` | everyone | Endpoint, model, current activity |
 | `/lumen say <message>` | everyone | Talk to Lumen regardless of `chatTrigger` |
 | `/lumen come` / `stay` / `follow [player]` | everyone | Manual control, no LLM involved |
-| `/lumen spawn` / `despawn` / `reload` | level 2 | |
+| `/lumen here` | everyone | Warp Lumen to you - the escape hatch when pathing loses |
+| `/lumen find <item>` | everyone | Fetch an item from a nearby container |
+| `/lumen inventory` | everyone | What Lumen is carrying and wearing |
+| `/lumen memory` | everyone | Places Lumen remembers finding things |
+| `/lumen why` | everyone | Why Lumen is not moving, and what is blocking it |
+| `/lumen spawn` / `despawn` / `reload` / `forget` | level 2 | |
 
-Right-clicking Lumen reports what it is currently doing.
+Right-clicking Lumen hands over whatever you are holding, or reports what it is doing
+if your hand is empty.
 
 ## Roadmap
 
-**Phase 2 - smarter movement**
-- Baritone integration for real tasks (`mine iron_ore`, `goto x y z`)
-- Wider command vocabulary, remembered home coordinates
+**Next - productive work**
+- Mining, chopping and gathering on request
+- Named places (`remember this as home`) and going back to them
+- Crafting from what is in the pack
 
 **Phase 3 - polish**
-- Player model + custom skin (needs the fake-`ServerPlayerEntity` route)
-- Combat, inventory, food, death drops
-- Memory that survives a restart
+- Player model + custom skin from `config/lumen/skins/`. This needs the fake
+  `ServerPlayerEntity` route, which trades away vanilla goal AI and navigation for a
+  player-shaped body. The brain, config, memory, chest and chat layers are all
+  independent of the entity class, so that swap stays possible.
+- Food and hunger
+- Conversation highlights carried across restarts, alongside the location memory
 
 ## Notes from the field
 
