@@ -8,11 +8,17 @@ import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.context.CommandContext;
 import com.mojang.brigadier.exceptions.CommandSyntaxException;
 import net.minecraft.command.argument.EntityArgumentType;
+import net.minecraft.entity.EquipmentSlot;
+import net.minecraft.inventory.SimpleInventory;
+import net.minecraft.item.ItemStack;
 import net.minecraft.server.command.CommandManager;
 import net.minecraft.server.command.ServerCommandSource;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.text.Text;
 import net.minecraft.util.Formatting;
+
+import java.util.ArrayList;
+import java.util.List;
 
 /** Everything under {@code /lumen}. */
 public final class LumenCommand {
@@ -41,6 +47,10 @@ public final class LumenCommand {
                         .executes(LumenCommand::come))
                 .then(CommandManager.literal("stay")
                         .executes(LumenCommand::stay))
+                .then(CommandManager.literal("here")
+                        .executes(LumenCommand::here))
+                .then(CommandManager.literal("inventory")
+                        .executes(LumenCommand::inventory))
                 .then(CommandManager.literal("follow")
                         .executes(context -> follow(context, context.getSource().getPlayerOrThrow()))
                         .then(CommandManager.argument("player", EntityArgumentType.player())
@@ -102,7 +112,8 @@ public final class LumenCommand {
         } else {
             source.sendFeedback(() -> Text.literal("Currently " + lumen.describeActivity()
                             + " at " + lumen.getBlockPos().toShortString()
-                            + " (" + Math.round(lumen.getHealth()) + "/" + Math.round(lumen.getMaxHealth()) + " hp)")
+                            + " (" + Math.round(lumen.getHealth()) + "/" + Math.round(lumen.getMaxHealth())
+                            + " hp, " + lumen.countCarriedStacks() + " stacks carried)")
                     .formatted(Formatting.GRAY), false);
         }
         source.sendFeedback(() -> Text.literal("LLM " + (config.enabled ? "enabled" : "disabled")
@@ -136,6 +147,51 @@ public final class LumenCommand {
             return 0;
         }
         lumen.stopAndIdle();
+        return 1;
+    }
+
+    /** Escape hatch for the times pathfinding loses: warp Lumen to the player. */
+    private static int here(CommandContext<ServerCommandSource> context) throws CommandSyntaxException {
+        ServerCommandSource source = context.getSource();
+        ServerPlayerEntity player = source.getPlayerOrThrow();
+        LumenEntity lumen = requireLumen(source);
+        if (lumen == null) {
+            return 0;
+        }
+        if (!lumen.teleportNear(player.getBlockPos())) {
+            source.sendError(Text.literal("No room around you for "
+                    + Lumen.config().companionName + " to stand."));
+            return 0;
+        }
+        lumen.followPlayer(player);
+        source.sendFeedback(() -> Text.literal(Lumen.config().companionName + " is right here.")
+                .formatted(Formatting.AQUA), false);
+        return 1;
+    }
+
+    private static int inventory(CommandContext<ServerCommandSource> context) {
+        ServerCommandSource source = context.getSource();
+        LumenEntity lumen = requireLumen(source);
+        if (lumen == null) {
+            return 0;
+        }
+        SimpleInventory carried = lumen.getInventory();
+        List<String> lines = new ArrayList<>();
+        for (int slot = 0; slot < carried.size(); slot++) {
+            ItemStack stack = carried.getStack(slot);
+            if (!stack.isEmpty()) {
+                lines.add(stack.getCount() + "x " + stack.getName().getString());
+            }
+        }
+        for (EquipmentSlot slot : EquipmentSlot.values()) {
+            ItemStack equipped = lumen.getEquippedStack(slot);
+            if (!equipped.isEmpty()) {
+                lines.add(equipped.getName().getString() + " (" + slot.getName() + ")");
+            }
+        }
+        String summary = lines.isEmpty() ? "nothing at all" : String.join(", ", lines);
+        source.sendFeedback(() -> Text.literal(Lumen.config().companionName + " is carrying " + summary)
+                .formatted(Formatting.GRAY), false);
         return 1;
     }
 

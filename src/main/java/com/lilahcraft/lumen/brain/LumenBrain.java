@@ -5,7 +5,6 @@ import com.lilahcraft.lumen.LumenConfig;
 import com.lilahcraft.lumen.entity.LumenEntity;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.network.ServerPlayerEntity;
-import net.minecraft.server.world.ServerWorld;
 import net.minecraft.util.math.BlockPos;
 
 import java.util.ArrayDeque;
@@ -92,7 +91,13 @@ public final class LumenBrain {
         if (text.isEmpty() || text.length() > config.maxPlayerMessageLength) {
             return;
         }
+        String senderName = sender.getName().getString();
+        String line = senderName + ": " + text;
+
         if (!forced && !isAddressedToLumen(config, text)) {
+            // Not for Lumen, but it was said in earshot. Keeping it means the next
+            // reply lands in an ongoing conversation instead of out of nowhere.
+            overhear(config, line);
             return;
         }
 
@@ -105,14 +110,16 @@ public final class LumenBrain {
         }
 
         if (!busy.compareAndSet(false, true)) {
-            Lumen.LOGGER.debug("Dropping '{}' - a request is already in flight", text);
-            if (forced) {
-                Lumen.tell(sender, config.companionName + " is still thinking about the last thing.");
-            }
+            // One request at a time, but the line is still remembered rather than lost -
+            // silently dropping these is what makes a companion feel like it has no memory.
+            Lumen.LOGGER.debug("Not answering '{}' - a request is already in flight", text);
+            overhear(config, line);
             return;
         }
 
-        String senderName = sender.getName().getString();
+        // Recorded now, not on completion, so history stays in the order it was said
+        // and survives a failed request.
+        remember(config, ChatMessage.user(line));
         List<ChatMessage> messages = buildMessages(config, lumen, senderName, text);
 
         client(config).complete(config, messages)
@@ -122,7 +129,7 @@ public final class LumenBrain {
                             Lumen.LOGGER.warn("Ollama request failed: {}", error.toString());
                             return;
                         }
-                        applyResponse(server, senderName, text, content);
+                        applyResponse(server, senderName, content);
                     } finally {
                         busy.set(false);
                     }
@@ -130,7 +137,7 @@ public final class LumenBrain {
     }
 
     /** Runs on the server thread. */
-    private void applyResponse(MinecraftServer server, String senderName, String playerText, String content) {
+    private void applyResponse(MinecraftServer server, String senderName, String content) {
         LumenConfig config = Lumen.config();
         LumenResponse response = LumenResponse.parse(content);
         if (response == null) {
@@ -142,13 +149,19 @@ public final class LumenBrain {
                     response.reason(), response.command(), response.message());
         }
 
-        remember(config, ChatMessage.user(senderName + ": " + playerText));
         if (response.hasMessage()) {
             remember(config, ChatMessage.assistant(response.message()));
             Lumen.broadcast(server, response.message());
         }
         if (response.hasCommand()) {
             executeCommand(server, senderName, response.command());
+        }
+    }
+
+    /** Files away a line Lumen heard but is not replying to. */
+    private void overhear(LumenConfig config, String line) {
+        if (config.rememberUntriggeredChat) {
+            remember(config, ChatMessage.user(line));
         }
     }
 
@@ -227,7 +240,7 @@ public final class LumenBrain {
         List<ChatMessage> messages = new ArrayList<>();
         messages.add(ChatMessage.system(buildSystemPrompt(config)));
         messages.addAll(history);
-        messages.add(ChatMessage.user(situationReport(config, lumen) + "\n\n" + senderName + " says: " + text));
+        messages.add(ChatMessage.user(WorldSnapshot.describe(lumen, config) + "\n" + senderName + " says: " + text));
         return messages;
     }
 
@@ -245,47 +258,12 @@ public final class LumenBrain {
                 + "Use exactly one command. If nothing needs to change, use \"idle\".\n"
                 + "The \"message\" field is the only thing players see: keep it to one or two short "
                 + "sentences, lowercase and casual, like typing in chat. Never mention JSON, commands "
-                + "or that you are an AI.";
+                + "or that you are an AI.\n\n"
+                + "Everything you know about the world is in the [what you can see right now] block of "
+                + "the next message: the blocks, mobs, players and items around you, the time, the "
+                + "weather, the biome, what you are carrying. Talk about those. If something is not "
+                + "listed there, you cannot see it - do not mention it, and never invent places, "
+                + "structures, items or things that happened. Saying you are not sure is fine.";
     }
 
-    /** A compact snapshot of the world so the model is not guessing. */
-    private static String situationReport(LumenConfig config, LumenEntity lumen) {
-        StringBuilder builder = new StringBuilder("[world state] ");
-        ServerWorld world = (ServerWorld) lumen.getWorld();
-        BlockPos pos = lumen.getBlockPos();
-
-        builder.append("you are at ").append(pos.getX()).append(", ").append(pos.getY())
-                .append(", ").append(pos.getZ())
-                .append(" in ").append(world.getRegistryKey().getValue().toString());
-        builder.append("; health ").append(Math.round(lumen.getHealth()))
-                .append("/").append(Math.round(lumen.getMaxHealth()));
-        builder.append("; it is ").append(world.isDay() ? "daytime" : "night");
-        if (world.isRaining()) {
-            builder.append(" and raining");
-        }
-        builder.append("; you are currently ").append(lumen.describeActivity());
-
-        List<ServerPlayerEntity> nearby = new ArrayList<>();
-        for (ServerPlayerEntity player : world.getPlayers()) {
-            if (player.squaredDistanceTo(lumen) <= 64.0D * 64.0D) {
-                nearby.add(player);
-            }
-        }
-        if (nearby.isEmpty()) {
-            builder.append("; nobody is nearby");
-        } else {
-            builder.append("; nearby players: ");
-            for (int i = 0; i < nearby.size(); i++) {
-                ServerPlayerEntity player = nearby.get(i);
-                if (i > 0) {
-                    builder.append(", ");
-                }
-                builder.append(player.getName().getString())
-                        .append(" (").append(Math.round(Math.sqrt(player.squaredDistanceTo(lumen))))
-                        .append(" blocks)");
-            }
-        }
-        builder.append('.');
-        return builder.toString();
-    }
 }

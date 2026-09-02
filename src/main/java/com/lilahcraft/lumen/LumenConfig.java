@@ -37,7 +37,7 @@ public final class LumenConfig {
     public String ollamaUrl = "http://192.168.50.51:11434/v1/chat/completions";
 
     /** Ollama model tag, e.g. {@code llama3.1:8b}. */
-    public String model = "llama3.1:8b";
+    public String model = "qwen2.5:14b";
 
     public double temperature = 0.8D;
 
@@ -60,12 +60,70 @@ public final class LumenConfig {
      *   <li>{@code never} - only {@code /lumen say}</li>
      * </ul>
      */
-    public String chatTrigger = "name";
+    public String chatTrigger = "always";
 
     public String triggerPrefix = "!lumen";
 
     /** How many past chat turns (user + assistant) are kept as context. */
-    public int maxHistoryMessages = 16;
+    public int maxHistoryMessages = 24;
+
+    /**
+     * Remember chat that was not addressed to Lumen, so a reply lands in the middle
+     * of a conversation rather than out of nowhere. Also keeps messages that arrive
+     * while a request is already in flight instead of dropping them.
+     */
+    public boolean rememberUntriggeredChat = true;
+
+    // --------------------------------------------------------------- awareness
+
+    /** Horizontal radius of the block scan fed to the model. Cost grows with the cube. */
+    public int awarenessBlockRadius = 8;
+
+    /** Vertical half-height of that scan. */
+    public int awarenessBlockHeight = 4;
+
+    /** How many distinct block types to name. */
+    public int maxListedBlockTypes = 8;
+
+    /** Radius for spotting mobs, players and dropped items. */
+    public double awarenessEntityRadius = 24.0D;
+
+    // -------------------------------------------------------------- navigation
+
+    /** Path through and open wooden doors, the way a villager does. */
+    public boolean canOpenDoors = true;
+
+    /** Ticks of no progress toward a goal before Lumen recalculates its path. */
+    public int stuckRepathTicks = 60;
+
+    /** Ticks of no progress before Lumen gives up and warps to its target. */
+    public int stuckTeleportTicks = 160;
+
+    // --------------------------------------------------------------- inventory
+
+    public int inventorySize = 27;
+
+    /** Right-clicking Lumen while holding something hands it over. */
+    public boolean acceptItemsFromPlayers = true;
+
+    /** Collect items lying on the ground. */
+    public boolean pickUpItems = true;
+
+    public double pickUpRadius = 8.0D;
+
+    /** Drop everything Lumen was carrying when it dies. */
+    public boolean dropInventoryOnDeath = true;
+
+    // ------------------------------------------------------------------ combat
+
+    /** Fight hostile mobs that come near Lumen or the player it is following. */
+    public boolean combat = true;
+
+    /** Base damage per hit. Weapons Lumen is holding add to this. */
+    public double attackDamage = 3.0D;
+
+    /** Only defend against hostiles within this range. */
+    public double defendRadius = 12.0D;
 
     /**
      * Vanilla entity type Lumen wears so that clients WITHOUT this mod can still
@@ -172,6 +230,16 @@ public final class LumenConfig {
         followStartDistance = clamp(followStartDistance, followStopDistance + 0.5D, 64.0D);
         teleportDistance = clamp(teleportDistance, followStartDistance + 1.0D, 256.0D);
         followSpeedMultiplier = clamp(followSpeedMultiplier, 0.5D, 3.0D);
+        awarenessBlockRadius = (int) clamp(awarenessBlockRadius, 0, 24);
+        awarenessBlockHeight = (int) clamp(awarenessBlockHeight, 0, 16);
+        maxListedBlockTypes = (int) clamp(maxListedBlockTypes, 0, 24);
+        awarenessEntityRadius = clamp(awarenessEntityRadius, 0.0D, 128.0D);
+        stuckRepathTicks = (int) clamp(stuckRepathTicks, 20, 1200);
+        stuckTeleportTicks = (int) clamp(stuckTeleportTicks, stuckRepathTicks + 20, 2400);
+        inventorySize = (int) clamp(inventorySize, 1, 54);
+        pickUpRadius = clamp(pickUpRadius, 0.0D, 32.0D);
+        attackDamage = clamp(attackDamage, 0.0D, 100.0D);
+        defendRadius = clamp(defendRadius, 0.0D, 64.0D);
         adminPermissionLevel = (int) clamp(adminPermissionLevel, 0, 4);
         maxPlayerMessageLength = (int) clamp(maxPlayerMessageLength, 16, 4096);
     }
