@@ -5,8 +5,11 @@ import com.lilahcraft.lumen.LumenConfig;
 import com.lilahcraft.lumen.entity.goal.LumenFetchGoal;
 import com.lilahcraft.lumen.entity.goal.LumenFollowGoal;
 import com.lilahcraft.lumen.entity.goal.LumenGoToGoal;
+import com.lilahcraft.lumen.entity.goal.LumenMineGoal;
 import com.lilahcraft.lumen.entity.goal.LumenPickUpItemGoal;
 import com.lilahcraft.lumen.entity.goal.LumenWanderGoal;
+import net.minecraft.block.Block;
+import net.minecraft.block.BlockState;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.EntityType;
 import net.minecraft.entity.EquipmentSlot;
@@ -58,6 +61,7 @@ import org.jetbrains.annotations.Nullable;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 import java.util.UUID;
 
@@ -81,7 +85,9 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         /** Walk to a fixed position, then go back to idling. */
         GO_TO,
         /** Walk to a container, take what was asked for, then bring it back. */
-        FETCH
+        FETCH,
+        /** Break blocks of a requested kind, then bring the haul back. */
+        MINE
     }
 
     private Mode mode;
@@ -99,6 +105,12 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
     /** Containers already checked on this errand, so a retry does not loop back. */
     private final Set<BlockPos> triedContainers = new HashSet<>();
     private int fetchAttempts;
+
+    private BlockPos mineTarget;
+    private String mineQuery;
+    private int minedCount;
+    /** Blocks already broken or ruled out this errand, so the search moves on. */
+    private final Set<BlockPos> minedPositions = new HashSet<>();
 
     private Vec3d lastProgressPos;
     private int stuckTicks;
@@ -205,6 +217,7 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         this.goalSelector.add(2, new LumenFollowGoal(this));
         this.goalSelector.add(3, new LumenGoToGoal(this));
         this.goalSelector.add(3, new LumenFetchGoal(this));
+        this.goalSelector.add(3, new LumenMineGoal(this));
         this.goalSelector.add(4, new MeleeAttackGoal(this, 1.2D, true));
         this.goalSelector.add(5, new LumenPickUpItemGoal(this));
         this.goalSelector.add(6, new LumenWanderGoal(this, 0.7D));
@@ -245,6 +258,9 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         this.fetchQuery = null;
         this.triedContainers.clear();
         this.fetchAttempts = 0;
+        this.mineTarget = null;
+        this.mineQuery = null;
+        this.minedPositions.clear();
         this.stuckTicks = 0;
         this.getNavigation().stop();
         // pendingDelivery survives: whatever Lumen fetched still belongs to whoever
@@ -434,6 +450,10 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
                 return fetchQuery == null ? "standing around"
                         : "going to a nearby container to fetch " + fetchQuery;
             }
+            case MINE -> {
+                return mineQuery == null ? "standing around"
+                        : "mining " + mineQuery + " (" + minedCount + " so far)";
+            }
             default -> {
                 return "standing around";
             }
@@ -457,15 +477,12 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
     @Override
     public ScreenHandler createMenu(int syncId, PlayerInventory playerInventory, PlayerEntity player) {
         SimpleInventory pack = getInventory();
-        int rows = Math.max(1, Math.min(6, pack.size() / 9));
-        return switch (rows) {
-            case 1 -> GenericContainerScreenHandler.createGeneric9x1(syncId, playerInventory, pack);
-            case 2 -> GenericContainerScreenHandler.createGeneric9x2(syncId, playerInventory, pack);
-            case 3 -> GenericContainerScreenHandler.createGeneric9x3(syncId, playerInventory, pack);
-            case 4 -> GenericContainerScreenHandler.createGeneric9x4(syncId, playerInventory, pack);
-            case 5 -> GenericContainerScreenHandler.createGeneric9x5(syncId, playerInventory, pack);
-            default -> GenericContainerScreenHandler.createGeneric9x6(syncId, playerInventory, pack);
-        };
+        // Only the chest sizes take an existing inventory: createGeneric9x1/2/4/5 build
+        // their own, so a pack of any other size could not be shown at all. The config
+        // is clamped to 27 or 54 to match.
+        return pack.size() > 27
+                ? GenericContainerScreenHandler.createGeneric9x6(syncId, playerInventory, pack)
+                : GenericContainerScreenHandler.createGeneric9x3(syncId, playerInventory, pack);
     }
 
     /** "3 items" style summary for /lumen status and the world snapshot. */
@@ -596,6 +613,120 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         }
     }
 
+    // ------------------------------------------------------------------- mining
+
+    /**
+     * Sends Lumen off to break blocks matching {@code query} and bring them back.
+     *
+     * @return false when nothing suitable is in range, so the caller can say so
+     */
+    public boolean startMining(PlayerEntity requester, String query) {
+        LumenConfig config = Lumen.config();
+        if (!config.allowMining || !(this.getWorld() instanceof ServerWorld world)) {
+            return false;
+        }
+        this.mineQuery = query;
+        this.deliverTo = requester.getUuid();
+        this.minedCount = 0;
+        this.minedPositions.clear();
+        this.followTarget = null;
+        this.destination = null;
+        this.stuckTicks = 0;
+        return targetNextBlock(world);
+    }
+
+    private boolean targetNextBlock(ServerWorld world) {
+        LumenConfig config = Lumen.config();
+        BlockPos next = MineFinder.findNearest(world, this, mineQuery,
+                config.miningRadius, config.miningHeight, minedPositions);
+        if (next == null) {
+            return false;
+        }
+        this.mode = Mode.MINE;
+        this.mineTarget = next;
+        return true;
+    }
+
+    @Nullable
+    public BlockPos getMineTarget() {
+        return getMode() == Mode.MINE ? mineTarget : null;
+    }
+
+    /**
+     * Breaks the block Lumen has been standing at, banks the drops for delivery, and
+     * lines up the next one.
+     *
+     * @return a message to relay if the errand ended, otherwise null to keep going
+     */
+    @Nullable
+    public String breakTargetBlock() {
+        LumenConfig config = Lumen.config();
+        BlockPos target = this.mineTarget;
+        if (target == null || !(this.getWorld() instanceof ServerWorld world)) {
+            finishMining();
+            return null;
+        }
+        this.minedPositions.add(target);
+        this.mineTarget = null;
+
+        BlockState state = world.getBlockState(target);
+        if (!MineFinder.isMineable(world, state, target)) {
+            return continueOrFinish(world);
+        }
+
+        ItemStack tool = this.getMainHandStack();
+        if (state.isToolRequired() && !tool.isSuitableFor(state)) {
+            String needed = tool.isEmpty() ? "a tool" : "a better tool";
+            finishMining();
+            return "can't break " + state.getBlock().getName().getString().toLowerCase(Locale.ROOT)
+                    + " without " + needed;
+        }
+
+        for (ItemStack drop : Block.getDroppedStacks(state, world, target, world.getBlockEntity(target), this, tool)) {
+            if (!drop.isEmpty()) {
+                pendingDelivery.add(drop);
+            }
+        }
+        // drops=false: the drops are already banked above, so they go to whoever asked
+        // instead of scattering on the floor.
+        world.breakBlock(target, false, this);
+        world.setBlockBreakingInfo(this.getId(), target, -1);
+        this.swingHand(Hand.MAIN_HAND);
+        if (!tool.isEmpty()) {
+            tool.damage(1, this, holder -> holder.sendEquipmentBreakStatus(EquipmentSlot.MAINHAND));
+        }
+        this.minedCount++;
+
+        if (this.minedCount >= config.maxMineBlocks) {
+            finishMining();
+            return null;
+        }
+        return continueOrFinish(world);
+    }
+
+    private String continueOrFinish(ServerWorld world) {
+        if (!targetNextBlock(world)) {
+            finishMining();
+        }
+        return null;
+    }
+
+    /** Ends the errand and heads back to whoever asked, carrying the haul. */
+    public void finishMining() {
+        this.mineTarget = null;
+        this.mineQuery = null;
+        this.minedPositions.clear();
+        if (this.getWorld() instanceof ServerWorld world) {
+            world.setBlockBreakingInfo(this.getId(), this.getBlockPos(), -1);
+        }
+        PlayerEntity requester = deliverTo == null ? null : this.getWorld().getPlayerByUuid(deliverTo);
+        if (requester != null) {
+            followPlayer(requester);
+        } else {
+            stopAndIdle();
+        }
+    }
+
     // ------------------------------------------------------------------- combat
 
     /** Only fight things that threaten Lumen or the player it is looking after. */
@@ -680,8 +811,12 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
                 return target != null && !this.getBlockPos().isWithinDistance(target, 2.0D) ? target : null;
             }
             case FETCH -> {
-                return fetchChest != null && !this.getBlockPos().isWithinDistance(fetchChest, 2.5D)
+                return fetchChest != null && !this.getBlockPos().isWithinDistance(fetchChest, 3.0D)
                         ? fetchChest : null;
+            }
+            case MINE -> {
+                return mineTarget != null && !this.getBlockPos().isWithinDistance(mineTarget, 4.0D)
+                        ? mineTarget : null;
             }
             default -> {
                 return null;

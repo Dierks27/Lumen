@@ -101,6 +101,7 @@ public final class LumenConfig {
 
     // --------------------------------------------------------------- inventory
 
+    /** Chest sized (27) or double chest sized (54); nothing else can be displayed. */
     public int inventorySize = 27;
 
     /** Eat from the pack when hurt. Lumen has no hunger bar; food simply heals. */
@@ -134,6 +135,20 @@ public final class LumenConfig {
 
     /** Most stacks Lumen will take out of a container in one errand. */
     public int maxFetchStacks = 3;
+
+    // ------------------------------------------------------------------ mining
+
+    /** Let Lumen break blocks on request. Turning this off disables the mine command. */
+    public boolean allowMining = true;
+
+    /** How far Lumen will look for something to mine. Cost grows with the cube. */
+    public double miningRadius = 12.0D;
+
+    /** Vertical half-height of that search. */
+    public int miningHeight = 8;
+
+    /** Blocks broken per errand before Lumen brings the haul back. */
+    public int maxMineBlocks = 8;
 
     // ------------------------------------------------------------------ combat
 
@@ -257,11 +272,14 @@ public final class LumenConfig {
         awarenessEntityRadius = clamp(awarenessEntityRadius, 0.0D, 128.0D);
         stuckRepathTicks = (int) clamp(stuckRepathTicks, 20, 1200);
         stuckTeleportTicks = (int) clamp(stuckTeleportTicks, stuckRepathTicks + 20, 2400);
-        // The inventory is shown in a vanilla container screen, which comes in rows
-        // of nine, so anything else would leave unreachable slots.
-        inventorySize = (int) clamp(Math.round(inventorySize / 9.0D) * 9, 9, 54);
+        // Shown in a vanilla chest screen, and only the 9x3 and 9x6 variants can be
+        // handed an existing inventory - so it is one size or the other.
+        inventorySize = inventorySize > 27 ? 54 : 27;
         eatHealthFraction = clamp(eatHealthFraction, 0.0D, 1.0D);
         pickUpRadius = clamp(pickUpRadius, 0.0D, 32.0D);
+        miningRadius = clamp(miningRadius, 0.0D, 32.0D);
+        miningHeight = (int) clamp(miningHeight, 0, 32);
+        maxMineBlocks = (int) clamp(maxMineBlocks, 1, 64);
         chestSearchRadius = clamp(chestSearchRadius, 0.0D, 64.0D);
         memoryRecallRadius = clamp(memoryRecallRadius, 0.0D, 256.0D);
         maxFetchStacks = (int) clamp(maxFetchStacks, 1, 27);

@@ -229,6 +229,18 @@ public final class LumenBrain {
             return;
         }
 
+        if (command.startsWith("mine") || command.startsWith("dig") || command.startsWith("chop")) {
+            String query = command.replaceFirst("^(mine|dig|chop)", "").trim();
+            query = query.replaceFirst("^(me|us)\\b", "").trim();
+            query = query.replaceFirst("^(some|a|an|the|down)\\b", "").trim();
+            ServerPlayerEntity requester = resolvePlayer(server, senderName, senderName);
+            if (!query.isEmpty() && requester != null && lumen.startMining(requester, query)) {
+                return;
+            }
+            Lumen.LOGGER.debug("Nothing minable matching '{}' nearby", query);
+            return;
+        }
+
         Lumen.LOGGER.debug("Ignoring unknown command from the model: '{}'", rawCommand);
     }
 
@@ -275,6 +287,7 @@ public final class LumenBrain {
                 + "  come            - walk to whoever just spoke to you\n"
                 + "  find <item>     - go through nearby chests and barrels for that item and "
                 + "bring it back to whoever asked\n"
+                + "  mine <block>    - go break blocks of that kind nearby and bring them back\n"
                 + "Use exactly one command. If nothing needs to change, use \"idle\".\n"
                 + "The \"message\" field is the only thing players see: keep it to one or two short "
                 + "sentences, lowercase and casual, like typing in chat. Never mention JSON, commands "
@@ -283,7 +296,11 @@ public final class LumenBrain {
                 + "the next message: the blocks, mobs, players and items around you, the time, the "
                 + "weather, the biome, what you are carrying. Talk about those. If something is not "
                 + "listed there, you cannot see it - do not mention it, and never invent places, "
-                + "structures, items or things that happened. Saying you are not sure is fine.\n\n"
+                + "structures, items or things that happened. Saying you are not sure is fine.\n"
+                + "If someone asks about something you cannot see from here - the colour of a "
+                + "block, what is in a room, what a build looks like - do not guess. Say you will "
+                + "come and look, and use the come command. Guessing and being wrong is worse than "
+                + "walking over.\n\n"
                 + "If a [what you remember from before] block is present, those are places you have "
                 + "actually fetched things from and you may talk about them. When someone asks for "
                 + "something you have found before, you already know where to look - say so.";
