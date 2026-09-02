@@ -623,21 +623,24 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
                 this.fetchRequested = remaining;
                 this.fetchStacks = 0.0D;
             }
-            ItemStack removed = access.take(kind, remaining);
-            if (removed.isEmpty()) {
-                continue;
+            // One stack's worth per call, so a big order comes out as proper stacks.
+            for (int round = 0; remaining > 0 && round < 64; round++) {
+                ItemStack removed = access.take(kind, remaining);
+                if (removed.isEmpty()) {
+                    break;
+                }
+                remaining -= removed.getCount();
+                taken += removed.getCount();
+                this.fetchTaken += removed.getCount();
+                if (this.fetchSample.isEmpty()) {
+                    this.fetchSample = removed.copyWithCount(1);
+                }
+                // Once something real has been taken, nothing weaker counts any more.
+                this.fetchMinScore = Math.max(this.fetchMinScore, tier);
+                pendingDelivery.add(removed);
+                // Learned: this container is where that item lives.
+                Lumen.memory().rememberContainer(query, Registries.ITEM.getId(removed.getItem()), dimension, chest);
             }
-            remaining -= removed.getCount();
-            taken += removed.getCount();
-            this.fetchTaken += removed.getCount();
-            if (this.fetchSample.isEmpty()) {
-                this.fetchSample = removed.copyWithCount(1);
-            }
-            // Once something real has been taken, nothing weaker counts any more.
-            this.fetchMinScore = Math.max(this.fetchMinScore, tier);
-            pendingDelivery.add(removed);
-            // Learned: this container is where that item lives.
-            Lumen.memory().rememberContainer(query, Registries.ITEM.getId(removed.getItem()), dimension, chest);
         }
         this.fetchWanted = remaining;
         return taken;

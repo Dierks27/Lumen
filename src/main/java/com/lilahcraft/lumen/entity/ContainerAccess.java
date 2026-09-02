@@ -71,7 +71,8 @@ public abstract class ContainerAccess {
     public abstract List<ItemStack> contents();
 
     /**
-     * Takes up to {@code max} items that are the same item (and NBT) as {@code sample}.
+     * Takes up to {@code max} items that are the same item (and NBT) as {@code sample},
+     * and never more than one stack's worth in a single call - loop for more.
      *
      * @return what was taken, or an empty stack
      */
@@ -106,7 +107,9 @@ public abstract class ContainerAccess {
         @Override
         public ItemStack take(ItemStack sample, int max) {
             ItemStack taken = ItemStack.EMPTY;
-            int remaining = max;
+            // Never build a stack bigger than the item allows: 128 stone in one slot
+            // is a glitch waiting to happen in every screen that shows it.
+            int remaining = Math.min(max, sample.getMaxCount());
             for (int slot = 0; slot < inventory.size() && remaining > 0; slot++) {
                 ItemStack stack = inventory.getStack(slot);
                 if (stack.isEmpty() || !ItemStack.canCombine(stack, sample)) {
@@ -165,7 +168,7 @@ public abstract class ContainerAccess {
         public ItemStack take(ItemStack sample, int max) {
             ItemVariant variant = ItemVariant.of(sample);
             try (Transaction transaction = Transaction.openOuter()) {
-                long extracted = storage.extract(variant, max, transaction);
+                long extracted = storage.extract(variant, Math.min(max, sample.getMaxCount()), transaction);
                 if (extracted <= 0) {
                     transaction.abort();
                     return ItemStack.EMPTY;
