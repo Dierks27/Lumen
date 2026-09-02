@@ -4,6 +4,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 
 /**
  * The shapes a local model actually emits in the {@code command} field.
@@ -96,6 +97,31 @@ class LumenCommandParsingTest {
     void normalisesWhitespaceAndCase() {
         assertEquals("find", verb("  FIND   iron  "));
         assertEquals("iron", argument("  FIND   iron  "));
+    }
+
+    // ---- the fallback for when the model chats but sends no command field ----
+
+    @Test
+    @DisplayName("a real request from chat is understood when the model omits the command")
+    void infersFromRealRequests() {
+        // Verbatim from the Homestead v0.4.0 session, where the model replied
+        // "On it! Heading to get you some stone" with command field "(none)".
+        assertEquals("get me 64 stone",
+                LumenBrain.inferCommandFromRequest("hey buddy can you go get me 64 stone"));
+        assertEquals("find me sticks",
+                LumenBrain.inferCommandFromRequest("okay buddy can you find me sticks"));
+        assertEquals("mine this stone",
+                LumenBrain.inferCommandFromRequest("can you mine this stone"));
+    }
+
+    @Test
+    @DisplayName("ordinary conversation is not mistaken for an instruction")
+    void doesNotInferFromChatter() {
+        assertNull(LumenBrain.inferCommandFromRequest("nice build buddy"));
+        assertNull(LumenBrain.inferCommandFromRequest("i'll go get some iron myself"));
+        assertNull(LumenBrain.inferCommandFromRequest("what do you think of the roof"));
+        assertNull(LumenBrain.inferCommandFromRequest(""));
+        assertNull(LumenBrain.inferCommandFromRequest(null));
     }
 
     @Test

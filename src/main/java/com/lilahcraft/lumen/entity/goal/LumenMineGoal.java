@@ -4,7 +4,6 @@ import com.lilahcraft.lumen.Lumen;
 import com.lilahcraft.lumen.entity.LumenEntity;
 import net.minecraft.block.BlockState;
 import net.minecraft.entity.ai.goal.Goal;
-import net.minecraft.item.ItemStack;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Vec3d;
@@ -97,6 +96,11 @@ public class LumenMineGoal extends Goal {
         lumen.getNavigation().stop();
         if (requiredTicks <= 0) {
             this.requiredTicks = ticksToBreak();
+            if (this.requiredTicks < 0) {
+                Lumen.broadcast(lumen.getWorld().getServer(), "i can't break that at all");
+                lumen.finishMining();
+                return;
+            }
         }
         this.progressTicks++;
         showBreakingOverlay();
@@ -110,19 +114,24 @@ public class LumenMineGoal extends Goal {
         }
     }
 
-    /** Roughly the player formula: hardness against the held tool's speed. */
+    /**
+     * The vanilla break time: progress per tick from {@link LumenEntity#blockBreakingDelta},
+     * inverted. A diamond pickaxe is fast, a wooden one slow, and modded tools and
+     * blocks come out right without special casing, because the numbers come from the
+     * block and the item.
+     *
+     * @return ticks needed, or -1 if this block cannot be broken at all
+     */
     private int ticksToBreak() {
         if (!(lumen.getWorld() instanceof ServerWorld world)) {
-            return 20;
+            return -1;
         }
         BlockState state = world.getBlockState(target);
-        float hardness = state.getHardness(world, target);
-        if (hardness < 0.0F) {
-            return 20;
+        float delta = lumen.blockBreakingDelta(state, target);
+        if (delta <= 0.0F) {
+            return -1;
         }
-        ItemStack tool = lumen.getMainHandStack();
-        float speed = Math.max(1.0F, tool.getMiningSpeedMultiplier(state));
-        return (int) Math.max(5.0F, (hardness * 30.0F) / speed);
+        return (int) Math.max(1.0D, Math.min(20 * 60, Math.ceil(1.0D / delta)));
     }
 
     /** Drives the vanilla block-cracking overlay so players can see it working. */

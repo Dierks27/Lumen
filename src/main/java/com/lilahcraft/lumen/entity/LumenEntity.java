@@ -29,7 +29,10 @@ import net.minecraft.entity.ai.pathing.MobNavigation;
 import net.minecraft.entity.ai.pathing.PathNodeType;
 import net.minecraft.entity.attribute.EntityAttributeInstance;
 import net.minecraft.entity.attribute.EntityAttributeModifier;
+import net.minecraft.enchantment.EnchantmentHelper;
+import net.minecraft.enchantment.Enchantments;
 import net.minecraft.entity.attribute.EntityAttributes;
+import net.minecraft.entity.effect.StatusEffects;
 import net.minecraft.entity.mob.HostileEntity;
 import net.minecraft.entity.mob.PathAwareEntity;
 import net.minecraft.entity.player.PlayerEntity;
@@ -106,6 +109,8 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
     /** Containers already checked on this errand, so a retry does not loop back. */
     private final Set<BlockPos> triedContainers = new HashSet<>();
     private int fetchAttempts;
+    /** How many items this errand is for. */
+    private int fetchWanted;
 
     private BlockPos mineTarget;
     private String mineQuery;
@@ -215,7 +220,8 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         // are written to tolerate being called during construction.
         this.goalSelector.add(0, new SwimGoal(this));
         if (Lumen.config().canOpenDoors) {
-            this.goalSelector.add(1, new LongDoorInteractGoal(this, false));
+            // true: close it again after passing through, rather than leaving it open.
+            this.goalSelector.add(1, new LongDoorInteractGoal(this, true));
         }
         this.goalSelector.add(1, new EscapeDangerGoal(this, 1.3D));
         this.goalSelector.add(2, new LumenFollowGoal(this));
@@ -283,7 +289,12 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         if (!config.allowChestAccess || !(this.getWorld() instanceof ServerWorld world)) {
             return false;
         }
-        this.fetchQuery = query;
+        ChestFinder.Request request = ChestFinder.parseRequest(query, config.defaultFetchCount);
+        if (request.query().isEmpty()) {
+            return false;
+        }
+        this.fetchQuery = request.query();
+        this.fetchWanted = Math.min(request.count(), config.maxFetchItems);
         this.deliverTo = requester.getUuid();
         this.triedContainers.clear();
         this.fetchAttempts = 0;
@@ -361,29 +372,38 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         int taken = 0;
         if (world.getBlockEntity(chest) instanceof Inventory inventory) {
             world.playSound(null, chest, SoundEvents.BLOCK_CHEST_OPEN, SoundCategory.BLOCKS, 0.6F, 1.0F);
-            for (int slot = 0; slot < inventory.size() && taken < config.maxFetchStacks; slot++) {
+            int remaining = Math.max(1, this.fetchWanted);
+            for (int slot = 0; slot < inventory.size() && remaining > 0; slot++) {
                 ItemStack stack = inventory.getStack(slot);
-                if (ChestFinder.matches(stack, query)) {
-                    ItemStack removed = inventory.removeStack(slot);
-                    if (!removed.isEmpty()) {
-                        pendingDelivery.add(removed);
-                        // Learned: this container is where that item lives.
-                        Lumen.memory().rememberContainer(query,
-                                Registries.ITEM.getId(removed.getItem()), dimension, chest);
-                        taken++;
-                    }
+                if (!ChestFinder.matches(stack, query)) {
+                    continue;
+                }
+                // Take only as many as were asked for, splitting the stack if need be.
+                ItemStack removed = inventory.removeStack(slot, Math.min(remaining, stack.getCount()));
+                if (!removed.isEmpty()) {
+                    remaining -= removed.getCount();
+                    taken += removed.getCount();
+                    pendingDelivery.add(removed);
+                    // Learned: this container is where that item lives.
+                    Lumen.memory().rememberContainer(query,
+                            Registries.ITEM.getId(removed.getItem()), dimension, chest);
                 }
             }
+            this.fetchWanted = remaining;
             inventory.markDirty();
             world.playSound(null, chest, SoundEvents.BLOCK_CHEST_CLOSE, SoundCategory.BLOCKS, 0.6F, 1.0F);
         }
 
         PlayerEntity requester = deliverTo == null ? null : world.getPlayerByUuid(deliverTo);
         // Taking from someone's storage is worth an audit line in the server log.
-        Lumen.LOGGER.info("Lumen took {} stack(s) matching '{}' from the container at {} for {}",
+        Lumen.LOGGER.info("Lumen took {} item(s) matching '{}' from the container at {} for {}",
                 taken, query, chest.toShortString(),
                 requester == null ? "nobody" : requester.getName().getString());
 
+        // Keep going to the next container while there is still some of the order left.
+        if (taken > 0 && this.fetchWanted > 0 && this.fetchAttempts < 5 && targetNextContainer(world)) {
+            return;
+        }
         if (taken == 0) {
             // The memory was stale, or somebody emptied it. Forget it and look elsewhere,
             // but only a few times so a wrong query cannot send Lumen on a tour.
@@ -659,7 +679,7 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
                     BlockPos candidate = origin.add(dx, dy, dz);
                     if (setGateOpen(candidate, true)) {
                         this.openedGate = candidate;
-                        this.gateCloseTimer = 120;
+                        this.gateCloseTimer = 40; // ~2s, long enough to walk through
                         return;
                     }
                 }
@@ -798,10 +818,14 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         List<ItemStack> drops = Block.getDroppedStacks(state, world, target,
                 world.getBlockEntity(target), this, tool);
         if (!world.breakBlock(target, false, this)) {
-            Lumen.LOGGER.warn("Refused to break {} at {}; not banking its drops",
-                    Registries.BLOCK.getId(state.getBlock()), target.toShortString());
+            String blockId = Registries.BLOCK.getId(state.getBlock()).toString();
+            Lumen.LOGGER.warn("world.breakBlock refused {} at {} (chunk loaded: {}); "
+                            + "drops not banked. Most likely a protection or claim mod.",
+                    blockId, target.toShortString(),
+                    world.isChunkLoaded(target.getX() >> 4, target.getZ() >> 4));
             finishMining();
-            return "something stopped me breaking that";
+            return "something won't let me break that " + state.getBlock().getName().getString()
+                    .toLowerCase(Locale.ROOT);
         }
         for (ItemStack drop : drops) {
             if (!drop.isEmpty()) {
@@ -1034,10 +1058,55 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
      * @return false when the navigator could not produce a path
      */
     public boolean moveToBlock(BlockPos target, double speed) {
-        BlockPos approach = findApproach(target);
-        BlockPos goal = approach == null ? target : approach;
+        // Only detour to a neighbour when the target itself cannot be stood in - a
+        // chest, a furnace. v0.4.0 did it for every destination, including ordinary
+        // walkable ones, and the nearest standable neighbour is sometimes on the far
+        // side of a wall. That is what stopped Lumen finding its way back indoors.
+        BlockPos goal = target;
+        if (!canStandAt(target)) {
+            BlockPos approach = findApproach(target);
+            if (approach != null) {
+                goal = approach;
+            }
+        }
         return this.getNavigation().startMovingTo(
                 goal.getX() + 0.5D, goal.getY(), goal.getZ() + 0.5D, speed);
+    }
+
+    /**
+     * How much of a block Lumen breaks per tick, by the vanilla formula.
+     *
+     * <p>{@code BlockState#calcBlockBreakingDelta} takes a PlayerEntity, so it cannot
+     * be called directly - this is the same calculation. Because it reads hardness and
+     * tool suitability from the block and item themselves, modded tools and modded
+     * blocks are handled without knowing anything about them.
+     *
+     * @return progress per tick, or 0 when the block cannot be broken at all
+     */
+    public float blockBreakingDelta(BlockState state, BlockPos pos) {
+        float hardness = state.getHardness(this.getWorld(), pos);
+        if (hardness < 0.0F) {
+            return 0.0F;
+        }
+        ItemStack tool = this.getMainHandStack();
+        float speed = tool.getMiningSpeedMultiplier(state);
+        if (speed > 1.0F) {
+            int efficiency = EnchantmentHelper.getLevel(Enchantments.EFFICIENCY, tool);
+            if (efficiency > 0) {
+                speed += efficiency * efficiency + 1;
+            }
+        }
+        if (this.hasStatusEffect(StatusEffects.HASTE)) {
+            speed *= 1.0F + (this.getStatusEffect(StatusEffects.HASTE).getAmplifier() + 1) * 0.2F;
+        }
+        if (this.isSubmergedInWater()) {
+            speed /= 5.0F;
+        }
+        if (!this.isOnGround()) {
+            speed /= 5.0F;
+        }
+        boolean harvestable = !state.isToolRequired() || tool.isSuitableFor(state);
+        return speed / hardness / (harvestable ? 30.0F : 100.0F);
     }
 
     // --------------------------------------------------------------- lifecycle

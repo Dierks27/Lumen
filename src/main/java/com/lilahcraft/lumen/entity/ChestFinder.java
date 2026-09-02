@@ -17,6 +17,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Finds a nearby container holding what somebody asked for.
@@ -29,6 +31,43 @@ import java.util.Set;
 public final class ChestFinder {
 
     private ChestFinder() {
+    }
+
+    /** How much of what: "10 stone" -> 10 and "stone". */
+    public record Request(int count, String query) {
+    }
+
+    /**
+     * Reads a quantity off the front of a request.
+     *
+     * <p>Handles "10 stone", "a stack of cobblestone", "all the sticks", "half a stack
+     * of iron" - the ways someone actually asks - and falls back to {@code defaultCount}
+     * when no amount is given.
+     */
+    public static Request parseRequest(String argument, int defaultCount) {
+        String text = argument == null ? "" : argument.trim().toLowerCase(Locale.ROOT);
+        if (text.isEmpty()) {
+            return new Request(defaultCount, "");
+        }
+        Matcher all = Pattern.compile("^all(?:\\s+(?:of\\s+)?(?:the\\s+)?)?(.*)$").matcher(text);
+        if (all.matches()) {
+            return new Request(Integer.MAX_VALUE, all.group(1).trim());
+        }
+        Matcher halfStack = Pattern.compile("^half\\s+(?:a\\s+|the\\s+)?stacks?\\s+(?:of\\s+)?(.*)$")
+                .matcher(text);
+        if (halfStack.matches()) {
+            return new Request(32, halfStack.group(1).trim());
+        }
+        Matcher stack = Pattern.compile("^(?:a\\s+|one\\s+)?stacks?\\s+(?:of\\s+)?(.*)$").matcher(text);
+        if (stack.matches()) {
+            return new Request(64, stack.group(1).trim());
+        }
+        Matcher counted = Pattern.compile("^(\\d{1,5})\\s+(?:of\\s+)?(.*)$").matcher(text);
+        if (counted.matches()) {
+            int count = Math.max(1, Integer.parseInt(counted.group(1)));
+            return new Request(count, counted.group(2).trim());
+        }
+        return new Request(defaultCount, text);
     }
 
     /** A container that holds a match, and whether the match was on the exact item id. */
