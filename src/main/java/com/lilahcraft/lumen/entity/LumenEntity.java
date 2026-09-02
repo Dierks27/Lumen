@@ -111,6 +111,8 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
     private int fetchAttempts;
     /** How many items this errand is for. */
     private int fetchWanted;
+    /** Non-zero while the amount is still expressed in stacks, pending the real item. */
+    private double fetchStacks;
 
     private BlockPos mineTarget;
     private String mineQuery;
@@ -273,6 +275,7 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         this.mineTarget = null;
         this.mineQuery = null;
         this.minedPositions.clear();
+        this.fetchStacks = 0.0D;
         this.stuckTicks = 0;
         this.getNavigation().stop();
         // pendingDelivery survives: whatever Lumen fetched still belongs to whoever
@@ -295,6 +298,7 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         }
         this.fetchQuery = request.query();
         this.fetchWanted = Math.min(request.count(), config.maxFetchItems);
+        this.fetchStacks = request.stacks();
         this.deliverTo = requester.getUuid();
         this.triedContainers.clear();
         this.fetchAttempts = 0;
@@ -377,6 +381,14 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
                 ItemStack stack = inventory.getStack(slot);
                 if (!ChestFinder.matches(stack, query)) {
                     continue;
+                }
+                if (this.fetchStacks > 0.0D) {
+                    // Now that the actual item is in hand, a "stack" has a real size:
+                    // 64 for most things, 16 for ender pearls, 1 for a pickaxe.
+                    remaining = (int) Math.max(1, Math.ceil(this.fetchStacks * stack.getMaxCount()));
+                    remaining = Math.min(remaining, Lumen.config().maxFetchItems);
+                    this.fetchWanted = remaining;
+                    this.fetchStacks = 0.0D;
                 }
                 // Take only as many as were asked for, splitting the stack if need be.
                 ItemStack removed = inventory.removeStack(slot, Math.min(remaining, stack.getCount()));

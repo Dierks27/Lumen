@@ -29,13 +29,24 @@ class ChestFinderRequestTest {
     }
 
     @Test
-    @DisplayName("a stack, and half a stack")
+    @DisplayName("a stack is left to be sized against the real item, not assumed to be 64")
     void parsesStacks() {
-        assertEquals(64, parse("a stack of cobblestone").count());
+        // 64 for cobblestone, but 16 for ender pearls and 1 for a pickaxe - so the
+        // amount stays expressed in stacks until the item is actually in hand.
+        assertEquals(1.0D, parse("a stack of cobblestone").stacks());
         assertEquals("cobblestone", parse("a stack of cobblestone").query());
-        assertEquals(64, parse("stack of oak planks").count());
-        assertEquals(32, parse("half a stack of iron").count());
+        assertEquals(1.0D, parse("stack of oak planks").stacks());
+        assertEquals(0.5D, parse("half a stack of iron").stacks());
         assertEquals("iron", parse("half a stack of iron").query());
+        assertEquals(3.0D, parse("3 stacks of stone").stacks());
+        assertEquals("stone", parse("3 stacks of stone").query());
+    }
+
+    @Test
+    @DisplayName("a plain number is a number of items, not stacks")
+    void plainNumbersAreNotStacks() {
+        assertEquals(0.0D, parse("10 stone").stacks());
+        assertEquals(10, parse("10 stone").count());
     }
 
     @Test
