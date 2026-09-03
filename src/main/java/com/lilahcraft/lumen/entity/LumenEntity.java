@@ -2,6 +2,7 @@ package com.lilahcraft.lumen.entity;
 
 import com.lilahcraft.lumen.Lumen;
 import com.lilahcraft.lumen.LumenConfig;
+import com.lilahcraft.lumen.craft.CraftPlanner;
 import com.lilahcraft.lumen.entity.ai.LumenNavigation;
 import com.lilahcraft.lumen.entity.goal.LumenFetchGoal;
 import com.lilahcraft.lumen.entity.goal.LumenFollowGoal;
@@ -9,6 +10,8 @@ import com.lilahcraft.lumen.entity.goal.LumenGoToGoal;
 import com.lilahcraft.lumen.entity.goal.LumenMineGoal;
 import com.lilahcraft.lumen.entity.goal.LumenPickUpItemGoal;
 import com.lilahcraft.lumen.entity.goal.LumenWanderGoal;
+import com.lilahcraft.lumen.skill.LumenSkill;
+import com.lilahcraft.lumen.memory.LumenMemory;
 import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.DoorBlock;
@@ -36,7 +39,10 @@ import net.minecraft.entity.ai.pathing.PathNode;
 import net.minecraft.entity.ai.pathing.PathNodeType;
 import net.minecraft.entity.attribute.EntityAttributeInstance;
 import net.minecraft.entity.attribute.EntityAttributeModifier;
+import net.minecraft.entity.attribute.DefaultAttributeContainer;
+import net.minecraft.entity.attribute.DefaultAttributeRegistry;
 import net.minecraft.entity.attribute.EntityAttributes;
+import net.minecraft.entity.damage.DamageSource;
 import net.minecraft.entity.effect.StatusEffects;
 import net.minecraft.entity.mob.HostileEntity;
 import net.minecraft.entity.mob.PathAwareEntity;
@@ -44,6 +50,7 @@ import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.inventory.SimpleInventory;
 import net.minecraft.item.FoodComponent;
+import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.nbt.NbtCompound;
 import net.minecraft.registry.Registries;
@@ -62,7 +69,9 @@ import net.minecraft.util.ActionResult;
 import net.minecraft.util.Formatting;
 import net.minecraft.util.Hand;
 import net.minecraft.util.Identifier;
+import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
@@ -70,7 +79,9 @@ import net.minecraft.world.EntityView;
 import net.minecraft.world.World;
 import org.jetbrains.annotations.Nullable;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -122,6 +133,37 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
     // Lazily built: MobEntity's constructor runs initGoals() before our field
     // initialisers, so anything a goal might touch has to be created on demand.
     private SimpleInventory inventory;
+
+    /** What Lumen is doing right now, as data, and what is waiting behind it. */
+    private LumenTask currentTask;
+    private final Deque<LumenTask> taskQueue = new ArrayDeque<>();
+    /** Where a fetch or mine searches from when a named place was given; else Lumen's spot. */
+    private BlockPos fetchAnchor;
+    private BlockPos mineAnchor;
+
+    /** One block a skill or quarry lined up: break it, or right-click it. */
+    public record WorkItem(BlockPos pos, boolean interact) {
+    }
+
+    /** Blocks lined up by a skill or a quarry, worked through the mine goal in order. */
+    private final Deque<WorkItem> work = new ArrayDeque<>();
+    private WorkItem currentWork;
+    private int workDone;
+    private int workSkipped;
+    private String workLabel;
+    private boolean workCollect;
+    private BlockPos workCenter;
+    /** A craft that needs a table: done once Lumen has walked to one. */
+    private LumenTask.Craft craftAfterArrival;
+    private int collectTicks;
+
+    // Survival: a food level that drains with real time, and a name tag that shows health.
+    private float foodLevel = 20.0F;
+    private int foodTicks;
+    private boolean hungerSlowed;
+    private String lastNameShown = "";
+    private int aggroCooldown;
+    private static final UUID HUNGER_SLOW_ID = UUID.fromString("7d4a2c6e-3b1f-4e0a-9c2d-5f6e7a8b9c0d");
 
     private BlockPos fetchChest;
     private String fetchQuery;
@@ -202,7 +244,22 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         try {
             Identifier identifier = new Identifier(id);
             if (Registries.ENTITY_TYPE.containsId(identifier)) {
-                return (EntityType<? extends PathAwareEntity>) (EntityType<?>) Registries.ENTITY_TYPE.get(identifier);
+                EntityType<?> type = Registries.ENTITY_TYPE.get(identifier);
+                // A mob needs the attributes a mob has. Wearing a type that lacks them
+                // (armour stands, boats, anything not living) crashes on the first
+                // navigation tick, so it is refused up front.
+                if (!DefaultAttributeRegistry.hasDefinitionFor(type)) {
+                    Lumen.LOGGER.warn("appearanceEntity '{}' is not a living entity type, falling back to minecraft:villager", id);
+                    return villager();
+                }
+                DefaultAttributeContainer attributes = DefaultAttributeRegistry.get((EntityType<? extends LivingEntity>) type);
+                if (!attributes.has(EntityAttributes.GENERIC_FOLLOW_RANGE)
+                        || !attributes.has(EntityAttributes.GENERIC_MOVEMENT_SPEED)) {
+                    Lumen.LOGGER.warn("appearanceEntity '{}' lacks mob attributes (follow range / speed), "
+                            + "falling back to minecraft:villager", id);
+                    return villager();
+                }
+                return (EntityType<? extends PathAwareEntity>) type;
             }
             Lumen.LOGGER.warn("Unknown appearanceEntity '{}', falling back to minecraft:villager", id);
         } catch (RuntimeException e) {
@@ -218,7 +275,8 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
 
     /** Re-applies name, health and speed. Safe to call on a live entity after /lumen reload. */
     public void applyConfig(LumenConfig config) {
-        this.setCustomName(Text.literal(config.companionName).formatted(Formatting.AQUA));
+        this.lastNameShown = "";
+        refreshNameTag(config);
         this.setCustomNameVisible(true);
 
         EntityAttributeInstance health = this.getAttributeInstance(EntityAttributes.GENERIC_MAX_HEALTH);
@@ -271,7 +329,10 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         this.goalSelector.add(3, new LumenGoToGoal(this));
         this.goalSelector.add(3, new LumenFetchGoal(this));
         this.goalSelector.add(3, new LumenMineGoal(this));
-        this.goalSelector.add(4, new MeleeAttackGoal(this, 1.2D, true));
+        // Above the errands: a fight takes the move control, the errand goal is stopped,
+        // and once the target is dead the goal selector restarts it from the entity's
+        // state - which is "respond to danger, then resume" for free.
+        this.goalSelector.add(2, new MeleeAttackGoal(this, 1.2D, true));
         this.goalSelector.add(5, new LumenPickUpItemGoal(this));
         this.goalSelector.add(6, new LumenWanderGoal(this, 0.7D));
         this.goalSelector.add(7, new LookAtEntityGoal(this, PlayerEntity.class, 8.0F));
@@ -357,10 +418,286 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         this.mineQuery = null;
         this.minedPositions.clear();
         this.fetchStacks = 0.0D;
+        this.fetchAnchor = null;
+        this.mineAnchor = null;
+        clearWork();
+        this.craftAfterArrival = null;
         this.stuckTicks = 0;
         this.getNavigation().stop();
         // pendingDelivery survives: whatever Lumen fetched still belongs to whoever
         // asked for it, and tick() hands it over as soon as they are close enough.
+        // The task queue survives too - only cancelAll() throws it away.
+    }
+
+    // ------------------------------------------------------------------- tasks
+
+    /** What submitting a task did. */
+    public enum Submission {
+        /** Running now. */
+        STARTED,
+        /** Behind whatever is running; will start in turn. */
+        QUEUED,
+        /** Could not start and nothing was queued - the note says why. */
+        FAILED
+    }
+
+    /** How many tasks may wait. Beyond it the player is told no. */
+    public static final int MAX_QUEUE = 8;
+
+    /**
+     * Gives Lumen something to do. Runs it now when nothing else is running, otherwise
+     * queues it behind the current errand - a second request no longer cancels the first.
+     *
+     * @return what happened; on FAILED, {@link #lastTaskNote()} says why
+     */
+    public Submission submit(LumenTask task) {
+        if (isBusy()) {
+            if (taskQueue.size() >= MAX_QUEUE) {
+                this.lastTaskNote = "i've already got " + taskQueue.size() + " things lined up";
+                return Submission.FAILED;
+            }
+            taskQueue.addLast(task);
+            return Submission.QUEUED;
+        }
+        return runTask(task) ? Submission.STARTED : Submission.FAILED;
+    }
+
+    private String lastTaskNote = "";
+
+    /**
+     * Running a task, or on an errand started some other way. Walking back to the
+     * player with goods is not busy: "now mine copper" said then should start, with the
+     * goods delivered once everything is done.
+     */
+    public boolean isBusy() {
+        Mode current = getMode();
+        return currentTask != null || current == Mode.FETCH || current == Mode.MINE || current == Mode.GO_TO;
+    }
+
+    /** Why the last task failed to start, for whoever asked. */
+    public String lastTaskNote() {
+        return lastTaskNote;
+    }
+
+    /** Makes a task the current one and starts it. False when it could not start. */
+    private boolean runTask(LumenTask task) {
+        this.currentTask = task;
+        this.lastTaskNote = "";
+        PlayerEntity requester = task.requester() == null ? null : this.getWorld().getPlayerByUuid(task.requester());
+        boolean ok;
+        if (task instanceof LumenTask.Fetch fetch) {
+            if (requester == null) {
+                this.lastTaskNote = "whoever asked for that has gone";
+                ok = false;
+            } else {
+                ok = startFetch(requester, fetch.request(), fetch.anchor());
+                if (!ok) {
+                    this.lastTaskNote = fetchSawUnreachable()
+                            ? "i can see some " + fetch.request().query() + " in a container but i can't get to it"
+                            : "i can't find any " + fetch.request().query()
+                                    + (fetch.anchorName() == null ? " in anything nearby" : " around the " + fetch.anchorName());
+                }
+            }
+        } else if (task instanceof LumenTask.Mine mine) {
+            if (requester == null) {
+                this.lastTaskNote = "whoever asked for that has gone";
+                ok = false;
+            } else {
+                String refusal = startMining(requester, mine.query(), mine.anchor());
+                ok = refusal == null;
+                if (!ok) {
+                    this.lastTaskNote = refusal;
+                }
+            }
+        } else if (task instanceof LumenTask.GoTo go) {
+            goTo(go.pos());
+            ok = true;
+        } else if (task instanceof LumenTask.Return) {
+            if (requester == null) {
+                this.lastTaskNote = "whoever asked has gone";
+                ok = false;
+            } else {
+                followPlayer(requester);
+                ok = true;
+            }
+        } else if (task instanceof LumenTask.Handover handover) {
+            if (requester == null) {
+                this.lastTaskNote = "whoever asked has gone";
+                ok = false;
+            } else {
+                this.pendingHandover = handover.query() == null ? "*" : handover.query();
+                this.deliverTo = requester.getUuid();
+                followPlayer(requester);
+                ok = true;
+            }
+        } else if (task instanceof LumenTask.Harvest harvest) {
+            LumenSkill skill = Lumen.skills().find(harvest.skillName());
+            if (requester == null) {
+                this.lastTaskNote = "whoever asked has gone";
+                ok = false;
+            } else if (skill == null) {
+                this.lastTaskNote = "i don't know how to " + harvest.skillName();
+                ok = false;
+            } else {
+                String refusal = startSkill(requester, skill, harvest.anchor(), harvest.anchorName());
+                ok = refusal == null;
+                if (!ok) {
+                    this.lastTaskNote = refusal;
+                }
+            }
+        } else if (task instanceof LumenTask.Quarry quarry) {
+            if (requester == null) {
+                this.lastTaskNote = "whoever asked has gone";
+                ok = false;
+            } else {
+                String refusal = startQuarry(requester, quarry.region());
+                ok = refusal == null;
+                if (!ok) {
+                    this.lastTaskNote = refusal;
+                }
+            }
+        } else if (task instanceof LumenTask.Craft craft) {
+            if (requester == null) {
+                this.lastTaskNote = "whoever asked has gone";
+                ok = false;
+            } else {
+                ok = beginCraft(requester, craft);
+            }
+        } else if (task instanceof LumenTask.Collect collect) {
+            this.deliverTo = collect.requester();
+            this.collectTicks = 0;
+            this.mode = Mode.IDLE; // the pick-up goal only runs while idle
+            ok = true;
+        } else {
+            ok = false;
+        }
+        if (!ok) {
+            this.currentTask = null;
+        }
+        return ok;
+    }
+
+    /**
+     * The current task is finished (or could not be finished). Starts the next one, or
+     * heads back to whoever asked when the queue is empty - which is what finishing an
+     * errand always did.
+     */
+    private void taskDone() {
+        LumenTask finished = this.currentTask;
+        this.currentTask = null;
+        while (!taskQueue.isEmpty()) {
+            LumenTask next = taskQueue.pollFirst();
+            if (runTask(next)) {
+                return;
+            }
+            // Could not start - say so, and carry on down the list.
+            Lumen.broadcast(this.getWorld().getServer(), lastTaskNote.isEmpty()
+                    ? "couldn't " + next.describe() : lastTaskNote);
+        }
+        UUID back = finished != null && finished.requester() != null ? finished.requester() : deliverTo;
+        PlayerEntity requester = back == null ? null : this.getWorld().getPlayerByUuid(back);
+        if (requester != null) {
+            followPlayer(requester);
+        } else {
+            stopAndIdle();
+        }
+    }
+
+    /**
+     * A direct instruction from the player - "come here", "follow me" - interrupts
+     * whatever is running. The errand is not thrown away: it goes to the front of the
+     * queue, and "carry on" resumes it. A fetch remembers how much is still owed.
+     */
+    public void pauseForPlayer() {
+        LumenTask running = this.currentTask;
+        this.currentTask = null;
+        if (running instanceof LumenTask.Fetch fetch && fetchQuery != null) {
+            // Nine of twelve already taken: only three are still wanted.
+            ChestFinder.Request remaining = fetchTaken > 0 && !fetch.request().isEverything()
+                    ? new ChestFinder.Request(Math.max(1, fetchWanted), 0.0D, fetch.request().query(), true)
+                    : fetch.request();
+            if (fetchWanted > 0 || fetchTaken == 0) {
+                taskQueue.addFirst(new LumenTask.Fetch(fetch.requester(), remaining, fetch.anchor(), fetch.anchorName()));
+            }
+        } else if (running instanceof LumenTask.Mine || running instanceof LumenTask.GoTo
+                || running instanceof LumenTask.Harvest || running instanceof LumenTask.Quarry
+                || running instanceof LumenTask.Craft) {
+            taskQueue.addFirst(running);
+        }
+        // Handover and Return are about the player anyway; they just happen on arrival.
+        if (running instanceof LumenTask.Handover handover) {
+            this.pendingHandover = handover.query() == null ? "*" : handover.query();
+        }
+        clearErrandFields();
+    }
+
+    /** Resets the per-errand fields without touching the queue or anything owed. */
+    private void clearErrandFields() {
+        this.mode = Mode.IDLE;
+        this.fetchChest = null;
+        this.fetchQuery = null;
+        this.fetchStacks = 0.0D;
+        this.fetchAnchor = null;
+        this.triedContainers.clear();
+        this.fetchAttempts = 0;
+        this.mineTarget = null;
+        this.mineQuery = null;
+        this.mineAnchor = null;
+        this.minedPositions.clear();
+        clearWork();
+        this.craftAfterArrival = null;
+        this.stuckTicks = 0;
+        this.getNavigation().stop();
+    }
+
+    private void clearWork() {
+        this.work.clear();
+        this.currentWork = null;
+        this.workLabel = null;
+        this.workCollect = false;
+        this.workCenter = null;
+        this.workDone = 0;
+        this.workSkipped = 0;
+    }
+
+    /** "Carry on": starts the next queued task. False when there is nothing waiting. */
+    public boolean resume() {
+        if (currentTask != null || taskQueue.isEmpty()) {
+            return false;
+        }
+        taskDone();
+        return currentTask != null;
+    }
+
+    /** Drops the current task and everything queued. Goods already fetched are kept for delivery. */
+    public int cancelAll() {
+        int dropped = taskQueue.size() + (currentTask != null ? 1 : 0);
+        taskQueue.clear();
+        this.currentTask = null;
+        stopAndIdle();
+        return dropped;
+    }
+
+    @Nullable
+    public LumenTask currentTask() {
+        return currentTask;
+    }
+
+    public int queuedCount() {
+        return taskQueue.size();
+    }
+
+    /** One line per task, the running one first, for /lumen queue and the snapshot. */
+    public List<String> describeQueue() {
+        List<String> lines = new ArrayList<>();
+        if (currentTask != null) {
+            lines.add("now: " + currentTask.describe());
+        }
+        int i = 1;
+        for (LumenTask task : taskQueue) {
+            lines.add(i++ + ". " + task.describe());
+        }
+        return lines;
     }
 
     /**
@@ -379,6 +716,13 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
      *         says whether that is because there was none, or none Lumen could get to
      */
     public boolean startFetch(PlayerEntity requester, ChestFinder.Request request) {
+        return startFetch(requester, request, null);
+    }
+
+    /**
+     * @param anchor where to search from - a named place - or null for wherever Lumen is
+     */
+    public boolean startFetch(PlayerEntity requester, ChestFinder.Request request, @Nullable BlockPos anchor) {
         LumenConfig config = Lumen.config();
         if (!config.allowChestAccess || !(this.getWorld() instanceof ServerWorld world)) {
             return false;
@@ -394,6 +738,7 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         this.fetchSample = ItemStack.EMPTY;
         this.fetchMinScore = ChestFinder.SUBSTRING_MATCH;
         this.fetchSawUnreachable = false;
+        this.fetchAnchor = anchor;
         this.deliverTo = requester.getUuid();
         setOwner(requester);
         this.triedContainers.clear();
@@ -425,8 +770,10 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         LumenConfig config = Lumen.config();
         Identifier dimension = world.getRegistryKey().getValue();
         ItemStack sameAs = fetchSample.isEmpty() ? null : fetchSample;
+        // "from the storage room" searches around the room, not around Lumen.
+        BlockPos center = fetchAnchor != null ? fetchAnchor : this.getBlockPos();
 
-        for (BlockPos remembered : Lumen.memory().recall(fetchQuery, dimension, this.getBlockPos(),
+        for (BlockPos remembered : Lumen.memory().recall(fetchQuery, dimension, center,
                 config.memoryRecallRadius, triedContainers)) {
             if (!world.isChunkLoaded(remembered.getX() >> 4, remembered.getZ() >> 4)) {
                 // Cannot check from here, but Lumen knows the way - go and look.
@@ -451,7 +798,7 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         }
 
         List<ChestFinder.Match> matches = ChestFinder.findContainersWith(
-                world, this.getBlockPos(), config.chestSearchRadius, fetchQuery, fetchMinScore, sameAs,
+                world, center, config.chestSearchRadius, fetchQuery, fetchMinScore, sameAs,
                 triedContainers);
         int tested = 0;
         for (ChestFinder.Match match : matches) {
@@ -519,7 +866,7 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         BlockPos chest = this.fetchChest;
         this.fetchChest = null;
         if (chest == null || !(this.getWorld() instanceof ServerWorld world)) {
-            stopAndIdle();
+            taskDone();
             return;
         }
         this.triedContainers.add(chest);
@@ -541,7 +888,7 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         String query = this.fetchQuery;
         this.fetchChest = null;
         if (chest == null || query == null || !(this.getWorld() instanceof ServerWorld world)) {
-            stopAndIdle();
+            taskDone();
             return;
         }
         Identifier dimension = world.getRegistryKey().getValue();
@@ -681,12 +1028,8 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
             line = "got " + this.fetchTaken + " " + what + ", bringing it over";
         }
         Lumen.broadcast(world.getServer(), line);
-
-        if (requester != null) {
-            followPlayer(requester);
-        } else {
-            stopAndIdle();
-        }
+        this.fetchAnchor = null;
+        taskDone();
     }
 
     /**
@@ -720,6 +1063,10 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
             this.pendingHandover = null;
             HandoverResult result = handOver(requester, "*".equals(query) ? null : query);
             Lumen.broadcast(this.getWorld().getServer(), describeHandover(result, "*".equals(query) ? "" : query));
+            if (currentTask instanceof LumenTask.Handover) {
+                taskDone();
+                return;
+            }
         }
         if (pendingDelivery.isEmpty()) {
             if (pendingHandover == null) {
@@ -780,6 +1127,15 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
 
     /** Human readable state, fed to the model as part of the world snapshot. */
     public String describeActivity() {
+        String now = describeCurrentActivity();
+        if (!taskQueue.isEmpty()) {
+            return now + ", with " + taskQueue.size() + " more thing" + (taskQueue.size() == 1 ? "" : "s")
+                    + " lined up (next: " + taskQueue.peekFirst().describe() + ")";
+        }
+        return now;
+    }
+
+    private String describeCurrentActivity() {
         switch (getMode()) {
             case FOLLOW -> {
                 PlayerEntity target = getFollowTarget();
@@ -801,10 +1157,16 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
                         : "going to a nearby container to fetch " + fetchQuery;
             }
             case MINE -> {
+                if (workLabel != null) {
+                    return workLabel + " (" + workDone + " done, " + work.size() + " to go)";
+                }
                 return mineQuery == null ? "standing around"
                         : "mining " + mineQuery + " (" + minedCount + " so far)";
             }
             default -> {
+                if (currentTask instanceof LumenTask.Collect) {
+                    return "picking up the drops";
+                }
                 return "standing around";
             }
         }
@@ -946,6 +1308,12 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         double reach = Math.max(3.0D, Lumen.config().followStartDistance);
         if (this.squaredDistanceTo(player) <= reach * reach && player.getWorld() == this.getWorld()) {
             return handOver(player, wanted);
+        }
+        if (isBusy()) {
+            // Mid-errand: walking off now would abandon it, and re-point what it has
+            // already collected at a different player. Queue it behind instead.
+            taskQueue.addLast(new LumenTask.Handover(player.getUuid(), wanted));
+            return null;
         }
         this.pendingHandover = wanted == null ? "*" : wanted;
         this.deliverTo = player.getUuid();
@@ -1156,7 +1524,9 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
             return;
         }
         this.eatCooldown = 40;
-        if (this.getHealth() >= this.getMaxHealth() * config.eatHealthFraction) {
+        boolean hurt = this.getHealth() < this.getMaxHealth() * config.eatHealthFraction;
+        boolean hungry = config.hungerEnabled && this.foodLevel <= 14.0F;
+        if (!hurt && !hungry) {
             return;
         }
         SimpleInventory pack = getInventory();
@@ -1169,7 +1539,10 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
             if (food == null) {
                 continue;
             }
-            this.heal(Math.max(1.0F, food.getHunger() / 2.0F));
+            if (hurt) {
+                this.heal(Math.max(1.0F, food.getHunger() / 2.0F));
+            }
+            this.foodLevel = Math.min(20.0F, this.foodLevel + food.getHunger());
             this.playSound(SoundEvents.ENTITY_GENERIC_EAT, 0.8F, 1.0F);
             stack.decrement(1);
             if (stack.isEmpty()) {
@@ -1340,7 +1713,8 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
     /** True while Lumen is on a task a passing remark should not cancel. */
     public boolean isOnErrand() {
         Mode current = getMode();
-        return current == Mode.FETCH || current == Mode.MINE || current == Mode.GO_TO
+        return currentTask != null
+                || current == Mode.FETCH || current == Mode.MINE || current == Mode.GO_TO
                 || (current == Mode.FOLLOW && isReturningWithGoods());
     }
 
@@ -1353,6 +1727,14 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
      */
     @Nullable
     public String startMining(PlayerEntity requester, String query) {
+        return startMining(requester, query, null);
+    }
+
+    /**
+     * @param anchor where to look for blocks - a named place - or null for around Lumen
+     */
+    @Nullable
+    public String startMining(PlayerEntity requester, String query, @Nullable BlockPos anchor) {
         LumenConfig config = Lumen.config();
         if (!config.allowMining) {
             return "mining is switched off";
@@ -1361,6 +1743,7 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
             return "i can't do that here";
         }
         this.mineQuery = query;
+        this.mineAnchor = anchor;
         this.deliverTo = requester.getUuid();
         setOwner(requester);
         this.minedCount = 0;
@@ -1387,14 +1770,64 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
 
     private boolean targetNextBlock(ServerWorld world) {
         LumenConfig config = Lumen.config();
-        BlockPos next = MineFinder.findNearest(world, this, mineQuery,
-                config.miningRadius, config.miningHeight, minedPositions);
+        if (workLabel != null) {
+            // A skill or quarry: take the next block on the list that is still worth doing.
+            this.currentWork = null;
+            while (!work.isEmpty()) {
+                WorkItem item = work.pollFirst();
+                BlockPos pos = item.pos();
+                if (!world.isChunkLoaded(pos.getX() >> 4, pos.getZ() >> 4)) {
+                    workSkipped++;
+                    continue;
+                }
+                BlockState state = world.getBlockState(pos);
+                if (state.isAir() || state.hasBlockEntity()) {
+                    workSkipped++;
+                    continue;
+                }
+                if (!item.interact()) {
+                    if (!MineFinder.isMineable(world, state, pos) || touchesFluid(world, pos)) {
+                        workSkipped++;
+                        continue;
+                    }
+                }
+                if (findApproach(pos) == null && !canStandAt(pos.up())) {
+                    workSkipped++;
+                    continue;
+                }
+                this.currentWork = item;
+                this.mode = Mode.MINE;
+                this.mineTarget = pos;
+                return true;
+            }
+            return false;
+        }
+        if (mineQuery == null) {
+            return false;
+        }
+        BlockPos next = MineFinder.findNearest(world, this, mineAnchor != null ? mineAnchor : this.getBlockPos(),
+                mineQuery, config.miningRadius, config.miningHeight, minedPositions);
         if (next == null) {
             return false;
         }
         this.mode = Mode.MINE;
         this.mineTarget = next;
         return true;
+    }
+
+    /** A block with lava or water against it is left alone: breaking it lets the fluid in. */
+    private static boolean touchesFluid(ServerWorld world, BlockPos pos) {
+        for (Direction side : Direction.values()) {
+            if (!world.getFluidState(pos.offset(side)).isEmpty()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** True while the block Lumen is heading for is to be right-clicked rather than broken. */
+    public boolean currentWorkIsInteract() {
+        return currentWork != null && currentWork.interact();
     }
 
     /**
@@ -1431,6 +1864,10 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         }
         this.minedPositions.add(target);
         this.mineTarget = null;
+
+        if (currentWork != null && currentWork.interact()) {
+            return interactTarget(world, target);
+        }
 
         BlockState state = world.getBlockState(target);
         if (!MineFinder.isMineable(world, state, target)) {
@@ -1479,10 +1916,60 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
             tool.damage(1, this, holder -> holder.sendEquipmentBreakStatus(EquipmentSlot.MAINHAND));
         }
         this.minedCount++;
+        this.workDone++;
 
-        if (this.minedCount >= config.maxMineBlocks) {
+        // A plain "mine iron" stops at maxMineBlocks; a skill or quarry has its own list.
+        if (workLabel == null && this.minedCount >= config.maxMineBlocks) {
             finishMining();
             return null;
+        }
+        return continueOrFinish(world);
+    }
+
+    /**
+     * Right-clicks the block for a taught skill. There is no fake player in Fabric API
+     * 1.20.1 and a block's use handler needs a real one, so the click is made in the
+     * name of whoever asked, exactly as mining inside a claim is. That also means they
+     * have to be nearby: a click from across the map would be a strange thing to allow.
+     */
+    @Nullable
+    private String interactTarget(ServerWorld world, BlockPos target) {
+        LumenConfig config = Lumen.config();
+        if (!config.allowInteract) {
+            finishMining();
+            return "using blocks is switched off in the config";
+        }
+        PlayerEntity requester = deliverTo == null ? null : world.getPlayerByUuid(deliverTo);
+        if (requester == null || requester.getWorld() != world) {
+            finishMining();
+            return "i need whoever asked to be around for that";
+        }
+        if (requester.squaredDistanceTo(Vec3d.ofCenter(target)) > config.interactRange * config.interactRange) {
+            finishMining();
+            return "come a bit closer - i can only use blocks while you're within "
+                    + Math.round(config.interactRange) + " blocks";
+        }
+        BlockState state = world.getBlockState(target);
+        if (state.isAir() || state.hasBlockEntity()) {
+            workSkipped++;
+            return continueOrFinish(world);
+        }
+        this.getLookControl().lookAt(Vec3d.ofCenter(target));
+        BlockHitResult hit = new BlockHitResult(Vec3d.ofCenter(target), Direction.UP, target, false);
+        ActionResult result;
+        try {
+            result = state.onUse(world, requester, Hand.MAIN_HAND, hit);
+        } catch (RuntimeException e) {
+            Lumen.LOGGER.warn("Using {} at {} threw {}", BlockStates.id(state), target.toShortString(), e.toString());
+            result = ActionResult.FAIL;
+        }
+        this.swingHand(Hand.MAIN_HAND);
+        Lumen.LOGGER.info("Lumen used {} at {} as {}: {}", BlockStates.describe(state), target.toShortString(),
+                requester.getName().getString(), result);
+        if (result.isAccepted()) {
+            this.workDone++;
+        } else {
+            this.workSkipped++;
         }
         return continueOrFinish(world);
     }
@@ -1499,15 +1986,430 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         this.mineTarget = null;
         this.mineQuery = null;
         this.minedPositions.clear();
+        this.mineAnchor = null;
         if (this.getWorld() instanceof ServerWorld world) {
             world.setBlockBreakingInfo(this.getId(), this.getBlockPos(), -1);
         }
-        PlayerEntity requester = deliverTo == null ? null : this.getWorld().getPlayerByUuid(deliverTo);
-        if (requester != null) {
-            followPlayer(requester);
-        } else {
-            stopAndIdle();
+        if (workLabel != null) {
+            String label = workLabel;
+            int done = workDone;
+            int skipped = workSkipped;
+            boolean collect = workCollect && done > 0;
+            BlockPos center = workCenter == null ? this.getBlockPos() : workCenter;
+            UUID requester = deliverTo;
+            clearWork();
+            Lumen.broadcast(this.getWorld().getServer(), done == 0
+                    ? "couldn't do any of the " + label + (skipped > 0 ? " - " + skipped + " weren't worth it or i couldn't reach them" : "")
+                    : label + " done - " + done + " block" + (done == 1 ? "" : "s")
+                            + (skipped > 0 ? ", skipped " + skipped : "")
+                            + (collect ? ", grabbing the drops" : ""));
+            if (collect && requester != null) {
+                taskQueue.addFirst(new LumenTask.Collect(requester, center, 10.0D));
+            }
         }
+        taskDone();
+    }
+
+    // -------------------------------------------------------------- skills
+
+    /**
+     * Runs a taught skill: finds every block its target matches within its radius, keeps
+     * the reachable ones, and works them one by one through the mine goal - breaking or
+     * right-clicking as the skill says.
+     *
+     * @return a refusal to say out loud, or null when Lumen set off
+     */
+    @Nullable
+    public String startSkill(PlayerEntity requester, LumenSkill skill, @Nullable BlockPos anchor, @Nullable String anchorName) {
+        LumenConfig config = Lumen.config();
+        if (skill.isInteract() && !config.allowInteract) {
+            return "using blocks is switched off in the config";
+        }
+        if (!skill.isInteract() && !config.allowMining) {
+            return "mining is switched off";
+        }
+        if (!(this.getWorld() instanceof ServerWorld world)) {
+            return "i can't do that here";
+        }
+        BlockMatcher.Spec spec = BlockMatcher.parse(skill.target);
+        BlockPos center = anchor != null ? anchor : this.getBlockPos();
+        int radius = Math.max(2, Math.min(32, skill.radius));
+        int height = Math.min(radius, 8);
+        List<BlockPos> found = new ArrayList<>();
+        BlockPos.Mutable cursor = new BlockPos.Mutable();
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dz = -radius; dz <= radius; dz++) {
+                int x = center.getX() + dx;
+                int z = center.getZ() + dz;
+                if (!world.isChunkLoaded(x >> 4, z >> 4)) {
+                    continue;
+                }
+                for (int dy = -height; dy <= height; dy++) {
+                    cursor.set(x, center.getY() + dy, z);
+                    BlockState state = world.getBlockState(cursor);
+                    if (state.isAir() || state.hasBlockEntity()) {
+                        continue;
+                    }
+                    if (!BlockStates.matches(spec, world, cursor, state)) {
+                        continue;
+                    }
+                    if (!skill.isInteract() && !MineFinder.isMineable(world, state, cursor)) {
+                        continue;
+                    }
+                    found.add(cursor.toImmutable());
+                }
+            }
+        }
+        if (found.isEmpty()) {
+            return "i can't see any " + skill.target + (anchorName == null ? " around here" : " at the " + anchorName);
+        }
+        found.sort(java.util.Comparator.comparingDouble(pos -> pos.getSquaredDistance(center)));
+        this.deliverTo = requester.getUuid();
+        setOwner(requester);
+        this.mineQuery = null;
+        this.mineAnchor = null;
+        this.minedCount = 0;
+        this.minedPositions.clear();
+        this.followTarget = null;
+        this.destination = null;
+        this.stuckTicks = 0;
+        clearWork();
+        int cap = Math.max(1, config.maxSkillBlocks);
+        for (BlockPos pos : found) {
+            if (work.size() >= cap) {
+                break;
+            }
+            work.addLast(new WorkItem(pos, skill.isInteract()));
+        }
+        this.workLabel = skill.name;
+        this.workCollect = skill.collect;
+        this.workCenter = center;
+        if (!targetNextBlock(world)) {
+            clearWork();
+            return "i can see the " + skill.target + " but i can't get to any of it";
+        }
+        if (!skill.isInteract() && !canHarvest(this.mineTarget)) {
+            clearWork();
+            this.mineTarget = null;
+            this.mode = Mode.IDLE;
+            return this.getMainHandStack().isEmpty()
+                    ? "i'd need a tool for that - put one in my pack"
+                    : "what i'm holding won't break that";
+        }
+        Lumen.skills().noteUse(skill);
+        return null;
+    }
+
+    // -------------------------------------------------------------- quarry
+
+    /**
+     * Digs out a region, top layer first, with a staircase down to it when it starts
+     * below Lumen's feet. Bounded by config, and blocks against lava or water, or
+     * holding a block entity, are left standing.
+     *
+     * @return a refusal to say out loud, or null when Lumen set off
+     */
+    @Nullable
+    public String startQuarry(PlayerEntity requester, QuarryPlanner.Region region) {
+        LumenConfig config = Lumen.config();
+        if (!config.allowMining) {
+            return "mining is switched off";
+        }
+        if (!config.allowQuarry) {
+            return "area mining is switched off in the config";
+        }
+        if (!(this.getWorld() instanceof ServerWorld world)) {
+            return "i can't do that here";
+        }
+        int maxSize = Math.max(1, config.maxQuarrySize);
+        if (region.sizeX() > maxSize || region.sizeZ() > maxSize || region.sizeY() > maxSize) {
+            return "that's bigger than i'm allowed - " + maxSize + " blocks a side at most";
+        }
+        if (region.volume() > config.maxQuarryBlocks) {
+            return "that's " + region.volume() + " blocks; i'm capped at " + config.maxQuarryBlocks + " per job";
+        }
+        int bottom = world.getBottomY() + 1;
+        int top = world.getTopY() - 2;
+        QuarryPlanner.Region clamped = QuarryPlanner.Region.of(region.minX(), Math.max(bottom, region.minY()), region.minZ(),
+                region.maxX(), Math.min(top, region.maxY()), region.maxZ());
+        BlockPos feet = this.getBlockPos();
+        List<int[]> plan = new ArrayList<>();
+        int descent = QuarryPlanner.descent(feet.getY(), clamped);
+        if (descent > 1) {
+            if (descent > config.maxQuarryDescent) {
+                return "that's " + descent + " blocks down; i'll dig down " + config.maxQuarryDescent + " at most";
+            }
+            int centerX = (clamped.minX() + clamped.maxX()) / 2;
+            int centerZ = (clamped.minZ() + clamped.maxZ()) / 2;
+            int dx = Integer.compare(centerX, feet.getX());
+            int dz = dx == 0 ? Integer.compare(centerZ, feet.getZ()) : 0;
+            plan.addAll(QuarryPlanner.staircase(feet.getX(), feet.getY(), feet.getZ(), clamped.maxY() + 1, dx, dz));
+        }
+        plan.addAll(QuarryPlanner.order(clamped, feet.getX(), feet.getZ()));
+        this.deliverTo = requester.getUuid();
+        setOwner(requester);
+        this.mineQuery = null;
+        this.mineAnchor = null;
+        this.minedCount = 0;
+        this.minedPositions.clear();
+        this.followTarget = null;
+        this.destination = null;
+        this.stuckTicks = 0;
+        clearWork();
+        for (int[] p : plan) {
+            work.addLast(new WorkItem(new BlockPos(p[0], p[1], p[2]), false));
+        }
+        this.workLabel = "quarry";
+        this.workCollect = false; // drops are banked straight into the delivery
+        this.workCenter = new BlockPos((clamped.minX() + clamped.maxX()) / 2, clamped.maxY(), (clamped.minZ() + clamped.maxZ()) / 2);
+        if (!targetNextBlock(world)) {
+            clearWork();
+            return "there's nothing in that area i can break";
+        }
+        if (!canHarvest(this.mineTarget)) {
+            clearWork();
+            this.mineTarget = null;
+            this.mode = Mode.IDLE;
+            return this.getMainHandStack().isEmpty()
+                    ? "i'd need a pickaxe for that - put one in my pack"
+                    : "what i'm holding won't break that";
+        }
+        Lumen.LOGGER.info("Lumen starts a quarry of {} block(s) ({}) for {}", plan.size(), clamped.describe(),
+                requester.getName().getString());
+        return null;
+    }
+
+    // -------------------------------------------------------------- crafting
+
+    /**
+     * Starts a craft task: crafts now when the recipe fits in the 2x2 grid or a table
+     * is beside Lumen, otherwise walks to the nearest table first.
+     */
+    private boolean beginCraft(PlayerEntity requester, LumenTask.Craft craft) {
+        LumenConfig config = Lumen.config();
+        if (!config.allowCrafting) {
+            this.lastTaskNote = "crafting is switched off in the config";
+            return false;
+        }
+        if (!(this.getWorld() instanceof ServerWorld world) || world.getServer() == null) {
+            this.lastTaskNote = "i can't do that here";
+            return false;
+        }
+        CraftPlanner planner = CraftPlanner.forServer(world.getServer());
+        Item item = planner.findCraftable(craft.query());
+        if (item == null) {
+            this.lastTaskNote = "i don't know how to make " + craft.query();
+            return false;
+        }
+        CraftPlanner.Plan plan = planner.plan(item, Math.max(1, craft.count()), packContents());
+        if (plan.isEmpty()) {
+            this.lastTaskNote = "i can't make " + CraftPlanner.name(item) + " - " + plan.missing();
+            return false;
+        }
+        this.deliverTo = requester.getUuid();
+        setOwner(requester);
+        if (plan.needsTable() && config.craftingNeedsTable && findCraftingTable(world, 3) == null) {
+            BlockPos table = findCraftingTable(world, (int) Math.min(48, config.chestSearchRadius));
+            if (table == null) {
+                this.lastTaskNote = "i'd need a crafting table for " + CraftPlanner.name(item) + " and there isn't one nearby";
+                return false;
+            }
+            BlockPos approach = findApproach(table);
+            if (approach == null || !isReachable(table)) {
+                this.lastTaskNote = "there's a crafting table at " + table.toShortString() + " but i can't get to it";
+                return false;
+            }
+            this.craftAfterArrival = craft;
+            goTo(approach);
+            Lumen.broadcast(world.getServer(), "heading to the crafting table for that");
+            return true;
+        }
+        String outcome = performCraft(world, requester, craft, planner, item, plan);
+        Lumen.broadcast(world.getServer(), outcome);
+        // Done on the spot: hand the result over the way a fetch does.
+        this.mode = Mode.IDLE;
+        taskDone();
+        return true;
+    }
+
+    /** Runs the plan against the pack and banks the product for delivery. Returns the chat line. */
+    private String performCraft(ServerWorld world, PlayerEntity requester, LumenTask.Craft craft,
+                                CraftPlanner planner, Item item, CraftPlanner.Plan plan) {
+        int made = planner.execute(plan, getInventory());
+        if (made <= 0) {
+            return "something didn't add up when i tried to craft " + CraftPlanner.name(item);
+        }
+        // Move what was asked for out of the pack into the delivery, so it is handed over.
+        int wanted = Math.min(made, Math.max(1, craft.count()));
+        SimpleInventory pack = getInventory();
+        int moved = 0;
+        for (int slot = 0; slot < pack.size() && moved < wanted; slot++) {
+            ItemStack stack = pack.getStack(slot);
+            if (stack.isEmpty() || stack.getItem() != item) {
+                continue;
+            }
+            ItemStack taken = pack.removeStack(slot, Math.min(stack.getCount(), wanted - moved));
+            moved += taken.getCount();
+            pendingDelivery.add(taken);
+        }
+        Lumen.LOGGER.info("Lumen crafted {} x {} for {} ({} step(s))", made, CraftPlanner.id(item),
+                requester.getName().getString(), plan.steps().size());
+        String steps = plan.steps().size() > 1 ? " (" + plan.steps().size() + " steps)" : "";
+        return "made " + made + " " + CraftPlanner.name(item) + steps + ", bringing it over";
+    }
+
+    /** What is in the pack, as copies, for planning. */
+    private List<ItemStack> packContents() {
+        List<ItemStack> out = new ArrayList<>();
+        SimpleInventory pack = getInventory();
+        for (int slot = 0; slot < pack.size(); slot++) {
+            ItemStack stack = pack.getStack(slot);
+            if (!stack.isEmpty()) {
+                out.add(stack.copy());
+            }
+        }
+        return out;
+    }
+
+    /** The nearest crafting table (vanilla or a modded workbench) within {@code radius}. */
+    @Nullable
+    private BlockPos findCraftingTable(ServerWorld world, int radius) {
+        BlockPos origin = this.getBlockPos();
+        BlockPos best = null;
+        double bestDistance = Double.MAX_VALUE;
+        int height = Math.min(radius, 6);
+        BlockPos.Mutable cursor = new BlockPos.Mutable();
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dz = -radius; dz <= radius; dz++) {
+                if (!world.isChunkLoaded((origin.getX() + dx) >> 4, (origin.getZ() + dz) >> 4)) {
+                    continue;
+                }
+                for (int dy = -height; dy <= height; dy++) {
+                    cursor.set(origin.getX() + dx, origin.getY() + dy, origin.getZ() + dz);
+                    BlockState state = world.getBlockState(cursor);
+                    if (state.isAir()) {
+                        continue;
+                    }
+                    String path = Registries.BLOCK.getId(state.getBlock()).getPath();
+                    if (!path.contains("crafting_table") && !path.contains("workbench")) {
+                        continue;
+                    }
+                    double distance = cursor.getSquaredDistance(origin);
+                    if (distance < bestDistance) {
+                        bestDistance = distance;
+                        best = cursor.toImmutable();
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
+    // ------------------------------------------------------------- survival
+
+    /**
+     * Hunger, a visible health bar, and being a target. A companion that cannot be hurt
+     * is a bot; one that can is a party member.
+     */
+    private void updateSurvival() {
+        LumenConfig config = Lumen.config();
+        if (config.hungerEnabled) {
+            if (++this.foodTicks >= Math.max(20, config.hungerDecaySeconds * 20)) {
+                this.foodTicks = 0;
+                this.foodLevel = Math.max(0.0F, this.foodLevel - 1.0F);
+                if (this.foodLevel == 6.0F || this.foodLevel == 0.0F) {
+                    Lumen.broadcast(this.getWorld().getServer(), this.foodLevel == 0.0F
+                            ? "i'm starving - any food in my pack would help"
+                            : "getting pretty hungry over here");
+                }
+            }
+            boolean slow = this.foodLevel <= 6.0F;
+            if (slow != this.hungerSlowed) {
+                EntityAttributeInstance speed = this.getAttributeInstance(EntityAttributes.GENERIC_MOVEMENT_SPEED);
+                if (speed != null) {
+                    speed.removeModifier(HUNGER_SLOW_ID);
+                    if (slow) {
+                        speed.addTemporaryModifier(new EntityAttributeModifier(HUNGER_SLOW_ID, "lumen hunger",
+                                -0.35D, EntityAttributeModifier.Operation.MULTIPLY_TOTAL));
+                    }
+                }
+                this.hungerSlowed = slow;
+            }
+        } else if (this.foodLevel < 20.0F) {
+            this.foodLevel = 20.0F;
+        }
+        if (this.age % 10 == 0) {
+            refreshNameTag(config);
+        }
+        if (config.hostilesAttackLumen && --this.aggroCooldown <= 0) {
+            this.aggroCooldown = 20;
+            aggroNearbyHostiles(config);
+        }
+    }
+
+    /** Hostiles nearby that have nothing better to do come for Lumen, as they would a player. */
+    private void aggroNearbyHostiles(LumenConfig config) {
+        double radius = config.aggroRadius;
+        if (radius <= 0.0D) {
+            return;
+        }
+        Box box = this.getBoundingBox().expand(radius);
+        for (HostileEntity hostile : this.getWorld().getEntitiesByClass(HostileEntity.class, box,
+                h -> h.isAlive() && h.getTarget() == null && h.canSee(this))) {
+            hostile.setTarget(this);
+        }
+    }
+
+    /** "Lumen ♥14" - health in the name tag, since a vanilla client shows no bar for a mob. */
+    private void refreshNameTag(LumenConfig config) {
+        String shown = config.companionName;
+        if (config.showHealthInName) {
+            shown += " \u2665" + Math.round(this.getHealth());
+            if (config.hungerEnabled && this.foodLevel <= 6.0F) {
+                shown += " hungry";
+            }
+        }
+        if (!shown.equals(this.lastNameShown)) {
+            this.lastNameShown = shown;
+            this.setCustomName(Text.literal(shown).formatted(Formatting.AQUA));
+        }
+    }
+
+    public float getFoodLevel() {
+        return foodLevel;
+    }
+
+    /** "well fed", "hungry", "starving" - for status and the snapshot. */
+    public String describeFood() {
+        if (!Lumen.config().hungerEnabled) {
+            return "not hungry";
+        }
+        if (foodLevel <= 0.0F) {
+            return "starving";
+        }
+        if (foodLevel <= 6.0F) {
+            return "hungry";
+        }
+        if (foodLevel <= 14.0F) {
+            return "peckish";
+        }
+        return "well fed";
+    }
+
+    @Override
+    public void onDeath(DamageSource source) {
+        super.onDeath(source);
+        if (this.getWorld().isClient()) {
+            return;
+        }
+        LumenConfig config = Lumen.config();
+        Lumen.memory().noteDeath(System.currentTimeMillis());
+        String cause = source.getName();
+        String cooldown = config.respawnCooldownMinutes > 0
+                ? " - back in " + config.respawnCooldownMinutes + " minutes"
+                : "";
+        Lumen.broadcast(this.getWorld().getServer(), config.companionName + " is down (" + cause + ")" + cooldown);
+        Lumen.LOGGER.info("{} died to {} at {}", config.companionName, cause, this.getBlockPos().toShortString());
     }
 
     // ------------------------------------------------------------------- combat
@@ -1806,14 +2708,29 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
             stopAndIdle();
         } else if (mode == Mode.GO_TO && destination != null
                 && this.getBlockPos().isWithinDistance(destination, 2.0D)) {
-            stopAndIdle();
+            arrived();
+        } else if (mode == Mode.FOLLOW && currentTask instanceof LumenTask.Return) {
+            PlayerEntity target = getFollowTarget();
+            double reach = Lumen.config().followStartDistance;
+            if (target != null && this.squaredDistanceTo(target) <= reach * reach) {
+                taskDone();
+            }
         }
         // Let go the instant the fight is over, rather than carrying aggro onward.
         LivingEntity currentTarget = this.getTarget();
         if (currentTarget != null && (!currentTarget.isAlive() || currentTarget instanceof PlayerEntity)) {
             this.setTarget(null);
         }
+        if (currentTask instanceof LumenTask.Collect collect) {
+            // Stay until the drops are picked up, or long enough that they are not coming.
+            boolean anyLeft = !this.getWorld().getEntitiesByClass(ItemEntity.class,
+                    new Box(collect.center()).expand(collect.radius()), this::wantsToPickUp).isEmpty();
+            if (!anyLeft || ++this.collectTicks > 20 * 15) {
+                taskDone();
+            }
+        }
         updateStuckState();
+        updateSurvival();
         handleFenceGates();
         handlePassages();
         collectNearbyItems();
@@ -1824,6 +2741,49 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         if (--this.equipCooldown <= 0) {
             this.equipCooldown = 40;
             equipBetterGear();
+        }
+    }
+
+    /** Reached a go-to destination: note the visit if it was a named place, then move on. */
+    private void arrived() {
+        if (craftAfterArrival != null && this.getWorld() instanceof ServerWorld world && world.getServer() != null) {
+            LumenTask.Craft craft = this.craftAfterArrival;
+            this.craftAfterArrival = null;
+            PlayerEntity requester = craft.requester() == null ? null : world.getPlayerByUuid(craft.requester());
+            CraftPlanner planner = CraftPlanner.forServer(world.getServer());
+            Item item = planner.findCraftable(craft.query());
+            CraftPlanner.Plan plan = item == null ? null : planner.plan(item, Math.max(1, craft.count()), packContents());
+            if (requester == null || item == null || plan == null || plan.isEmpty()) {
+                Lumen.broadcast(world.getServer(), "got to the table but " + (plan == null || plan.isEmpty()
+                        ? "i can't make " + craft.query() + " any more" : "whoever asked has gone"));
+            } else {
+                Lumen.broadcast(world.getServer(), performCraft(world, requester, craft, planner, item, plan));
+            }
+            this.mode = Mode.IDLE;
+            taskDone();
+            return;
+        }
+        if (currentTask instanceof LumenTask.GoTo go && go.placeName() != null
+                && this.getWorld() instanceof ServerWorld world) {
+            LumenMemory.KnownPlace place = Lumen.memory().findPlace(go.placeName(), world.getRegistryKey().getValue());
+            if (place != null) {
+                Lumen.memory().notePlaceVisit(place);
+            }
+        }
+        if (currentTask != null) {
+            taskDone();
+        } else {
+            stopAndIdle();
+        }
+    }
+
+    /** Called by the go-to goal when there is no route and no warp either. */
+    public void goToFailed() {
+        if (currentTask instanceof LumenTask.GoTo go) {
+            Lumen.broadcast(this.getWorld().getServer(), "i can't find a way to " + go.describe().replaceFirst("^go to ", ""));
+            taskDone();
+        } else {
+            stopAndIdle();
         }
     }
 

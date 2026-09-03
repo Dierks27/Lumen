@@ -3,8 +3,16 @@ package com.lilahcraft.lumen.command;
 import com.lilahcraft.lumen.Lumen;
 import com.lilahcraft.lumen.LumenConfig;
 import com.lilahcraft.lumen.brain.LumenBrain;
+import com.lilahcraft.lumen.entity.BlockStates;
 import com.lilahcraft.lumen.entity.ChestFinder;
+import com.lilahcraft.lumen.entity.LumenWand;
+import com.lilahcraft.lumen.entity.QuarryPlanner;
+import com.lilahcraft.lumen.skill.LumenSkill;
+import com.lilahcraft.lumen.skill.SkillTeacher;
 import com.lilahcraft.lumen.entity.LumenEntity;
+import com.lilahcraft.lumen.entity.LumenTask;
+import com.lilahcraft.lumen.brain.Phrasing;
+import com.lilahcraft.lumen.memory.LumenMemory;
 import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.context.CommandContext;
@@ -25,6 +33,8 @@ import net.minecraft.server.world.ServerWorld;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.text.Text;
 import net.minecraft.util.Formatting;
+import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.MathHelper;
@@ -47,7 +57,9 @@ public final class LumenCommand {
                 .executes(LumenCommand::status)
                 .then(CommandManager.literal("spawn")
                         .requires(LumenCommand::isAdmin)
-                        .executes(LumenCommand::spawn))
+                        .executes(context -> spawn(context, false))
+                        .then(CommandManager.literal("force")
+                                .executes(context -> spawn(context, true))))
                 .then(CommandManager.literal("despawn")
                         .requires(LumenCommand::isAdmin)
                         .executes(LumenCommand::despawn))
@@ -82,8 +94,47 @@ public final class LumenCommand {
                 .then(CommandManager.literal("memory")
                         .executes(LumenCommand::memory))
                 .then(CommandManager.literal("forget")
-                        .requires(LumenCommand::isAdmin)
-                        .executes(LumenCommand::forget))
+                        // Bare "forget" wipes everything and is checked for admin inside;
+                        // a child node cannot be more permissive than a gated parent.
+                        .executes(LumenCommand::forget)
+                        .then(CommandManager.argument("place", StringArgumentType.greedyString())
+                                .executes(LumenCommand::forgetPlace)))
+                .then(CommandManager.literal("remember")
+                        .then(CommandManager.argument("name", StringArgumentType.greedyString())
+                                .executes(LumenCommand::remember)))
+                .then(CommandManager.literal("go")
+                        .then(CommandManager.argument("place", StringArgumentType.greedyString())
+                                .executes(LumenCommand::go)))
+                .then(CommandManager.literal("look")
+                        .executes(LumenCommand::look))
+                .then(CommandManager.literal("teach")
+                        .then(CommandManager.argument("lesson", StringArgumentType.greedyString())
+                                .executes(LumenCommand::teach)))
+                .then(CommandManager.literal("skills")
+                        .executes(LumenCommand::skills))
+                .then(CommandManager.literal("skill")
+                        .then(CommandManager.argument("name", StringArgumentType.greedyString())
+                                .executes(LumenCommand::skill)))
+                .then(CommandManager.literal("do")
+                        .then(CommandManager.argument("skill", StringArgumentType.greedyString())
+                                .executes(LumenCommand::doSkill)))
+                .then(CommandManager.literal("wand")
+                        .executes(LumenCommand::wand))
+                .then(CommandManager.literal("quarry")
+                        .executes(context -> quarry(context, "selection"))
+                        .then(CommandManager.argument("area", StringArgumentType.greedyString())
+                                .executes(context -> quarry(context, StringArgumentType.getString(context, "area")))))
+                .then(CommandManager.literal("craft")
+                        .then(CommandManager.argument("item", StringArgumentType.greedyString())
+                                .executes(LumenCommand::craft)))
+                .then(CommandManager.literal("notes")
+                        .executes(LumenCommand::notes))
+                .then(CommandManager.literal("queue")
+                        .executes(LumenCommand::queue))
+                .then(CommandManager.literal("cancel")
+                        .executes(LumenCommand::cancel))
+                .then(CommandManager.literal("continue")
+                        .executes(LumenCommand::resume))
                 .then(CommandManager.literal("find")
                         .then(CommandManager.argument("item", StringArgumentType.greedyString())
                                 .executes(LumenCommand::find)))
@@ -101,11 +152,19 @@ public final class LumenCommand {
         return source.hasPermissionLevel(Lumen.config().adminPermissionLevel);
     }
 
-    private static int spawn(CommandContext<ServerCommandSource> context) throws CommandSyntaxException {
+    private static int spawn(CommandContext<ServerCommandSource> context, boolean force) throws CommandSyntaxException {
         ServerCommandSource source = context.getSource();
         ServerPlayerEntity player = source.getPlayerOrThrow();
         LumenConfig config = Lumen.config();
 
+        String blocked = Lumen.manager().spawnBlockedReason(config);
+        if (blocked != null && !force) {
+            source.sendError(Text.literal(blocked));
+            return 0;
+        }
+        if (blocked != null) {
+            Lumen.LOGGER.info("{} forced a spawn during the respawn cooldown", player.getName().getString());
+        }
         LumenEntity lumen = Lumen.manager().spawn(player.getServerWorld(), player.getPos(), player.getYaw(), config);
         if (lumen == null) {
             source.sendError(Text.literal("Could not spawn " + config.companionName + " here."));
@@ -152,8 +211,14 @@ public final class LumenCommand {
             source.sendFeedback(() -> Text.literal("Currently " + lumen.describeActivity()
                             + " at " + lumen.getBlockPos().toShortString()
                             + " (" + Math.round(lumen.getHealth()) + "/" + Math.round(lumen.getMaxHealth())
-                            + " hp, " + lumen.countCarriedStacks() + " stacks carried)")
+                            + " hp, " + lumen.describeFood() + ", " + lumen.countCarriedStacks() + " stacks carried)")
                     .formatted(Formatting.GRAY), false);
+        }
+        long cooldown = Lumen.manager().cooldownRemainingMillis(config);
+        if (cooldown > 0L) {
+            long minutes = (cooldown + 59_999L) / 60_000L;
+            source.sendFeedback(() -> Text.literal("Respawn cooldown: " + minutes + " minute(s) left.")
+                    .formatted(Formatting.YELLOW), false);
         }
         source.sendFeedback(() -> Text.literal("LLM " + (config.enabled ? "enabled" : "disabled")
                 + ", trigger: " + config.chatTrigger
@@ -176,7 +241,13 @@ public final class LumenCommand {
         if (lumen == null) {
             return 0;
         }
+        boolean paused = lumen.currentTask() != null;
+        lumen.pauseForPlayer();
         lumen.goTo(player.getBlockPos());
+        if (paused) {
+            source.sendFeedback(() -> Text.literal(Lumen.config().companionName
+                    + " paused its errand. /lumen continue resumes it.").formatted(Formatting.GRAY), false);
+        }
         return 1;
     }
 
@@ -185,8 +256,159 @@ public final class LumenCommand {
         if (lumen == null) {
             return 0;
         }
-        lumen.stopAndIdle();
+        int dropped = lumen.cancelAll();
+        if (dropped > 0) {
+            context.getSource().sendFeedback(() -> Text.literal("Dropped " + dropped + " task(s).")
+                    .formatted(Formatting.GRAY), false);
+        }
         return 1;
+    }
+
+    private static int queue(CommandContext<ServerCommandSource> context) {
+        ServerCommandSource source = context.getSource();
+        LumenEntity lumen = requireLumen(source);
+        if (lumen == null) {
+            return 0;
+        }
+        List<String> lines = lumen.describeQueue();
+        if (lines.isEmpty()) {
+            source.sendFeedback(() -> Text.literal(Lumen.config().companionName + " has nothing lined up.")
+                    .formatted(Formatting.GRAY), false);
+            return 1;
+        }
+        source.sendFeedback(() -> Text.literal(Lumen.config().companionName + "'s list:").formatted(Formatting.AQUA), false);
+        for (String line : lines) {
+            source.sendFeedback(() -> Text.literal("  " + line).formatted(Formatting.GRAY), false);
+        }
+        if (lumen.currentTask() == null && lumen.queuedCount() > 0) {
+            source.sendFeedback(() -> Text.literal("  (paused - /lumen continue to carry on)")
+                    .formatted(Formatting.DARK_GRAY), false);
+        }
+        return 1;
+    }
+
+    private static int cancel(CommandContext<ServerCommandSource> context) {
+        ServerCommandSource source = context.getSource();
+        LumenEntity lumen = requireLumen(source);
+        if (lumen == null) {
+            return 0;
+        }
+        int dropped = lumen.cancelAll();
+        source.sendFeedback(() -> Text.literal(dropped == 0 ? "Nothing to cancel." : "Cancelled " + dropped + " task(s).")
+                .formatted(Formatting.GRAY), false);
+        return 1;
+    }
+
+    private static int resume(CommandContext<ServerCommandSource> context) {
+        ServerCommandSource source = context.getSource();
+        LumenEntity lumen = requireLumen(source);
+        if (lumen == null) {
+            return 0;
+        }
+        if (!lumen.resume()) {
+            source.sendFeedback(() -> Text.literal(lumen.isOnErrand() ? "Already busy." : "Nothing was waiting.")
+                    .formatted(Formatting.GRAY), false);
+            return 0;
+        }
+        LumenTask task = lumen.currentTask();
+        source.sendFeedback(() -> Text.literal(Lumen.config().companionName + " resumes: "
+                + (task == null ? "?" : task.describe())).formatted(Formatting.AQUA), false);
+        return 1;
+    }
+
+    private static int remember(CommandContext<ServerCommandSource> context) throws CommandSyntaxException {
+        ServerCommandSource source = context.getSource();
+        ServerPlayerEntity player = source.getPlayerOrThrow();
+        String name = LumenMemory.cleanPlaceName(Phrasing.placeNameFromRemember(
+                StringArgumentType.getString(context, "name")));
+        if (name.isEmpty()) {
+            source.sendError(Text.literal("Give the place a name: /lumen remember hops room"));
+            return 0;
+        }
+        LumenMemory.KnownPlace place = Lumen.memory().rememberPlace(name, player.getWorld().getRegistryKey().getValue(),
+                player.getBlockPos(), LumenMemory.DEFAULT_PLACE_RADIUS, player.getName().getString());
+        source.sendFeedback(() -> Text.literal("Remembered \"" + place.name + "\" at " + place.pos().toShortString()
+                + " (radius " + place.radius + ").").formatted(Formatting.AQUA), true);
+        return 1;
+    }
+
+    private static int go(CommandContext<ServerCommandSource> context) throws CommandSyntaxException {
+        ServerCommandSource source = context.getSource();
+        ServerPlayerEntity player = source.getPlayerOrThrow();
+        LumenEntity lumen = requireLumen(source);
+        if (lumen == null) {
+            return 0;
+        }
+        String query = StringArgumentType.getString(context, "place");
+        LumenMemory.KnownPlace place = Lumen.memory().findPlace(query, player.getWorld().getRegistryKey().getValue());
+        if (place == null) {
+            source.sendError(Text.literal("No place called \"" + query + "\". Stand there and /lumen remember <name>."));
+            return 0;
+        }
+        LumenEntity.Submission result = lumen.submit(new LumenTask.GoTo(player.getUuid(), place.pos(), place.name));
+        return reportSubmission(source, result, lumen, "goes to the " + place.name);
+    }
+
+    private static int forgetPlace(CommandContext<ServerCommandSource> context) {
+        ServerCommandSource source = context.getSource();
+        String query = StringArgumentType.getString(context, "place").trim();
+        String lower = query.toLowerCase(java.util.Locale.ROOT);
+        if (lower.startsWith("skill ")) {
+            String name = query.substring(6).trim();
+            if (!Lumen.skills().remove(name)) {
+                source.sendError(Text.literal("No skill called \"" + name + "\"."));
+                return 0;
+            }
+            source.sendFeedback(() -> Text.literal("Forgot the skill \"" + name + "\".").formatted(Formatting.GRAY), true);
+            return 1;
+        }
+        if (lower.equals("notes")) {
+            Lumen.memory().clearNotes();
+            source.sendFeedback(() -> Text.literal("Forgot every note.").formatted(Formatting.GRAY), true);
+            return 1;
+        }
+        if (lower.startsWith("note ")) {
+            int index;
+            try {
+                index = Integer.parseInt(query.substring(5).trim());
+            } catch (NumberFormatException e) {
+                source.sendError(Text.literal("Which note? /lumen notes shows their numbers."));
+                return 0;
+            }
+            if (!Lumen.memory().forgetNote(index)) {
+                source.sendError(Text.literal("No note number " + index + "."));
+                return 0;
+            }
+            source.sendFeedback(() -> Text.literal("Forgot note " + index + ".").formatted(Formatting.GRAY), true);
+            return 1;
+        }
+        if (!Lumen.memory().forgetPlace(query)) {
+            source.sendError(Text.literal("No place called \"" + query + "\"."));
+            return 0;
+        }
+        source.sendFeedback(() -> Text.literal("Forgot the place \"" + query + "\".").formatted(Formatting.GRAY), true);
+        return 1;
+    }
+
+    /** Feedback for a task that was submitted from a slash command. */
+    private static int reportSubmission(ServerCommandSource source, LumenEntity.Submission result, LumenEntity lumen,
+                                        String started) {
+        String name = Lumen.config().companionName;
+        switch (result) {
+            case STARTED -> {
+                source.sendFeedback(() -> Text.literal(name + " " + started + ".").formatted(Formatting.AQUA), false);
+                return 1;
+            }
+            case QUEUED -> {
+                source.sendFeedback(() -> Text.literal(name + " will do that after what it is doing now ("
+                        + lumen.queuedCount() + " waiting).").formatted(Formatting.AQUA), false);
+                return 1;
+            }
+            default -> {
+                source.sendError(Text.literal(name + ": " + lumen.lastTaskNote()));
+                return 0;
+            }
+        }
     }
 
     /** Escape hatch for the times pathfinding loses: warp Lumen to the player. */
@@ -348,27 +570,222 @@ public final class LumenCommand {
         return 1;
     }
 
+    /** What block the player is looking at, as Lumen sees it: id, full state, and ripeness. */
+    private static int look(CommandContext<ServerCommandSource> context) throws CommandSyntaxException {
+        ServerCommandSource source = context.getSource();
+        ServerPlayerEntity player = source.getPlayerOrThrow();
+        HitResult hit = player.raycast(8.0D, 1.0F, false);
+        if (!(hit instanceof BlockHitResult blockHit) || hit.getType() != HitResult.Type.BLOCK) {
+            source.sendError(Text.literal("Look at a block within 8 blocks."));
+            return 0;
+        }
+        BlockPos pos = blockHit.getBlockPos();
+        BlockState state = player.getWorld().getBlockState(pos);
+        String described = BlockStates.describe(state);
+        boolean signal = BlockStates.hasGrowthSignal(state);
+        boolean ripe = signal && BlockStates.isRipe(player.getWorld(), pos, state);
+        source.sendFeedback(() -> Text.literal(described + " at " + pos.toShortString()).formatted(Formatting.AQUA), false);
+        source.sendFeedback(() -> Text.literal("  \"" + BlockStates.displayName(state) + "\"; "
+                + (state.hasBlockEntity() ? "has a block entity (Lumen will not use or break it); " : "")
+                + (signal ? (ripe ? "reads as RIPE" : "reads as still growing") : "no growth signal - \"ripe\" will never match it"))
+                .formatted(Formatting.GRAY), false);
+        source.sendFeedback(() -> Text.literal("  teach with: /lumen teach harvest <name>: right click these when ripe")
+                .formatted(Formatting.DARK_GRAY), false);
+        return 1;
+    }
+
+    /** Teaches a skill from a sentence, grounded on the block the player is looking at. */
+    private static int teach(CommandContext<ServerCommandSource> context) throws CommandSyntaxException {
+        ServerCommandSource source = context.getSource();
+        ServerPlayerEntity player = source.getPlayerOrThrow();
+        if (!Lumen.config().allowTeaching) {
+            source.sendError(Text.literal("Teaching is turned off in the config."));
+            return 0;
+        }
+        String lesson = StringArgumentType.getString(context, "lesson");
+        String lookedAt = null;
+        boolean ripe = false;
+        HitResult hit = player.raycast(8.0D, 1.0F, false);
+        if (hit instanceof BlockHitResult blockHit && hit.getType() == HitResult.Type.BLOCK) {
+            BlockState state = player.getWorld().getBlockState(blockHit.getBlockPos());
+            if (!state.isAir()) {
+                lookedAt = BlockStates.id(state);
+                ripe = BlockStates.isRipe(player.getWorld(), blockHit.getBlockPos(), state);
+            }
+        }
+        LumenSkill skill = SkillTeacher.parse(lesson, lookedAt, ripe);
+        if (skill == null) {
+            source.sendError(Text.literal("Say what to do and to what: /lumen teach harvest hops: right click the ripe hops vines"));
+            return 0;
+        }
+        skill.taughtBy = player.getName().getString();
+        skill.created = System.currentTimeMillis();
+        if (!Lumen.skills().put(skill)) {
+            source.sendError(Text.literal("The skill book is full; forget one first."));
+            return 0;
+        }
+        source.sendFeedback(() -> Text.literal("Learned \"" + skill.name + "\": " + skill.describe()
+                + (skill.example.isEmpty() ? "" : " (example block: " + skill.example + ")")).formatted(Formatting.AQUA), true);
+        return 1;
+    }
+
+    private static int skills(CommandContext<ServerCommandSource> context) {
+        ServerCommandSource source = context.getSource();
+        List<LumenSkill> all = Lumen.skills().all();
+        if (all.isEmpty()) {
+            source.sendFeedback(() -> Text.literal(Lumen.config().companionName
+                    + " has not been taught anything yet. Look at a block and /lumen teach <name>: <how>.")
+                    .formatted(Formatting.GRAY), false);
+            return 1;
+        }
+        source.sendFeedback(() -> Text.literal(Lumen.config().companionName + " knows " + all.size() + " skill(s):")
+                .formatted(Formatting.AQUA), false);
+        for (LumenSkill skill : all) {
+            source.sendFeedback(() -> Text.literal("  " + skill.describe() + " (used " + skill.uses + "x)")
+                    .formatted(Formatting.GRAY), false);
+        }
+        return 1;
+    }
+
+    private static int skill(CommandContext<ServerCommandSource> context) {
+        ServerCommandSource source = context.getSource();
+        String name = StringArgumentType.getString(context, "name");
+        LumenSkill skill = Lumen.skills().find(name);
+        if (skill == null) {
+            source.sendError(Text.literal("No skill called \"" + name + "\"."));
+            return 0;
+        }
+        source.sendFeedback(() -> Text.literal(skill.name).formatted(Formatting.AQUA), false);
+        source.sendFeedback(() -> Text.literal("  action: " + (skill.isInteract() ? "right-click" : "break")
+                + "; target: " + skill.target + "; radius " + skill.radius + "; collect: " + skill.collect).formatted(Formatting.GRAY), false);
+        source.sendFeedback(() -> Text.literal("  taught by " + skill.taughtBy + (skill.example.isEmpty() ? "" : " looking at " + skill.example)
+                + "; aliases: " + (skill.aliases.isEmpty() ? "none" : String.join(", ", skill.aliases))).formatted(Formatting.DARK_GRAY), false);
+        return 1;
+    }
+
+    private static int doSkill(CommandContext<ServerCommandSource> context) throws CommandSyntaxException {
+        ServerCommandSource source = context.getSource();
+        ServerPlayerEntity player = source.getPlayerOrThrow();
+        LumenEntity lumen = requireLumen(source);
+        if (lumen == null) {
+            return 0;
+        }
+        String query = StringArgumentType.getString(context, "skill");
+        Phrasing.PlaceRef ref = Phrasing.splitPlaceReference(query);
+        LumenMemory.KnownPlace place = ref.place() == null ? null
+                : Lumen.memory().findPlace(ref.place(), player.getWorld().getRegistryKey().getValue());
+        LumenSkill skill = Lumen.skills().find(place == null ? query : ref.rest());
+        if (skill == null) {
+            source.sendError(Text.literal("No skill called \"" + query + "\". /lumen skills lists them."));
+            return 0;
+        }
+        LumenEntity.Submission result = lumen.submit(new LumenTask.Harvest(player.getUuid(), skill.name,
+                place == null ? null : place.pos(), place == null ? null : place.name));
+        return reportSubmission(source, result, lumen, "starts on " + skill.name
+                + (place == null ? "" : " at the " + place.name));
+    }
+
+    private static int wand(CommandContext<ServerCommandSource> context) throws CommandSyntaxException {
+        ServerCommandSource source = context.getSource();
+        ServerPlayerEntity player = source.getPlayerOrThrow();
+        LumenWand.giveTo(player);
+        source.sendFeedback(() -> Text.literal("Left-click one corner, right-click the other, then /lumen quarry.")
+                .formatted(Formatting.AQUA), false);
+        return 1;
+    }
+
+    private static int quarry(CommandContext<ServerCommandSource> context, String area) throws CommandSyntaxException {
+        ServerCommandSource source = context.getSource();
+        ServerPlayerEntity player = source.getPlayerOrThrow();
+        LumenEntity lumen = requireLumen(source);
+        if (lumen == null) {
+            return 0;
+        }
+        QuarryPlanner.Spec spec = QuarryPlanner.parse(area);
+        QuarryPlanner.Region region;
+        String label;
+        if (spec == null || spec.selection() || !spec.hasSize()) {
+            region = LumenWand.selection(player.getUuid());
+            if (region == null) {
+                source.sendError(Text.literal("No selection. /lumen wand, mark two corners, or give a size: /lumen quarry 10x10x2 level 40"));
+                return 0;
+            }
+            label = "the selection (" + region.sizeX() + "x" + region.sizeZ() + "x" + region.sizeY() + ")";
+        } else {
+            BlockPos feet = lumen.getBlockPos();
+            region = QuarryPlanner.regionAround(feet.getX(), feet.getY(), feet.getZ(), spec);
+            label = spec.sizeX() + "x" + spec.sizeZ() + "x" + spec.height() + (spec.targetY() != null ? " at y " + spec.targetY() : "");
+        }
+        LumenEntity.Submission result = lumen.submit(new LumenTask.Quarry(player.getUuid(), region, label));
+        return reportSubmission(source, result, lumen, "digs out " + region.describe());
+    }
+
+    private static int craft(CommandContext<ServerCommandSource> context) throws CommandSyntaxException {
+        ServerCommandSource source = context.getSource();
+        ServerPlayerEntity player = source.getPlayerOrThrow();
+        LumenEntity lumen = requireLumen(source);
+        if (lumen == null) {
+            return 0;
+        }
+        ChestFinder.Request request = ChestFinder.parseRequest(StringArgumentType.getString(context, "item"), 1);
+        int count = request.isEverything() ? 1 : Math.max(1, Math.min(64, request.count()));
+        LumenEntity.Submission result = lumen.submit(new LumenTask.Craft(player.getUuid(), request.query(), count));
+        return reportSubmission(source, result, lumen, "works on " + count + " " + request.query());
+    }
+
+    private static int notes(CommandContext<ServerCommandSource> context) {
+        ServerCommandSource source = context.getSource();
+        List<String> notes = Lumen.memory().notes();
+        if (notes.isEmpty()) {
+            source.sendFeedback(() -> Text.literal(Lumen.config().companionName + " has no notes yet - they build up as you chat.")
+                    .formatted(Formatting.GRAY), false);
+            return 1;
+        }
+        source.sendFeedback(() -> Text.literal(Lumen.config().companionName + " remembers:").formatted(Formatting.AQUA), false);
+        for (int i = 0; i < notes.size(); i++) {
+            String line = (i + 1) + ". " + notes.get(i);
+            source.sendFeedback(() -> Text.literal("  " + line).formatted(Formatting.GRAY), false);
+        }
+        source.sendFeedback(() -> Text.literal("  /lumen forget note <n> drops one; /lumen forget notes drops them all.")
+                .formatted(Formatting.DARK_GRAY), false);
+        return 1;
+    }
+
     private static int memory(CommandContext<ServerCommandSource> context) {
         ServerCommandSource source = context.getSource();
+        List<String> places = Lumen.memory().placeLines(15);
         List<String> lines = Lumen.memory().lines(15);
-        if (lines.isEmpty()) {
+        if (lines.isEmpty() && places.isEmpty()) {
             source.sendFeedback(() -> Text.literal(Lumen.config().companionName
                     + " has not found anything worth remembering yet.").formatted(Formatting.GRAY), false);
             return 1;
         }
-        source.sendFeedback(() -> Text.literal(Lumen.config().companionName + " remembers "
-                + Lumen.memory().size() + " place(s):").formatted(Formatting.AQUA), false);
-        for (String line : lines) {
-            source.sendFeedback(() -> Text.literal("  " + line).formatted(Formatting.GRAY), false);
+        if (!places.isEmpty()) {
+            source.sendFeedback(() -> Text.literal(Lumen.config().companionName + " knows "
+                    + Lumen.memory().placeCount() + " named place(s):").formatted(Formatting.AQUA), false);
+            for (String line : places) {
+                source.sendFeedback(() -> Text.literal("  " + line).formatted(Formatting.GRAY), false);
+            }
+        }
+        if (!lines.isEmpty()) {
+            source.sendFeedback(() -> Text.literal(Lumen.config().companionName + " remembers "
+                    + Lumen.memory().size() + " container(s):").formatted(Formatting.AQUA), false);
+            for (String line : lines) {
+                source.sendFeedback(() -> Text.literal("  " + line).formatted(Formatting.GRAY), false);
+            }
         }
         return 1;
     }
 
     private static int forget(CommandContext<ServerCommandSource> context) {
         ServerCommandSource source = context.getSource();
-        int had = Lumen.memory().size();
+        if (!isAdmin(source)) {
+            source.sendError(Text.literal("Only an operator can clear everything. /lumen forget <place> forgets one place."));
+            return 0;
+        }
+        int had = Lumen.memory().size() + Lumen.memory().placeCount();
         Lumen.memory().clear();
-        source.sendFeedback(() -> Text.literal("Cleared " + had + " remembered place(s).")
+        source.sendFeedback(() -> Text.literal("Cleared " + had + " remembered container(s) and place(s).")
                 .formatted(Formatting.GRAY), true);
         return 1;
     }
@@ -385,18 +802,15 @@ public final class LumenCommand {
             source.sendError(Text.literal("Chest access is turned off in the config."));
             return 0;
         }
-        ChestFinder.Request request = ChestFinder.parseRequest(query, Lumen.config().defaultFetchCount);
-        if (!lumen.startFetch(player, request)) {
-            source.sendError(Text.literal(lumen.fetchSawUnreachable()
-                    ? "A container within " + Math.round(Lumen.config().chestSearchRadius) + " blocks has \""
-                            + request.query() + "\", but " + Lumen.config().companionName + " cannot path to it."
-                    : "No container within " + Math.round(Lumen.config().chestSearchRadius) + " blocks has \""
-                            + request.query() + "\"."));
-            return 0;
-        }
-        source.sendFeedback(() -> Text.literal(Lumen.config().companionName
-                + " goes looking for " + ChestFinder.describeRequest(request) + ".").formatted(Formatting.AQUA), false);
-        return 1;
+        Phrasing.PlaceRef ref = Phrasing.splitPlaceReference(query);
+        LumenMemory.KnownPlace place = ref.place() == null ? null
+                : Lumen.memory().findPlace(ref.place(), player.getWorld().getRegistryKey().getValue());
+        String itemText = place == null ? query : ref.rest();
+        ChestFinder.Request request = ChestFinder.parseRequest(itemText, Lumen.config().defaultFetchCount);
+        LumenEntity.Submission result = lumen.submit(new LumenTask.Fetch(player.getUuid(), request,
+                place == null ? null : place.pos(), place == null ? null : place.name));
+        return reportSubmission(source, result, lumen, "goes looking for " + ChestFinder.describeRequest(request)
+                + (place == null ? "" : " around the " + place.name));
     }
 
     private static int mine(CommandContext<ServerCommandSource> context) throws CommandSyntaxException {
@@ -411,14 +825,14 @@ public final class LumenCommand {
             return 0;
         }
         String query = StringArgumentType.getString(context, "block");
-        String refusal = lumen.startMining(player, query);
-        if (refusal != null) {
-            source.sendError(Text.literal(Lumen.config().companionName + ": " + refusal));
-            return 0;
-        }
-        source.sendFeedback(() -> Text.literal(Lumen.config().companionName
-                + " goes off to mine " + query + ".").formatted(Formatting.AQUA), false);
-        return 1;
+        Phrasing.PlaceRef ref = Phrasing.splitPlaceReference(query);
+        LumenMemory.KnownPlace place = ref.place() == null ? null
+                : Lumen.memory().findPlace(ref.place(), player.getWorld().getRegistryKey().getValue());
+        String blockText = place == null ? query : ref.rest();
+        LumenEntity.Submission result = lumen.submit(new LumenTask.Mine(player.getUuid(), blockText,
+                place == null ? null : place.pos(), place == null ? null : place.name));
+        return reportSubmission(source, result, lumen, "goes off to mine " + blockText
+                + (place == null ? "" : " near the " + place.name));
     }
 
     /**
@@ -565,6 +979,7 @@ public final class LumenCommand {
         if (lumen == null) {
             return 0;
         }
+        lumen.pauseForPlayer();
         lumen.followPlayer(target);
         return 1;
     }

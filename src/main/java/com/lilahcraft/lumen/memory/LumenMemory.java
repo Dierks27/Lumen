@@ -6,6 +6,7 @@ import com.lilahcraft.lumen.Lumen;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.math.BlockPos;
+import org.jetbrains.annotations.Nullable;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -46,13 +47,49 @@ public final class LumenMemory {
         }
     }
 
+    /**
+     * A place the player named: "remember this as the hops room". A point plus a radius,
+     * which is enough to say "you are in the hops room" and to search around it.
+     */
+    public static final class KnownPlace {
+        public String name = "";
+        public String dimension = "";
+        public int x;
+        public int y;
+        public int z;
+        public int radius = DEFAULT_PLACE_RADIUS;
+        public String taughtBy = "";
+        public long created;
+        public int visits;
+
+        public BlockPos pos() {
+            return new BlockPos(x, y, z);
+        }
+
+        /** True when {@code pos} is inside this place's sphere. */
+        public boolean contains(BlockPos pos) {
+            return pos().getSquaredDistance(pos) <= (double) radius * radius;
+        }
+    }
+
+    /** How big a place is when nobody says: a small room. */
+    public static final int DEFAULT_PLACE_RADIUS = 6;
+
     /** The on-disk shape. Keeping a wrapper leaves room to add more kinds of memory. */
     private static final class Data {
+        /** When Lumen last died, epoch millis; 0 when never. Drives the respawn cooldown. */
+        long lastDeath;
+        /** Things the player told Lumen that are worth keeping: summarised conversation. */
+        List<String> notes = new ArrayList<>();
         List<KnownContainer> containers = new ArrayList<>();
+        /** Absent in files written before v0.7.0; null-guarded on load. */
+        List<KnownPlace> places = new ArrayList<>();
     }
 
     /** Beyond this the oldest entries are dropped. */
     private static final int MAX_ENTRIES = 200;
+
+    private static final int MAX_PLACES = 100;
 
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create();
 
@@ -74,7 +111,14 @@ public final class LumenMemory {
             if (this.data.containers == null) {
                 this.data.containers = new ArrayList<>();
             }
-            Lumen.LOGGER.info("Loaded {} remembered container(s)", this.data.containers.size());
+            if (this.data.places == null) {
+                this.data.places = new ArrayList<>();
+            }
+            if (this.data.notes == null) {
+                this.data.notes = new ArrayList<>();
+            }
+            Lumen.LOGGER.info("Loaded {} remembered container(s) and {} place(s)",
+                    this.data.containers.size(), this.data.places.size());
         } catch (IOException | RuntimeException e) {
             Lumen.LOGGER.error("Could not read {}, starting with an empty memory: {}", path, e.toString());
             this.data = new Data();
@@ -95,8 +139,14 @@ public final class LumenMemory {
         return data.containers.size();
     }
 
+    public synchronized int placeCount() {
+        return data.places.size();
+    }
+
+    /** Forgets everything: containers and places alike. */
     public synchronized void clear() {
         data.containers.clear();
+        data.places.clear();
         save();
     }
 
@@ -173,6 +223,221 @@ public final class LumenMemory {
         return out.toString();
     }
 
+    // ------------------------------------------------------------------ places
+
+    /**
+     * Saves a named place, replacing any place of the same name in the same dimension.
+     * Names are kept as plain lowercase words so "the Hops Room" and "hops room" are one
+     * place.
+     */
+    public synchronized KnownPlace rememberPlace(String name, Identifier dimension, BlockPos pos, int radius,
+                                                 String taughtBy) {
+        String clean = cleanPlaceName(name);
+        data.places.removeIf(place -> place.dimension.equals(dimension.toString()) && place.name.equals(clean));
+        KnownPlace place = new KnownPlace();
+        place.name = clean;
+        place.dimension = dimension.toString();
+        place.x = pos.getX();
+        place.y = pos.getY();
+        place.z = pos.getZ();
+        place.radius = Math.max(1, Math.min(64, radius));
+        place.taughtBy = taughtBy == null ? "" : taughtBy;
+        place.created = System.currentTimeMillis();
+        data.places.add(place);
+        if (data.places.size() > MAX_PLACES) {
+            data.places.remove(0);
+        }
+        save();
+        return place;
+    }
+
+    /** @return true if a place by that name (fuzzily) existed and is now gone */
+    public synchronized boolean forgetPlace(String query) {
+        KnownPlace place = findPlace(query, null);
+        if (place == null) {
+            return false;
+        }
+        data.places.remove(place);
+        save();
+        return true;
+    }
+
+    /**
+     * The place that best answers to {@code query}, in {@code dimension} if given.
+     * Matching is tiered the same way items are: exact name, then every word of the
+     * query as a whole word of the name, then substring. "hops", "the hops room" and
+     * "hopsroom" all find "hops room".
+     */
+    @Nullable
+    public synchronized KnownPlace findPlace(String query, @Nullable Identifier dimension) {
+        String clean = cleanPlaceName(query);
+        if (clean.isEmpty()) {
+            return null;
+        }
+        KnownPlace best = null;
+        int bestScore = 0;
+        for (KnownPlace place : data.places) {
+            if (dimension != null && !place.dimension.equals(dimension.toString())) {
+                continue;
+            }
+            int score = placeScore(place.name, clean);
+            if (score > bestScore) {
+                bestScore = score;
+                best = place;
+            }
+        }
+        return best;
+    }
+
+    /** All places in a dimension, nearest first. */
+    public synchronized List<KnownPlace> placesIn(Identifier dimension, BlockPos near) {
+        return data.places.stream()
+                .filter(place -> place.dimension.equals(dimension.toString()))
+                .sorted(Comparator.comparingDouble((KnownPlace place) -> place.pos().getSquaredDistance(near)))
+                .toList();
+    }
+
+    /** The place {@code pos} is inside, if any - the smallest one when they overlap. */
+    @Nullable
+    public synchronized KnownPlace placeAt(Identifier dimension, BlockPos pos) {
+        KnownPlace inside = null;
+        for (KnownPlace place : data.places) {
+            if (place.dimension.equals(dimension.toString()) && place.contains(pos)
+                    && (inside == null || place.radius < inside.radius)) {
+                inside = place;
+            }
+        }
+        return inside;
+    }
+
+    public synchronized void notePlaceVisit(KnownPlace place) {
+        place.visits++;
+        save();
+    }
+
+    /**
+     * The "[places you know]" block for the prompt, nearest first, with a compass
+     * bearing so the model can talk about them sensibly. Empty when nothing is known.
+     */
+    public synchronized String describePlaces(Identifier dimension, BlockPos near, int limit) {
+        List<KnownPlace> nearby = placesIn(dimension, near);
+        if (nearby.isEmpty()) {
+            return "";
+        }
+        StringBuilder out = new StringBuilder("[places you know]\n");
+        int shown = 0;
+        for (KnownPlace place : nearby) {
+            if (shown++ >= Math.max(0, limit)) {
+                break;
+            }
+            int distance = (int) Math.round(Math.sqrt(place.pos().getSquaredDistance(near)));
+            out.append("- ").append(place.name).append(": ");
+            if (place.contains(near)) {
+                out.append("you are in it now");
+            } else {
+                out.append(distance).append(" blocks ").append(bearing(near, place.pos()));
+                if (place.y - near.getY() >= 3) {
+                    out.append(", up");
+                } else if (near.getY() - place.y >= 3) {
+                    out.append(", down");
+                }
+            }
+            out.append("\n");
+        }
+        return out.toString();
+    }
+
+    /** Lines for /lumen memory. */
+    public synchronized List<String> placeLines(int limit) {
+        return data.places.stream()
+                .sorted(Comparator.comparingLong((KnownPlace place) -> place.created).reversed())
+                .limit(Math.max(0, limit))
+                .map(place -> place.name + " at " + place.x + ", " + place.y + ", " + place.z
+                        + " in " + place.dimension + " (r" + place.radius
+                        + (place.taughtBy.isEmpty() ? "" : ", from " + place.taughtBy) + ")")
+                .toList();
+    }
+
+    /** "north", "south-east", ... from {@code from} to {@code to}, ignoring height. */
+    static String bearing(BlockPos from, BlockPos to) {
+        int dx = to.getX() - from.getX();
+        int dz = to.getZ() - from.getZ();
+        if (dx == 0 && dz == 0) {
+            return "here";
+        }
+        // Minecraft: +z is south, +x is east.
+        double angle = Math.toDegrees(Math.atan2(dx, -dz)); // 0 = north, 90 = east
+        if (angle < 0) {
+            angle += 360.0D;
+        }
+        String[] points = {"north", "north-east", "east", "south-east", "south", "south-west", "west", "north-west"};
+        return points[(int) Math.round(angle / 45.0D) % 8];
+    }
+
+    /**
+     * How well a stored place name answers to a query: 3 exact, 2 every query word is a
+     * word of the name, 1 substring either way, 0 nothing. Pure, for the tests.
+     */
+    static int placeScore(String name, String query) {
+        if (name.equals(query)) {
+            return 3;
+        }
+        String[] queryWords = query.split(" ");
+        String[] nameWords = name.split(" ");
+        boolean all = queryWords.length > 0;
+        for (String wanted : queryWords) {
+            boolean found = false;
+            for (String present : nameWords) {
+                if (present.equals(wanted)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                all = false;
+                break;
+            }
+        }
+        if (all) {
+            return 2;
+        }
+        String squashedName = name.replace(" ", "");
+        String squashedQuery = query.replace(" ", "");
+        if (squashedName.contains(squashedQuery) || squashedQuery.contains(squashedName)) {
+            return 1;
+        }
+        return 0;
+    }
+
+    /**
+     * "the Hops Room!" -> "hops room". Drops articles and the words people wrap a name in
+     * ("this as", "call it"), so the stored name is the name and nothing else.
+     */
+    public static String cleanPlaceName(@Nullable String raw) {
+        if (raw == null) {
+            return "";
+        }
+        String text = raw.trim().toLowerCase(Locale.ROOT)
+                .replaceAll("[^a-z0-9 _-]+", " ")
+                .replace('_', ' ')
+                .replace('-', ' ')
+                .replaceAll("\\s+", " ")
+                .trim();
+        // Only framing words come off. "spot", "place" and "room" stay: "the copper
+        // spot" is the name the player chose, and "spot" is half of it.
+        for (int i = 0; i < 4; i++) {
+            String stripped = text
+                    .replaceFirst("^(this|here|it|that|the|a|an|my|our|as|is|called|named)\\b\\s*", "")
+                    .replaceFirst("\\s+the$", "")
+                    .trim();
+            if (stripped.equals(text)) {
+                break;
+            }
+            text = stripped;
+        }
+        return text;
+    }
+
     /** Lines for /lumen memory. */
     public synchronized List<String> lines(int limit) {
         return data.containers.stream()
@@ -226,6 +491,100 @@ public final class LumenMemory {
     private static String itemPath(String itemId) {
         int colon = itemId.indexOf(':');
         return (colon < 0 ? itemId : itemId.substring(colon + 1)).toLowerCase(Locale.ROOT);
+    }
+
+    // ------------------------------------------------------------------ deaths
+
+    public synchronized void noteDeath(long epochMillis) {
+        data.lastDeath = epochMillis;
+        save();
+    }
+
+    /** Epoch millis of the last death, or 0. */
+    public synchronized long lastDeath() {
+        return data.lastDeath;
+    }
+
+    public synchronized void clearDeath() {
+        data.lastDeath = 0L;
+        save();
+    }
+
+    // ------------------------------------------------------------------- notes
+
+    /** How many notes are kept; older ones fall off. The prompt pays for every one. */
+    public static final int MAX_NOTES = 12;
+    public static final int MAX_NOTE_LENGTH = 140;
+
+    public synchronized List<String> notes() {
+        return new ArrayList<>(data.notes);
+    }
+
+    /**
+     * Adds notes from a conversation summary. Trimmed, deduplicated, bounded. Anything
+     * that repeats an existing note (same words) is dropped rather than doubled.
+     */
+    public synchronized int addNotes(List<String> fresh) {
+        int added = 0;
+        for (String raw : fresh) {
+            if (raw == null) {
+                continue;
+            }
+            String note = raw.trim().replaceAll("\\s+", " ").replaceAll("^[-*\\d.)\\s]+", "").trim();
+            if (note.length() < 8) {
+                continue;
+            }
+            if (note.length() > MAX_NOTE_LENGTH) {
+                note = note.substring(0, MAX_NOTE_LENGTH - 3) + "...";
+            }
+            String key = note.toLowerCase(Locale.ROOT);
+            boolean duplicate = false;
+            for (String existing : data.notes) {
+                if (existing.toLowerCase(Locale.ROOT).equals(key)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) {
+                continue;
+            }
+            data.notes.add(note);
+            added++;
+        }
+        while (data.notes.size() > MAX_NOTES) {
+            data.notes.remove(0);
+        }
+        if (added > 0) {
+            save();
+        }
+        return added;
+    }
+
+    /** Removes note number {@code index} (1-based, as /lumen notes shows them). */
+    public synchronized boolean forgetNote(int index) {
+        if (index < 1 || index > data.notes.size()) {
+            return false;
+        }
+        data.notes.remove(index - 1);
+        save();
+        return true;
+    }
+
+    public synchronized void clearNotes() {
+        data.notes.clear();
+        save();
+    }
+
+    /** The "[things you remember]" block for the prompt, or empty. */
+    public synchronized String describeNotes() {
+        if (data.notes.isEmpty()) {
+            return "";
+        }
+        StringBuilder out = new StringBuilder("[things you remember from earlier days]\n");
+        for (String note : data.notes) {
+            out.append("- ").append(note).append('\n');
+        }
+        return out.toString();
     }
 
     static String normalise(String query) {

@@ -29,6 +29,24 @@ specific code.
 - Where things were found is kept in `config/lumen/memory.json` and survives restarts
 - Ask for something fetched before and Lumen goes straight back to that container
 - Memories that turn out wrong are forgotten and the search starts again
+- **Named places.** Stand somewhere and say *"remember this as the hops room"* (or
+  `/lumen remember hops room`). From then on *"go to the hops room"*, *"find hops from
+  the hops room"* and *"mine copper near the copper spot"* all work, in chat and as
+  `/lumen go`, `/lumen find` and `/lumen mine`. Names match loosely - "hops", "the hops
+  room" and "hopsroom" are all the same place. `/lumen memory` lists them,
+  `/lumen forget <place>` drops one. The model is told which places are nearby and how
+  far, so it can talk about them
+
+**Doing several things**
+- A second request waits its turn instead of cancelling the first. *"Grab me some iron,
+  then go mine some copper, then come back"* is three jobs run in order; so is saying
+  them one at a time while it works. `/lumen queue` shows the list
+- *"Come here"* and *"follow me"* interrupt: the errand is paused, not lost, and
+  *"carry on"* (or `/lumen continue`) picks it back up with whatever was still owed.
+  *"Stop"* or `/lumen cancel` throws the lot away
+- With combat on, a fight interrupts an errand and the errand resumes when it is over
+- Something the model says in passing ("stop", "follow") only counts when you actually
+  said it - a chatty model no longer talks Lumen out of a job
 
 **Fetching**
 - Takes the amount you asked for and stops: *"grab me 12 redstone"* is 12, not the
@@ -74,6 +92,63 @@ specific code.
 - Defends itself and whoever it is following against hostile mobs, and eats from its
   pack when hurt
 
+**Teaching it jobs**
+- Look at a block and explain the job once: *"lumen, learn harvest hops: right click
+  the ripe hops vines and collect what drops"* (or `/lumen teach harvest hops: ...`).
+  From then on *"harvest the hops"* or `/lumen do hops` walks it round every matching
+  block in range, right-clicks (or breaks) each one, picks up the drops and brings
+  them back. Skills live in `config/lumen/skills.json` and survive restarts
+- "These" and "this" are grounded on the block you are looking at when you teach, so
+  *"learn pick berries: right click these when they're ripe"* while looking at a bush
+  stores the real block id, not the word "these". `/lumen look` shows what Lumen sees
+  in the block you are looking at, including whether it reads as ripe
+- Ripeness is mod-agnostic: a block that implements vanilla's bone-meal check
+  (`Fertilizable`) is ripe when it can grow no further; otherwise an `age`, `stage`,
+  `growth` or `maturity` property at its maximum counts. You can also pin a state
+  yourself: *"sweet berry bush age=3"*
+- The catch, verified against the 1.20.1 sources: a mob cannot right-click a block by
+  itself - `AbstractBlock#onUse` needs a real player and Fabric API 1.20.1 has no
+  `FakePlayer`. So a right-click skill acts in the name of the player who asked, who
+  must be online, in the same dimension and within `interactRange`. Containers are
+  never right-clicked, so a skill cannot open your chests. `/lumen skills` lists what
+  it knows, `/lumen skill <name>` shows one, `/lumen forget skill <name>` drops it
+
+**Quarrying**
+- *"Go down to level 2 and mine out a 20x20x2 and bring me back all the loot"* is one
+  sentence and one job: Lumen digs a staircase down to the level, clears the area top
+  down in a serpentine so it never digs the floor out from under itself, skips
+  anything next to water or lava, then comes back with the haul. Sizes read as
+  `WxLxH`, *"10 by 10"*, *"3 deep"*; levels as *"level 2"*, *"y -20"*, *"bedrock"*,
+  *"diamond level"*
+- `/lumen wand` hands you a selection wand (a stick). Left-click one corner, right-click
+  the other - the selection is outlined in particles - then *"mine out the selection"*
+  or a bare `/lumen quarry`
+- Bounded by `maxQuarryBlocks`, `maxQuarrySize` and `maxQuarryDescent`; containers and
+  block entities are never broken, and claims apply the requesting player's permissions
+
+**Crafting**
+- *"Craft 8 sticks"*, *"I need a pickaxe"*, `/lumen craft 4 torches`: Lumen plans the
+  recipe from what is in its pack, recursively - a stone pickaxe needs sticks, which
+  need planks, which need a log - and names exactly what is missing if it cannot.
+  Recipes that need a table send it to the nearest crafting table first (or set
+  `craftingNeedsTable: false`)
+
+**Staying alive**
+- Hostile mobs now target Lumen (`hostilesAttackLumen`), and Lumen gets hungry: the
+  food bar drains one point every `hungerDecaySeconds`, it eats from its pack when
+  hungry or hurt, and below six food it walks slowly and says so. The name tag reads
+  `Lumen ♥16` (and `hungry`) so you can see how it is doing from across the room
+- One life per `respawnCooldownMinutes` (two hours by default). When it dies the pack
+  drops, the death is recorded in memory, and `/lumen spawn` refuses until the time is
+  up - `/lumen status` shows how long is left. An admin can `/lumen spawn force`
+
+**Notes to self**
+- Every `notesEveryMessages` chat lines the model writes a few one-line notes about
+  what mattered - what you built together, what you asked it to remember, jokes that
+  landed - into `config/lumen/memory.json`. They come back in the prompt after a
+  restart. `/lumen notes` shows them, `/lumen forget note <n>` and
+  `/lumen forget notes` drop them
+
 ## Server-side only, and what that costs
 
 Lumen is installed on the **server only**. Players join with an unmodified client.
@@ -89,8 +164,24 @@ Lumen's own server-side class. Vanilla clients spawn an ordinary villager model 
 perfectly happy; zombies do not treat Lumen as a villager, and it makes no villager
 noises.
 
-Change the look with `appearanceEntity` in the config, e.g. `minecraft:wandering_trader`
-or `minecraft:snow_golem`.
+Change the look with `appearanceEntity` in the config. Anything the client can render
+works, but the hitbox and the attribute set come with the type, so some fit better than
+others:
+
+| `appearanceEntity` | Fit | Notes |
+| --- | --- | --- |
+| `minecraft:villager` (default) | good | Human-sized, walks through 1x2 gaps. Stock look |
+| `minecraft:wandering_trader` | good | Same body, blue robe, easy to pick out |
+| `minecraft:illusioner` / `minecraft:evoker` / `minecraft:pillager` | good | Human-sized. Renders with the arms crossed or the crossbow of the type |
+| `minecraft:zombie_villager` / `minecraft:witch` | fine | Human-sized; a witch renders the hat |
+| `minecraft:snow_golem` | fine | Slightly taller; leaves no snow trail (behaviour is Lumen's, not the type's) |
+| `minecraft:allay` / `minecraft:vex` | poor | Tiny hitbox: renders floating at knee height and clips through fences |
+| `minecraft:iron_golem` | poor | 2.7 blocks tall - cannot follow you indoors |
+| `minecraft:slime` / `minecraft:magma_cube` | poor | The hitbox is the large size, so doorways are out |
+| `minecraft:armor_stand`, items, projectiles | refused | Not a mob: no movement or follow-range attributes. Lumen logs a warning and falls back to the villager |
+
+At spawn Lumen checks the type has the attributes a walking mob needs and falls back to
+the villager otherwise, so a typo in the config never crashes the server.
 
 **A player-shaped Lumen with a Steve skin is not possible this way** - a player model
 requires a real (fake) `ServerPlayerEntity` with a tab list entry, which is a different
@@ -152,16 +243,29 @@ Baritone cannot drive Lumen, and it is worth being clear why. Standard Baritone 
 **client** mod: it controls `Minecraft.getInstance().player` through client tick and
 input hooks, and the 1.20.1 build is a Forge jar. It will not load on a Fabric server,
 and there is no player client for it to attach to. That stays true for the Phase 3
-fake-player route, because a fake `ServerPlayerEntity` is still server side. Automatone
-is the fork that *does* drive server-side mobs - and it is the one that blows the stack
-on modded blocks.
+fake-player route, because a fake `ServerPlayerEntity` is still server side.
+
+Automatone is the Baritone fork that *does* drive server-side mobs, and earlier versions
+of this README repeated the folklore that it "blows the stack on modded blocks in
+recursive `canWalkThrough` checks". That was checked against the source and it is not
+true: `MovementHelper.canWalkThrough` is not recursive (its only outward call is
+`canWalkOn`, which never calls back). The one real `StackOverflowError` in Automatone is
+an unconditional self-call in `EntityContext.worldData()`, reached only from its `chests`
+command, on any block, vanilla or modded. The actual reasons it is not used here are
+duller and decisive: the only 1.20.1 build is a **Quilt** jar with no `fabric.mod.json`,
+so it does not load on a Fabric server at all; it is **LGPL-3.0**, so a fork could never
+be MIT; its `MixinMobEntity` cancels `MobEntity.tickNewAi()` while pathing, which would
+switch off every one of Lumen's goals; and it hands modded blocks `BlockPos.ORIGIN` and
+sometimes a `null` world when asking about passability, which is a worse modded-block
+hazard than the one it was blamed for.
 
 So Lumen fixes the actual symptom instead. Vanilla decides whether a block can be walked
 through with `AbstractBlock#canPathfindThrough`, which mods routinely leave reporting
 their block as solid even when it has no collision box at all - decorative clutter,
 cables, pipes, plants. `LumenPathNodeMaker` says: if the pathfinder calls it BLOCKED but
-it cannot actually be collided with, treat it as open. One non-recursive shape lookup,
-so it cannot recurse into a stack overflow the way Automatone did.
+it cannot actually be collided with, treat it as open. That check asks the real world at
+the real position, and a modded block that throws while answering is treated as solid
+rather than allowed to kill the tick.
 
 When Lumen still gets stuck, **`/lumen why`** runs a real path test to wherever it is
 trying to get to (or to you, when idle) and reports whether the path reaches, where it
@@ -254,6 +358,16 @@ curl http://192.168.50.51:11434/v1/models
 | `maxHealth` / `movementSpeed` / `followRange` | `20` / `0.4` / `48` | Attributes. |
 | `followStartDistance` / `followStopDistance` | `4.0` / `2.5` | Follow hysteresis. |
 | `teleportDistance` | `24` | Past this, Lumen warps to you instead of pathing. |
+| `allowInteract` / `interactRange` | `true` / `32` | Right-click skills, and how close the player who asked must stay (a mob cannot click a block on its own). |
+| `allowTeaching` / `maxSkillBlocks` | `true` / `32` | Whether players can teach skills, and blocks handled per run. |
+| `allowQuarry` / `maxQuarryBlocks` | `true` / `512` | Area digging, and the most blocks one quarry job may break. |
+| `maxQuarrySize` / `maxQuarryDescent` | `32` / `40` | Longest side of an area, and how far below Lumen it will dig a staircase. |
+| `allowCrafting` / `craftingNeedsTable` | `true` / `true` | Crafting from the pack; whether 3x3 recipes need a real crafting table nearby. |
+| `hostilesAttackLumen` / `aggroRadius` | `true` / `10` | Hostile mobs within the radius pick Lumen as a target. |
+| `hungerEnabled` / `hungerDecaySeconds` | `true` / `240` | One food point lost every so many seconds; below 6 it is slow and hungry. |
+| `showHealthInName` | `true` | `Lumen ♥16` above its head. |
+| `respawnCooldownMinutes` | `120` | After a death, `/lumen spawn` waits this long. `0` disables it. |
+| `conversationNotes` / `notesEveryMessages` | `true` / `30` | Let the model keep notes about the conversation, and how often. |
 | `logRawResponses` | `false` | Logs the raw LLM body. The fastest way to debug prompts. |
 | `adminPermissionLevel` | `2` | Level for `spawn`, `despawn`, `reload`. |
 
@@ -300,10 +414,13 @@ misbehave anyway.
 | --- | --- | --- |
 | `/lumen` or `/lumen status` | everyone | Endpoint, model, current activity |
 | `/lumen say <message>` | everyone | Talk to Lumen regardless of `chatTrigger` |
-| `/lumen come` / `stay` / `follow [player]` | everyone | Manual control, no LLM involved |
+| `/lumen come` / `stay` / `follow [player]` | everyone | Manual control, no LLM involved. `come` and `follow` pause an errand; `stay` cancels everything |
+| `/lumen remember <name>` | everyone | Save where you are standing as a named place |
+| `/lumen go <place>` | everyone | Walk to a named place |
+| `/lumen queue` / `cancel` / `continue` | everyone | What is lined up; drop it all; resume a paused errand |
 | `/lumen here` | everyone | Warp Lumen to you - the escape hatch when pathing loses |
-| `/lumen find <item>` | everyone | Fetch an item from a nearby container |
-| `/lumen mine <block>` | everyone | Go break blocks of that kind and bring them back |
+| `/lumen find <item> [from <place>]` | everyone | Fetch an item from a nearby container, or one near a named place |
+| `/lumen mine <block> [near <place>]` | everyone | Go break blocks of that kind and bring them back |
 | `/lumen inventory` | everyone | What Lumen is carrying and wearing |
 | `/lumen memory` | everyone | Places Lumen remembers finding things |
 | `/lumen drop` | everyone | Hand back everything it is carrying, straight into your inventory |
@@ -311,7 +428,15 @@ misbehave anyway.
 | `/lumen debug` | everyone | What the model last said, and what became of it |
 | `/lumen containers` | everyone | Nearby containers, and which are searchable |
 | `/lumen why` | everyone | A path test to its target, and what is blocking it |
-| `/lumen spawn` / `despawn` / `reload` / `forget` | level 2 | |
+| `/lumen look` | everyone | What Lumen sees in the block you are looking at: id, state, whether it reads as ripe |
+| `/lumen teach <name>: <how>` | everyone | Teach a skill from a sentence, grounded on the block you are looking at |
+| `/lumen skills` / `skill <name>` / `do <skill>` | everyone | List skills; show one; run one from where Lumen stands |
+| `/lumen wand` | everyone | Get a selection wand: left-click one corner, right-click the other |
+| `/lumen quarry [area]` | everyone | Dig out the wand selection, or a described area: `/lumen quarry 10x10x2 level 40` |
+| `/lumen craft [n] <item>` | everyone | Craft from the pack, recursively |
+| `/lumen notes` | everyone | The notes the model has kept about your conversations |
+| `/lumen forget <place>` / `skill <name>` / `note <n>` / `notes` | everyone | Forget one place, one skill, one note, or every note |
+| `/lumen spawn` / `despawn` / `reload` / `forget` | level 2 | Bare `forget` clears every memory. `spawn force` overrides the respawn cooldown |
 
 Right-clicking Lumen with something in hand gives it that item. Right-clicking empty
 handed - or while sneaking - opens its pack as a chest screen you can move things in
@@ -320,29 +445,29 @@ and out of. The bottom row is what it is holding and wearing.
 ## Roadmap
 
 **Next**
-- A selection wand for area mining and quarrying
-- A task queue with priorities, so a second request waits instead of cancelling
-- Named places (`remember this as home`) and going back to them
-- Learned memory beyond container locations, carried across restarts
+- Skills with more than one step: walk here, take from this container, put into that
+  one, wait. Today a skill is one target and one action (right-click or break) plus
+  collecting, which covers harvesting and most machine-tending; sequences are the
+  next layer on the same store
+- A right-click that does not need the player nearby. This needs a fake player, which
+  Fabric API 1.20.1 does not ship; a minimal server-side one is the candidate
 - Storage that exposes items through neither `Inventory` nor the Fabric transfer API
   (`/lumen containers` shows which)
-- Crafting from what is in the pack
+- Smelting and other machine recipes when crafting
 
 **Phase 3 - polish**
 - Player model + custom skin from `config/lumen/skins/`. This needs the fake
   `ServerPlayerEntity` route, which trades away vanilla goal AI and navigation for a
   player-shaped body. The brain, config, memory, chest and chat layers are all
   independent of the entity class, so that swap stays possible.
-- Food and hunger
-- Conversation highlights carried across restarts, alongside the location memory
 
 ## Notes from the field
 
 Hard-won details that shaped this build:
 
 1. NoChatReports drops unsigned player chat - companion lines must be system messages.
-2. Automatone / forked Baritone `StackOverflowError`s on modded blocks in recursive
-   `canWalkThrough` checks. Vanilla pathfinding handles them natively.
+2. Automatone does not fit: Quilt-only at 1.20.1, LGPL-3.0, and it disables the goal
+   selector while pathing. Its `canWalkThrough` is not recursive; that was folklore.
 3. `useGrammar` on Ollama is not reliable; enforce the JSON shape in the prompt.
 4. Null fields in the model's JSON will crash naive history handling - null-check first.
 5. `OLLAMA_HOST=0.0.0.0` is required for LAN access.

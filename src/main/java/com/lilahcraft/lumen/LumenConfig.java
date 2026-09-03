@@ -163,6 +163,68 @@ public final class LumenConfig {
     /** Blocks broken per errand before Lumen brings the haul back. */
     public int maxMineBlocks = 8;
 
+    // ------------------------------------------------------------------ skills
+
+    /** Let taught skills right-click blocks, done in the name of whoever asked. */
+    public boolean allowInteract = true;
+
+    /** The player must be within this many blocks for Lumen to use a block on their behalf. */
+    public double interactRange = 32.0D;
+
+    /** Blocks a single run of a skill may work through. */
+    public int maxSkillBlocks = 32;
+
+    /** Let players teach skills in chat and with /lumen teach. */
+    public boolean allowTeaching = true;
+
+    // ------------------------------------------------------------------ quarry
+
+    /** Let Lumen dig out regions ("mine out a 20x20x2", the wand selection). */
+    public boolean allowQuarry = true;
+
+    /** Blocks per quarry job, whatever was asked for. */
+    public int maxQuarryBlocks = 512;
+
+    /** Longest side of a region, in blocks. */
+    public int maxQuarrySize = 32;
+
+    /** How far below its feet Lumen will dig a staircase to reach a region. */
+    public int maxQuarryDescent = 40;
+
+    // ---------------------------------------------------------------- crafting
+
+    public boolean allowCrafting = true;
+
+    /** Recipes bigger than 2x2 need a crafting table within reach, like a player. */
+    public boolean craftingNeedsTable = true;
+
+    // ---------------------------------------------------------------- survival
+
+    /** Hostile mobs nearby with nothing else to fight go for Lumen. */
+    public boolean hostilesAttackLumen = true;
+
+    public double aggroRadius = 10.0D;
+
+    /** Lumen gets hungry over real time, slows down when starving, and eats from its pack. */
+    public boolean hungerEnabled = true;
+
+    /** Seconds of real time per point of food lost; 20 points, so 240 is 80 minutes to empty. */
+    public int hungerDecaySeconds = 240;
+
+    /** Show hearts in the name tag - a vanilla client draws no health bar for a mob. */
+    public boolean showHealthInName = true;
+
+    /** Real minutes before /lumen spawn works again after a death. 0 disables the cooldown. */
+    public int respawnCooldownMinutes = 120;
+
+    // ------------------------------------------------------------------- notes
+
+    /** Summarise the conversation into notes that survive a restart. */
+    public boolean conversationNotes = true;
+
+    /** How many player messages between summaries. */
+    public int notesEveryMessages = 30;
+
     // ------------------------------------------------------------------ combat
 
     /**
@@ -304,6 +366,15 @@ public final class LumenConfig {
         attackDamage = clamp(attackDamage, 0.0D, 100.0D);
         defendRadius = clamp(defendRadius, 0.0D, 64.0D);
         adminPermissionLevel = (int) clamp(adminPermissionLevel, 0, 4);
+        interactRange = clamp(interactRange, 4.0D, 128.0D);
+        maxSkillBlocks = (int) clamp(maxSkillBlocks, 1, 256);
+        maxQuarryBlocks = (int) clamp(maxQuarryBlocks, 1, 4096);
+        maxQuarrySize = (int) clamp(maxQuarrySize, 1, 64);
+        maxQuarryDescent = (int) clamp(maxQuarryDescent, 0, 128);
+        aggroRadius = clamp(aggroRadius, 0.0D, 32.0D);
+        hungerDecaySeconds = (int) clamp(hungerDecaySeconds, 10, 86400);
+        respawnCooldownMinutes = (int) clamp(respawnCooldownMinutes, 0, 10080);
+        notesEveryMessages = (int) clamp(notesEveryMessages, 5, 500);
         maxPlayerMessageLength = (int) clamp(maxPlayerMessageLength, 16, 4096);
     }
 

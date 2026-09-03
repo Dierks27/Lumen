@@ -59,6 +59,27 @@ ollama run qwen2.5:14b "hello"
   the mod at fault.
 - Inside a claim, blocks are broken in the name of whoever asked, so Open Parties and
   Claims applies that player's permissions.
+- Named places: stand somewhere and say "remember this as the hops room", then "go to
+  the hops room" or "find hops from the hops room". `/lumen memory` lists them.
+- A second request waits its turn instead of cancelling the first: "grab iron, then
+  mine copper, then come back" runs in order. "Come here" pauses an errand and "carry
+  on" resumes it; `/lumen queue` shows what is lined up.
+- Teach it a job: look at the crop and say "learn harvest hops: right click the ripe
+  hops vines and collect what drops". Then "harvest the hops" or `/lumen do hops`.
+  Right-click skills act as the player who asked, who has to stay within
+  `interactRange`. `/lumen skills`, `/lumen look`, `config/lumen/skills.json`.
+- Area mining: "go down to level 2 and mine out a 20x20x2 and bring back the loot", or
+  `/lumen wand`, mark two corners, then "mine out the selection". Bounded by
+  `maxQuarryBlocks`; never breaks containers.
+- Crafting from the pack, recursively: "craft 8 sticks", "I need a pickaxe",
+  `/lumen craft 4 torches`. It names what is missing when it cannot.
+- Survival: hostiles target Lumen, it gets hungry and eats from its pack, the name tag
+  shows hearts, and after a death `/lumen spawn` waits `respawnCooldownMinutes` (120).
+  `/lumen status` shows the time left; `/lumen spawn force` overrides it.
+- Conversation notes: every 30 lines the model writes down what mattered and reads it
+  back after a restart. `/lumen notes` shows them.
+- `appearanceEntity` now falls back to the villager for types that cannot walk (armor
+  stands, items). The README has a table of which vanilla types fit.
 - Set `logRawResponses: true` if the model drifts from the expected JSON format —
   that log is where you will see it.
 
