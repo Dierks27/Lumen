@@ -20,7 +20,8 @@ public final class Phrasing {
 
     /** Verbs that start a new instruction, so "and" before one of them is a separator. */
     private static final String VERBS = "go|goto|come|mine|dig|chop|break|harvest|find|fetch|get|bring|grab|"
-            + "collect|search|follow|stay|stop|wait|give|hand|drop|return|head|walk|remember|continue";
+            + "collect|search|follow|stay|stop|wait|give|hand|drop|return|head|walk|remember|continue|"
+            + "put|store|stash|deposit|stand|craft|make|quarry|take|descend";
 
     private static final Pattern THEN = Pattern.compile(
             "\\s*(?:[,;]\\s*)?(?:and\\s+)?then\\s+|\\s*;\\s*|\\s*,?\\s+and\\s+(?:also\\s+)?(?=(?:" + VERBS + ")\\b)",

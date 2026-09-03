@@ -67,12 +67,51 @@ public sealed interface LumenTask {
         }
     }
 
-    /** Run a taught skill: find its targets around {@code anchor} (or Lumen) and work them. */
-    record Harvest(UUID requester, String skillName, @Nullable BlockPos anchor, @Nullable String anchorName)
-            implements LumenTask {
+    /**
+     * Run a taught skill, step by step, around {@code anchor} (or Lumen). {@code count}
+     * caps the first block step or take step: "harvest 10 hops". 0 means all.
+     */
+    record Harvest(UUID requester, String skillName, @Nullable BlockPos anchor, @Nullable String anchorName,
+                   int count) implements LumenTask {
+        public Harvest(UUID requester, String skillName, @Nullable BlockPos anchor, @Nullable String anchorName) {
+            this(requester, skillName, anchor, anchorName, 0);
+        }
+
         @Override
         public String describe() {
-            return skillName + (anchorName == null ? "" : " at the " + anchorName);
+            return (count > 0 ? skillName + " (" + count + ")" : skillName)
+                    + (anchorName == null ? "" : " at the " + anchorName);
+        }
+    }
+
+    /**
+     * Put items from the pack into a container: the one at {@code container} when given,
+     * else one found by {@code containerRef} ("nearest", "with iron", or a place name).
+     * Empty query means everything Lumen carries; count 0 means all of it.
+     */
+    record Deposit(UUID requester, String query, int count, @Nullable BlockPos container,
+                   @Nullable String containerRef) implements LumenTask {
+        @Override
+        public String describe() {
+            return "put " + (query.isEmpty() ? "everything" : (count > 0 ? count + " " : "") + query)
+                    + " into " + (container != null ? "the container at " + container.toShortString()
+                            : containerRef == null || containerRef.isEmpty() ? "a container" : "the " + containerRef);
+        }
+    }
+
+    /** Dig a staircase down (or walk up) to stand with feet at {@code targetY}. */
+    record Descend(UUID requester, int targetY) implements LumenTask {
+        @Override
+        public String describe() {
+            return "go down to y " + targetY;
+        }
+    }
+
+    /** Stand still for a while - a step in a taught skill. */
+    record Wait(@Nullable UUID requester, int ticks) implements LumenTask {
+        @Override
+        public String describe() {
+            return "wait " + Math.max(1, ticks / 20) + "s";
         }
     }
 

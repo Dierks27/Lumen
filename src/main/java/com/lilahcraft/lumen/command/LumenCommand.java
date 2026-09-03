@@ -8,7 +8,9 @@ import com.lilahcraft.lumen.entity.ChestFinder;
 import com.lilahcraft.lumen.entity.LumenWand;
 import com.lilahcraft.lumen.entity.QuarryPlanner;
 import com.lilahcraft.lumen.skill.LumenSkill;
+import com.lilahcraft.lumen.skill.SkillStep;
 import com.lilahcraft.lumen.skill.SkillTeacher;
+import com.lilahcraft.lumen.entity.ContainerAccess;
 import com.lilahcraft.lumen.entity.LumenEntity;
 import com.lilahcraft.lumen.entity.LumenTask;
 import com.lilahcraft.lumen.brain.Phrasing;
@@ -124,6 +126,12 @@ public final class LumenCommand {
                         .executes(context -> quarry(context, "selection"))
                         .then(CommandManager.argument("area", StringArgumentType.greedyString())
                                 .executes(context -> quarry(context, StringArgumentType.getString(context, "area")))))
+                .then(CommandManager.literal("put")
+                        .then(CommandManager.argument("what", StringArgumentType.greedyString())
+                                .executes(LumenCommand::put)))
+                .then(CommandManager.literal("down")
+                        .then(CommandManager.argument("y", com.mojang.brigadier.arguments.IntegerArgumentType.integer(-64, 320))
+                                .executes(LumenCommand::down)))
                 .then(CommandManager.literal("craft")
                         .then(CommandManager.argument("item", StringArgumentType.greedyString())
                                 .executes(LumenCommand::craft)))
@@ -339,10 +347,23 @@ public final class LumenCommand {
         if (lumen == null) {
             return 0;
         }
-        String query = StringArgumentType.getString(context, "place");
+        String query = StringArgumentType.getString(context, "place").trim();
+        // "/lumen go here" stands exactly where you are; "/lumen go 100 64 -20" is a spot.
+        String lower = query.toLowerCase(java.util.Locale.ROOT);
+        if (lower.matches("here|this spot|to me|stand here|right here")) {
+            LumenEntity.Submission here = lumen.submit(new LumenTask.GoTo(player.getUuid(), player.getBlockPos(), null));
+            return reportSubmission(source, here, lumen, "comes to stand at " + player.getBlockPos().toShortString());
+        }
+        java.util.regex.Matcher coords = java.util.regex.Pattern.compile("^(-?\\d+)[ ,]+(-?\\d+)[ ,]+(-?\\d+)$").matcher(lower);
+        if (coords.matches()) {
+            BlockPos pos = new BlockPos(Integer.parseInt(coords.group(1)), Integer.parseInt(coords.group(2)),
+                    Integer.parseInt(coords.group(3)));
+            LumenEntity.Submission spot = lumen.submit(new LumenTask.GoTo(player.getUuid(), pos, null));
+            return reportSubmission(source, spot, lumen, "goes to " + pos.toShortString());
+        }
         LumenMemory.KnownPlace place = Lumen.memory().findPlace(query, player.getWorld().getRegistryKey().getValue());
         if (place == null) {
-            source.sendError(Text.literal("No place called \"" + query + "\". Stand there and /lumen remember <name>."));
+            source.sendError(Text.literal("No place called \"" + query + "\". Stand there and /lumen remember <name>, or give x y z."));
             return 0;
         }
         LumenEntity.Submission result = lumen.submit(new LumenTask.GoTo(player.getUuid(), place.pos(), place.name));
@@ -585,11 +606,15 @@ public final class LumenCommand {
         boolean signal = BlockStates.hasGrowthSignal(state);
         boolean ripe = signal && BlockStates.isRipe(player.getWorld(), pos, state);
         source.sendFeedback(() -> Text.literal(described + " at " + pos.toShortString()).formatted(Formatting.AQUA), false);
+        boolean container = ContainerAccess.isSearchable(player.getServerWorld(), pos, player.getWorld().getBlockEntity(pos));
         source.sendFeedback(() -> Text.literal("  \"" + BlockStates.displayName(state) + "\"; "
-                + (state.hasBlockEntity() ? "has a block entity (Lumen will not use or break it); " : "")
+                + (container ? "a container Lumen can take from and put into; "
+                        : state.hasBlockEntity() ? "has a block entity (Lumen will not use or break it); " : "")
                 + (signal ? (ripe ? "reads as RIPE" : "reads as still growing") : "no growth signal - \"ripe\" will never match it"))
                 .formatted(Formatting.GRAY), false);
-        source.sendFeedback(() -> Text.literal("  teach with: /lumen teach harvest <name>: right click these when ripe")
+        source.sendFeedback(() -> Text.literal(container
+                ? "  teach with: /lumen teach restock: take 16 wheat from this chest, then put it in the barrel"
+                : "  teach with: /lumen teach harvest <name>: right click these when ripe, then collect the drops")
                 .formatted(Formatting.DARK_GRAY), false);
         return 1;
     }
@@ -603,19 +628,11 @@ public final class LumenCommand {
             return 0;
         }
         String lesson = StringArgumentType.getString(context, "lesson");
-        String lookedAt = null;
-        boolean ripe = false;
-        HitResult hit = player.raycast(8.0D, 1.0F, false);
-        if (hit instanceof BlockHitResult blockHit && hit.getType() == HitResult.Type.BLOCK) {
-            BlockState state = player.getWorld().getBlockState(blockHit.getBlockPos());
-            if (!state.isAir()) {
-                lookedAt = BlockStates.id(state);
-                ripe = BlockStates.isRipe(player.getWorld(), blockHit.getBlockPos(), state);
-            }
-        }
-        LumenSkill skill = SkillTeacher.parse(lesson, lookedAt, ripe);
+        SkillTeacher.LookedAt looked = lookedAt(player);
+        LumenSkill skill = SkillTeacher.parse(lesson, looked);
         if (skill == null) {
-            source.sendError(Text.literal("Say what to do and to what: /lumen teach harvest hops: right click the ripe hops vines"));
+            source.sendError(Text.literal("Say what to do and to what: /lumen teach harvest hops: right click the ripe hops vines"
+                    + " - or /lumen teach restock: take 16 wheat from the storage chest, then put it in this barrel"));
             return 0;
         }
         skill.taughtBy = player.getName().getString();
@@ -627,6 +644,55 @@ public final class LumenCommand {
         source.sendFeedback(() -> Text.literal("Learned \"" + skill.name + "\": " + skill.describe()
                 + (skill.example.isEmpty() ? "" : " (example block: " + skill.example + ")")).formatted(Formatting.AQUA), true);
         return 1;
+    }
+
+    /** What the player is looking at, for grounding "these" and "this chest" in a lesson. */
+    public static SkillTeacher.LookedAt lookedAt(ServerPlayerEntity player) {
+        HitResult hit = player.raycast(8.0D, 1.0F, false);
+        if (!(hit instanceof BlockHitResult blockHit) || hit.getType() != HitResult.Type.BLOCK) {
+            return SkillTeacher.LookedAt.NOTHING;
+        }
+        BlockPos pos = blockHit.getBlockPos();
+        BlockState state = player.getWorld().getBlockState(pos);
+        if (state.isAir()) {
+            return SkillTeacher.LookedAt.NOTHING;
+        }
+        boolean container = ContainerAccess.isSearchable(player.getServerWorld(), pos, player.getWorld().getBlockEntity(pos));
+        return new SkillTeacher.LookedAt(BlockStates.id(state), BlockStates.isRipe(player.getWorld(), pos, state),
+                new int[] {pos.getX(), pos.getY(), pos.getZ()}, container);
+    }
+
+    /** "/lumen put 16 wheat in this chest", "/lumen put everything in the nearest chest". */
+    private static int put(CommandContext<ServerCommandSource> context) throws CommandSyntaxException {
+        ServerCommandSource source = context.getSource();
+        ServerPlayerEntity player = source.getPlayerOrThrow();
+        LumenEntity lumen = requireLumen(source);
+        if (lumen == null) {
+            return 0;
+        }
+        String what = StringArgumentType.getString(context, "what").trim();
+        SkillStep step = SkillTeacher.parseClause("put " + what, lookedAt(player));
+        if (step == null || !SkillStep.PUT.equals(step.kind)) {
+            source.sendError(Text.literal("Say what and where: /lumen put 16 wheat in this chest (look at the chest), "
+                    + "or /lumen put everything in the nearest chest"));
+            return 0;
+        }
+        LumenEntity.Submission result = lumen.submit(new LumenTask.Deposit(player.getUuid(), step.item, step.count,
+                step.hasPos() ? new BlockPos(step.pos[0], step.pos[1], step.pos[2]) : null, step.target));
+        return reportSubmission(source, result, lumen, "goes to " + step.describe());
+    }
+
+    /** "/lumen down 12": a staircase down to that level, one block down per block forward. */
+    private static int down(CommandContext<ServerCommandSource> context) throws CommandSyntaxException {
+        ServerCommandSource source = context.getSource();
+        ServerPlayerEntity player = source.getPlayerOrThrow();
+        LumenEntity lumen = requireLumen(source);
+        if (lumen == null) {
+            return 0;
+        }
+        int y = com.mojang.brigadier.arguments.IntegerArgumentType.getInteger(context, "y");
+        LumenEntity.Submission result = lumen.submit(new LumenTask.Descend(player.getUuid(), y));
+        return reportSubmission(source, result, lumen, "digs stairs down to y " + y);
     }
 
     private static int skills(CommandContext<ServerCommandSource> context) {
@@ -655,9 +721,12 @@ public final class LumenCommand {
             source.sendError(Text.literal("No skill called \"" + name + "\"."));
             return 0;
         }
-        source.sendFeedback(() -> Text.literal(skill.name).formatted(Formatting.AQUA), false);
-        source.sendFeedback(() -> Text.literal("  action: " + (skill.isInteract() ? "right-click" : "break")
-                + "; target: " + skill.target + "; radius " + skill.radius + "; collect: " + skill.collect).formatted(Formatting.GRAY), false);
+        source.sendFeedback(() -> Text.literal(skill.name + " (within " + skill.radius + " blocks)").formatted(Formatting.AQUA), false);
+        int n = 1;
+        for (SkillStep step : skill.steps()) {
+            int number = n++;
+            source.sendFeedback(() -> Text.literal("  " + number + ". " + step.describe()).formatted(Formatting.GRAY), false);
+        }
         source.sendFeedback(() -> Text.literal("  taught by " + skill.taughtBy + (skill.example.isEmpty() ? "" : " looking at " + skill.example)
                 + "; aliases: " + (skill.aliases.isEmpty() ? "none" : String.join(", ", skill.aliases))).formatted(Formatting.DARK_GRAY), false);
         return 1;
@@ -674,14 +743,17 @@ public final class LumenCommand {
         Phrasing.PlaceRef ref = Phrasing.splitPlaceReference(query);
         LumenMemory.KnownPlace place = ref.place() == null ? null
                 : Lumen.memory().findPlace(ref.place(), player.getWorld().getRegistryKey().getValue());
-        LumenSkill skill = Lumen.skills().find(place == null ? query : ref.rest());
+        // "/lumen do 10 hops": the number caps what the skill works through.
+        ChestFinder.Request request = ChestFinder.parseRequest(place == null ? query : ref.rest(), 0);
+        int count = request.isEverything() ? 0 : Math.max(0, request.count());
+        LumenSkill skill = Lumen.skills().find(request.query());
         if (skill == null) {
             source.sendError(Text.literal("No skill called \"" + query + "\". /lumen skills lists them."));
             return 0;
         }
         LumenEntity.Submission result = lumen.submit(new LumenTask.Harvest(player.getUuid(), skill.name,
-                place == null ? null : place.pos(), place == null ? null : place.name));
-        return reportSubmission(source, result, lumen, "starts on " + skill.name
+                place == null ? null : place.pos(), place == null ? null : place.name, count));
+        return reportSubmission(source, result, lumen, "starts on " + skill.name + (count > 0 ? " (" + count + ")" : "")
                 + (place == null ? "" : " at the " + place.name));
     }
 

@@ -64,13 +64,26 @@ ollama run qwen2.5:14b "hello"
 - A second request waits its turn instead of cancelling the first: "grab iron, then
   mine copper, then come back" runs in order. "Come here" pauses an errand and "carry
   on" resumes it; `/lumen queue` shows what is lined up.
-- Teach it a job: look at the crop and say "learn harvest hops: right click the ripe
-  hops vines and collect what drops". Then "harvest the hops" or `/lumen do hops`.
-  Right-click skills act as the player who asked, who has to stay within
-  `interactRange`. `/lumen skills`, `/lumen look`, `config/lumen/skills.json`.
+- Teach it a job in one sentence, any steps you like: "learn restock: take 16 wheat
+  from the storage chest, then put it in this barrel", "learn harvest hops: right
+  click the ripe hops vines, then collect the drops", "learn start the mill: flip the
+  lever". Look at the crop or chest while you say it. Then "restock" or
+  `/lumen do restock`; "harvest 10 hops" caps a run. Right-click steps act as the
+  player who asked, who has to stay within `interactRange`. `/lumen skills`,
+  `/lumen skill <name>`, `/lumen look`, `config/lumen/skills.json`.
+- "Put the cobblestone in this chest", `/lumen put everything in the nearest chest`.
+- Pathfinding searches `pathSearchEffort` (8) times harder than a vanilla mob, so the
+  stairs to the floor below are found. Lava, fire, magma and cactus are never walked
+  on; water costs what it should again; a swim that goes nowhere ends on dry land.
+- "Go down to level 12" / `/lumen down 12` digs a staircase, never a shaft, and Lumen
+  no longer mines the floor from under its own feet.
+- Crafting tries every recipe, the ones using what is in the pack first: a modded log
+  becomes planks and then sticks.
+- Ripeness: an age at its maximum counts even when a modded crop claims it can still
+  grow. Job summaries say why blocks were skipped.
 - Area mining: "go down to level 2 and mine out a 20x20x2 and bring back the loot", or
-  `/lumen wand`, mark two corners, then "mine out the selection". Bounded by
-  `maxQuarryBlocks`; never breaks containers.
+  `/lumen wand`, mark two corners, then "mine out the selection". Clears every block
+  in the area. Bounded by `maxQuarryBlocks`; never breaks containers.
 - Crafting from the pack, recursively: "craft 8 sticks", "I need a pickaxe",
   `/lumen craft 4 torches`. It names what is missing when it cannot.
 - Survival: hostiles target Lumen, it gets hungry and eats from its pack, the name tag
