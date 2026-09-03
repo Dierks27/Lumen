@@ -88,7 +88,10 @@ public class LumenMineGoal extends Goal {
             this.repathCountdown = this.getTickCount(15);
             boolean moving = lumen.moveToBlock(target, Lumen.config().followSpeedMultiplier);
             if (!moving && lumen.getNavigation().isIdle() && giveUpTicks > 60) {
-                lumen.finishMining();
+                // On a list job this drops the one block and tries the next; a plain
+                // mine ends here as before.
+                this.giveUpTicks = 0;
+                lumen.skipCurrentWork();
             }
             return;
         }

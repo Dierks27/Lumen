@@ -149,6 +149,21 @@ public final class LumenConfig {
     /** Hard ceiling on one errand, whatever was asked for. */
     public int maxFetchItems = 640;
 
+    // ------------------------------------------------------------- pathfinding
+
+    /**
+     * How many times harder than a vanilla mob Lumen searches for a path. Vanilla's
+     * budget runs out pressed against the floor when the target is downstairs; 8 finds
+     * the stairs across a large house. Costs CPU only while Lumen is planning a route.
+     */
+    public int pathSearchEffort = 8;
+
+    /**
+     * Path cost of a block of water. Vanilla uses 8; 0 made Lumen wade through ponds
+     * and get stuck in them. Lava, fire, magma and cactus are never walked on at all.
+     */
+    public double waterPenalty = 8.0D;
+
     // ------------------------------------------------------------------ mining
 
     /** Let Lumen break blocks on request. Turning this off disables the mine command. */
@@ -173,6 +188,9 @@ public final class LumenConfig {
 
     /** Blocks a single run of a skill may work through. */
     public int maxSkillBlocks = 32;
+
+    /** Steps a taught skill may have. */
+    public int maxSkillSteps = 12;
 
     /** Let players teach skills in chat and with /lumen teach. */
     public boolean allowTeaching = true;
@@ -368,6 +386,9 @@ public final class LumenConfig {
         adminPermissionLevel = (int) clamp(adminPermissionLevel, 0, 4);
         interactRange = clamp(interactRange, 4.0D, 128.0D);
         maxSkillBlocks = (int) clamp(maxSkillBlocks, 1, 256);
+        maxSkillSteps = (int) clamp(maxSkillSteps, 1, 32);
+        pathSearchEffort = (int) clamp(pathSearchEffort, 1, 64);
+        waterPenalty = clamp(waterPenalty, 0.0D, 64.0D);
         maxQuarryBlocks = (int) clamp(maxQuarryBlocks, 1, 4096);
         maxQuarrySize = (int) clamp(maxQuarrySize, 1, 64);
         maxQuarryDescent = (int) clamp(maxQuarryDescent, 0, 128);

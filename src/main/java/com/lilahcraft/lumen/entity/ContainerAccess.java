@@ -44,7 +44,7 @@ public abstract class ContainerAccess {
             // A misbehaving modded block must not end the errand; fall through to the
             // plain inventory, if it has one.
         }
-        if (storage != null && storage.supportsExtraction()) {
+        if (storage != null && (storage.supportsExtraction() || storage.supportsInsertion())) {
             return new TransferApiAccess(storage);
         }
         BlockEntity blockEntity = world.getBlockEntity(pos);
@@ -77,6 +77,13 @@ public abstract class ContainerAccess {
      * @return what was taken, or an empty stack
      */
     public abstract ItemStack take(ItemStack sample, int max);
+
+    /**
+     * Puts as much of {@code stack} in as will fit.
+     *
+     * @return what did not fit, or an empty stack
+     */
+    public abstract ItemStack put(ItemStack stack);
 
     /** Called once after a round of taking, so the block saves and updates comparators. */
     public void finish() {
@@ -130,6 +137,37 @@ public abstract class ContainerAccess {
         }
 
         @Override
+        public ItemStack put(ItemStack stack) {
+            ItemStack rest = stack.copy();
+            // Top up matching stacks first, then empty slots, the way a shift-click does.
+            for (int pass = 0; pass < 2 && !rest.isEmpty(); pass++) {
+                for (int slot = 0; slot < inventory.size() && !rest.isEmpty(); slot++) {
+                    ItemStack present = inventory.getStack(slot);
+                    if (pass == 0) {
+                        if (present.isEmpty() || !ItemStack.canCombine(present, rest)) {
+                            continue;
+                        }
+                        int room = Math.min(present.getMaxCount(), inventory.getMaxCountPerStack()) - present.getCount();
+                        if (room <= 0) {
+                            continue;
+                        }
+                        int moved = Math.min(room, rest.getCount());
+                        present.increment(moved);
+                        rest.decrement(moved);
+                    } else {
+                        if (!present.isEmpty() || !inventory.isValid(slot, rest)) {
+                            continue;
+                        }
+                        int moved = Math.min(rest.getCount(), Math.min(rest.getMaxCount(), inventory.getMaxCountPerStack()));
+                        inventory.setStack(slot, rest.copyWithCount(moved));
+                        rest.decrement(moved);
+                    }
+                }
+            }
+            return rest;
+        }
+
+        @Override
         public void finish() {
             inventory.markDirty();
         }
@@ -165,7 +203,29 @@ public abstract class ContainerAccess {
         }
 
         @Override
+        public ItemStack put(ItemStack stack) {
+            if (stack.isEmpty() || !storage.supportsInsertion()) {
+                return stack;
+            }
+            ItemVariant variant = ItemVariant.of(stack);
+            try (Transaction transaction = Transaction.openOuter()) {
+                long inserted = storage.insert(variant, stack.getCount(), transaction);
+                if (inserted <= 0) {
+                    transaction.abort();
+                    return stack;
+                }
+                transaction.commit();
+                return stack.copyWithCount((int) (stack.getCount() - inserted));
+            } catch (RuntimeException e) {
+                return stack;
+            }
+        }
+
+        @Override
         public ItemStack take(ItemStack sample, int max) {
+            if (!storage.supportsExtraction()) {
+                return ItemStack.EMPTY;
+            }
             ItemVariant variant = ItemVariant.of(sample);
             try (Transaction transaction = Transaction.openOuter()) {
                 long extracted = storage.extract(variant, Math.min(max, sample.getMaxCount()), transaction);

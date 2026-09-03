@@ -143,16 +143,19 @@ public final class BlockMatcher {
      * <ol>
      *   <li>If the block can say whether it still grows (vanilla {@code Fertilizable},
      *       which most farming mods implement for bone meal), "cannot grow further" means ripe.</li>
-     *   <li>Otherwise an integer property named like age or stage at its maximum.</li>
+     *   <li>An integer property named like age or stage at its maximum also means ripe,
+     *       even when the block claims it could still grow - modded crops lie about that.</li>
      *   <li>A block with no growth signal at all is never "ripe".</li>
      * </ol>
      *
      * @param stillGrowing true/false from the block's own growth check, or null when it has none
      */
     public static boolean isRipe(Map<String, String> props, Map<String, Integer> intMax, @Nullable Boolean stillGrowing) {
-        if (stillGrowing != null) {
-            return !stillGrowing;
+        if (stillGrowing != null && !stillGrowing) {
+            return true;
         }
+        // The block says it can still grow, or has no opinion. Some modded crops answer
+        // "yes, bone meal me" at every age, so an age at its maximum still counts as ripe.
         for (String key : GROWTH_PROPERTIES) {
             if (props.containsKey(key) && intMax.containsKey(key)) {
                 return parseInt(props.get(key), -1) >= intMax.get(key);

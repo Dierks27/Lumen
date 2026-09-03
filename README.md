@@ -93,33 +93,55 @@ specific code.
   pack when hurt
 
 **Teaching it jobs**
-- Look at a block and explain the job once: *"lumen, learn harvest hops: right click
-  the ripe hops vines and collect what drops"* (or `/lumen teach harvest hops: ...`).
-  From then on *"harvest the hops"* or `/lumen do hops` walks it round every matching
-  block in range, right-clicks (or breaks) each one, picks up the drops and brings
-  them back. Skills live in `config/lumen/skills.json` and survive restarts
-- "These" and "this" are grounded on the block you are looking at when you teach, so
-  *"learn pick berries: right click these when they're ripe"* while looking at a bush
-  stores the real block id, not the word "these". `/lumen look` shows what Lumen sees
-  in the block you are looking at, including whether it reads as ripe
+- A skill is a name and a list of steps, taught in one sentence: *"lumen, learn
+  restock: take 16 wheat from the storage chest, then put it in this barrel"* (or
+  `/lumen teach ...`). Steps are split on "then": **walk to** a place, **right-click**
+  any block (a lever, a crank, a crop), **break** any block, **take** items from a
+  container, **put** items into a container, **hold** a tool from the pack, **wait** N
+  seconds, **say** something, **collect the drops**, **come back**. From then on
+  *"restock"* or `/lumen do restock` runs the steps in order. Skills live in
+  `config/lumen/skills.json`, survive restarts, and a v0.8.0 file loads as-is
+- Ripeness is optional, not required: *"right click the lever"* is a skill. *"Right
+  click these when they're ripe"* adds the ripeness filter
+- "These", "this chest" and "here" are grounded on the block you are looking at when
+  you teach: a crop stores its real block id, a chest stores its exact position, so
+  the skill goes back to that chest every time. "The nearest chest" and "a chest with
+  tools" also work. `/lumen look` shows what Lumen reads off the block in front of you
+- A number caps a run: *"harvest 10 hops"*, `/lumen do 10 hops`, *"take 16 wheat"*
 - Ripeness is mod-agnostic: a block that implements vanilla's bone-meal check
-  (`Fertilizable`) is ripe when it can grow no further; otherwise an `age`, `stage`,
-  `growth` or `maturity` property at its maximum counts. You can also pin a state
-  yourself: *"sweet berry bush age=3"*
+  (`Fertilizable`) is ripe when it can grow no further, and an `age`, `stage`,
+  `growth` or `maturity` property at its maximum counts as ripe even when the block
+  claims it could still grow, because some modded crops say yes to bone meal at every
+  age. You can also pin a state yourself: *"sweet berry bush age=3"*
+- Right-clicks that hand the harvest to the clicking player (some mods do that instead
+  of dropping it) are noticed: whatever appears in your inventory during the click is
+  taken back and brought to you with the rest
+- Job summaries say why blocks were skipped - *"3 i couldn't reach, 2 not ripe or
+  already done"* - and a harvested plant is never clicked twice
 - The catch, verified against the 1.20.1 sources: a mob cannot right-click a block by
   itself - `AbstractBlock#onUse` needs a real player and Fabric API 1.20.1 has no
   `FakePlayer`. So a right-click skill acts in the name of the player who asked, who
   must be online, in the same dimension and within `interactRange`. Containers are
-  never right-clicked, so a skill cannot open your chests. `/lumen skills` lists what
-  it knows, `/lumen skill <name>` shows one, `/lumen forget skill <name>` drops it
+  never right-clicked, so a click step cannot open your chests; take and put steps go
+  through the same storage access as fetching. `/lumen skills` lists what it knows,
+  `/lumen skill <name>` shows its steps, `/lumen forget skill <name>` drops it
+- *"Put the cobblestone in this chest"* and `/lumen put everything in the nearest
+  chest` work on their own too, without teaching
 
-**Quarrying**
+**Quarrying and digging down**
 - *"Go down to level 2 and mine out a 20x20x2 and bring me back all the loot"* is one
   sentence and one job: Lumen digs a staircase down to the level, clears the area top
-  down in a serpentine so it never digs the floor out from under itself, skips
-  anything next to water or lava, then comes back with the haul. Sizes read as
-  `WxLxH`, *"10 by 10"*, *"3 deep"*; levels as *"level 2"*, *"y -20"*, *"bedrock"*,
-  *"diamond level"*
+  down in a serpentine, skips anything next to water or lava, then comes back with the
+  haul. Sizes read as `WxLxH`, *"10 by 10"*, *"3 deep"*; levels as *"level 2"*,
+  *"y -20"*, *"bedrock"*, *"diamond level"*. A quarry clears every block in the area,
+  whatever it is made of
+- *"Go down to level 12"* on its own, or `/lumen down 12`, digs a staircase in the
+  direction Lumen is facing - one block down per block forward, head then feet - so
+  there is always a walkable way back up. Water or lava in the way stops the stairs
+  with a message rather than a splash
+- Lumen never mines the block under its own feet unless the block beneath that is
+  solid, and a plain *"mine stone"* never targets the floor at all. That is the end of
+  the one-wide shaft straight down into lava
 - `/lumen wand` hands you a selection wand (a stick). Left-click one corner, right-click
   the other - the selection is outlined in particles - then *"mine out the selection"*
   or a bare `/lumen quarry`
@@ -129,9 +151,25 @@ specific code.
 **Crafting**
 - *"Craft 8 sticks"*, *"I need a pickaxe"*, `/lumen craft 4 torches`: Lumen plans the
   recipe from what is in its pack, recursively - a stone pickaxe needs sticks, which
-  need planks, which need a log - and names exactly what is missing if it cannot.
-  Recipes that need a table send it to the nearest crafting table first (or set
-  `craftingNeedsTable: false`)
+  need planks, which need a log - and names what is missing if it cannot (*"i'd need
+  any planks for stick"*). Every recipe for an item is considered, the ones that use
+  what is in the pack first, so a modded log becomes that mod's planks and then
+  sticks. Recipes that need a table send it to the nearest crafting table first (or
+  set `craftingNeedsTable: false`)
+
+**Getting around**
+- The path search runs `pathSearchEffort` times harder than a vanilla mob's. Vanilla's
+  budget of 768 nodes is spent pressed against the floor when the target is one storey
+  down, which is exactly *"I can't reach the hops"* said from the roof; with room to
+  search, the stairs across the house are found. When something is still unreachable,
+  Lumen says which way it needs to go: *"i can't find a way down to the hops - they're
+  6 blocks below me. if there are stairs or a door, walk me there and ask again"*
+- Lava, fire, magma and cactus are never walked on, at any cost. Water has its vanilla
+  path cost again (`waterPenalty`), so ponds are walked around, and a swim that goes
+  nowhere for four seconds ends with a hop to the nearest dry block
+- *"Stand here"*, `/lumen go here` and `/lumen go 100 64 -20` put Lumen on an exact
+  spot before a job. Ladders are still beyond vanilla pathfinding; stairs, slabs and
+  doors are fine
 
 **Staying alive**
 - Hostile mobs now target Lumen (`hostilesAttackLumen`), and Lumen gets hungry: the
@@ -359,7 +397,9 @@ curl http://192.168.50.51:11434/v1/models
 | `followStartDistance` / `followStopDistance` | `4.0` / `2.5` | Follow hysteresis. |
 | `teleportDistance` | `24` | Past this, Lumen warps to you instead of pathing. |
 | `allowInteract` / `interactRange` | `true` / `32` | Right-click skills, and how close the player who asked must stay (a mob cannot click a block on its own). |
-| `allowTeaching` / `maxSkillBlocks` | `true` / `32` | Whether players can teach skills, and blocks handled per run. |
+| `allowTeaching` / `maxSkillBlocks` / `maxSkillSteps` | `true` / `32` / `12` | Whether players can teach skills, blocks handled per click or break step, steps per skill. |
+| `pathSearchEffort` | `8` | How many times harder than a vanilla mob Lumen searches for a route. Raise it for a big multi-storey base. |
+| `waterPenalty` | `8` | Path cost of a water block, vanilla's value. Lava, fire, magma and cactus are never walked on. |
 | `allowQuarry` / `maxQuarryBlocks` | `true` / `512` | Area digging, and the most blocks one quarry job may break. |
 | `maxQuarrySize` / `maxQuarryDescent` | `32` / `40` | Longest side of an area, and how far below Lumen it will dig a staircase. |
 | `allowCrafting` / `craftingNeedsTable` | `true` / `true` | Crafting from the pack; whether 3x3 recipes need a real crafting table nearby. |
@@ -416,7 +456,7 @@ misbehave anyway.
 | `/lumen say <message>` | everyone | Talk to Lumen regardless of `chatTrigger` |
 | `/lumen come` / `stay` / `follow [player]` | everyone | Manual control, no LLM involved. `come` and `follow` pause an errand; `stay` cancels everything |
 | `/lumen remember <name>` | everyone | Save where you are standing as a named place |
-| `/lumen go <place>` | everyone | Walk to a named place |
+| `/lumen go <place>` / `go here` / `go <x> <y> <z>` | everyone | Walk to a named place, to where you stand, or to coordinates |
 | `/lumen queue` / `cancel` / `continue` | everyone | What is lined up; drop it all; resume a paused errand |
 | `/lumen here` | everyone | Warp Lumen to you - the escape hatch when pathing loses |
 | `/lumen find <item> [from <place>]` | everyone | Fetch an item from a nearby container, or one near a named place |
@@ -429,8 +469,10 @@ misbehave anyway.
 | `/lumen containers` | everyone | Nearby containers, and which are searchable |
 | `/lumen why` | everyone | A path test to its target, and what is blocking it |
 | `/lumen look` | everyone | What Lumen sees in the block you are looking at: id, state, whether it reads as ripe |
-| `/lumen teach <name>: <how>` | everyone | Teach a skill from a sentence, grounded on the block you are looking at |
-| `/lumen skills` / `skill <name>` / `do <skill>` | everyone | List skills; show one; run one from where Lumen stands |
+| `/lumen teach <name>: <steps>` | everyone | Teach a skill from a sentence, steps split on "then", grounded on the block or chest you are looking at |
+| `/lumen skills` / `skill <name>` / `do [n] <skill>` | everyone | List skills; show one's steps; run one, optionally capped at n |
+| `/lumen put [n] <item> in <container>` | everyone | Put things from the pack into a container: `put 16 wheat in this chest`, `put everything in the nearest chest` |
+| `/lumen down <y>` | everyone | Dig a staircase down to that level |
 | `/lumen wand` | everyone | Get a selection wand: left-click one corner, right-click the other |
 | `/lumen quarry [area]` | everyone | Dig out the wand selection, or a described area: `/lumen quarry 10x10x2 level 40` |
 | `/lumen craft [n] <item>` | everyone | Craft from the pack, recursively |
@@ -445,12 +487,11 @@ and out of. The bottom row is what it is holding and wearing.
 ## Roadmap
 
 **Next**
-- Skills with more than one step: walk here, take from this container, put into that
-  one, wait. Today a skill is one target and one action (right-click or break) plus
-  collecting, which covers harvesting and most machine-tending; sequences are the
-  next layer on the same store
 - A right-click that does not need the player nearby. This needs a fake player, which
   Fabric API 1.20.1 does not ship; a minimal server-side one is the candidate
+- Ladders and scaffolding as routes. Vanilla land pathfinding only plans one-block
+  steps; climbing needs its own node type
+- Conditions in skills: "if the chest is empty, say so and stop"
 - Storage that exposes items through neither `Inventory` nor the Fabric transfer API
   (`/lumen containers` shows which)
 - Smelting and other machine recipes when crafting

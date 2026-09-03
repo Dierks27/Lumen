@@ -59,7 +59,18 @@ public final class SkillBook {
                 if (s.action == null) {
                     s.action = LumenSkill.INTERACT;
                 }
+                s.migrate();
+                s.steps.removeIf(step -> step == null || step.kind == null);
+                for (SkillStep step : s.steps) {
+                    if (step.target == null) {
+                        step.target = "";
+                    }
+                    if (step.item == null) {
+                        step.item = "";
+                    }
+                }
             }
+            this.data.skills.removeIf(s -> s.steps.isEmpty());
             Lumen.LOGGER.info("Loaded {} learned skill(s)", this.data.skills.size());
         } catch (IOException | RuntimeException e) {
             Lumen.LOGGER.error("Could not read {}, starting with no skills: {}", path, e.toString());

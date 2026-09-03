@@ -10,7 +10,9 @@ import com.lilahcraft.lumen.entity.ChestFinder;
 import com.lilahcraft.lumen.entity.LumenWand;
 import com.lilahcraft.lumen.entity.QuarryPlanner;
 import com.lilahcraft.lumen.skill.LumenSkill;
+import com.lilahcraft.lumen.skill.SkillStep;
 import com.lilahcraft.lumen.skill.SkillTeacher;
+import com.lilahcraft.lumen.command.LumenCommand;
 import com.lilahcraft.lumen.entity.LumenEntity;
 import com.lilahcraft.lumen.entity.LumenTask;
 import com.lilahcraft.lumen.memory.LumenMemory;
@@ -28,6 +30,8 @@ import java.util.ArrayList;
 import java.util.Deque;
 import java.util.List;
 import java.util.Locale;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -265,6 +269,11 @@ public final class LumenBrain {
         if (parts.isEmpty()) {
             parts = List.of("");
         }
+        // "learn restock: take wheat from the chest, then put it in the barrel" is one
+        // lesson, not a lesson followed by a deposit.
+        if (parts.size() > 1 && normaliseCommand(parts.get(0)).matches("^(learn|teach)\\b.*")) {
+            parts = List.of(rawCommand);
+        }
         List<String> parsedParts = new ArrayList<>();
         List<String> outcomes = new ArrayList<>();
         for (int i = 0; i < parts.size(); i++) {
@@ -329,13 +338,40 @@ public final class LumenBrain {
                 Lumen.broadcast(server, "got it, this is the " + name + " now");
                 return "remembered place '" + name + "' at " + speaker.getBlockPos().toShortString();
             }
-            case "goto", "walk" -> {
+            case "goto", "walk", "stand", "descend", "down" -> {
                 ServerPlayerEntity speaker = resolvePlayer(server, senderName, senderName);
                 if (speaker == null) {
                     return "no such player: " + senderName;
                 }
+                if (verb.equals("stand") && (argument.isEmpty() || argument.matches("here|there|still|by me|next to me|with me"))) {
+                    // "stand here" is a spot to be at, not a follow.
+                    return describeSubmission(server, lumen,
+                            lumen.submit(new LumenTask.GoTo(speaker.getUuid(), speaker.getBlockPos(), null)),
+                            "coming to stand there", "going to stand at " + speaker.getBlockPos().toShortString());
+                }
                 if (argument.isEmpty() || argument.equals("me")) {
                     return routeCome(server, lumen, speaker, queued);
+                }
+                // "go down to level 2", "down to y 12": a staircase, never a shaft.
+                Matcher level = LEVEL_REQUEST.matcher((verb.equals("goto") || verb.equals("walk") ? "" : verb + " ") + argument);
+                if (level.find()) {
+                    int y = Integer.parseInt(level.group(1));
+                    return describeSubmission(server, lumen,
+                            lumen.submit(new LumenTask.Descend(speaker.getUuid(), y)),
+                            "on it - digging stairs down to y " + y, "descend to y " + y);
+                }
+                Matcher coords = COORDS.matcher(argument);
+                if (coords.matches()) {
+                    BlockPos pos = new BlockPos(Integer.parseInt(coords.group(1)), Integer.parseInt(coords.group(2)),
+                            Integer.parseInt(coords.group(3)));
+                    return describeSubmission(server, lumen,
+                            lumen.submit(new LumenTask.GoTo(speaker.getUuid(), pos, null)),
+                            "heading to " + pos.toShortString(), "going to " + pos.toShortString());
+                }
+                if (argument.matches("here|right here|this spot|where i am|to me|over here")) {
+                    return describeSubmission(server, lumen,
+                            lumen.submit(new LumenTask.GoTo(speaker.getUuid(), speaker.getBlockPos(), null)),
+                            "coming to stand there", "going to stand at " + speaker.getBlockPos().toShortString());
                 }
                 LumenMemory.KnownPlace place = Lumen.memory().findPlace(argument,
                         speaker.getWorld().getRegistryKey().getValue());
@@ -403,7 +439,7 @@ public final class LumenBrain {
                 }
                 return routeCome(server, lumen, player, queued);
             }
-            case "find", "fetch", "get", "bring", "grab", "collect", "search" -> {
+            case "find", "fetch", "get", "bring", "grab", "collect", "search", "take" -> {
                 if (argument.isEmpty()) {
                     return "no item named";
                 }
@@ -440,9 +476,11 @@ public final class LumenBrain {
                 if (spec != null || verb.equals("quarry") || verb.equals("excavate")) {
                     return routeQuarry(server, lumen, requester, spec, argument);
                 }
-                // "harvest the hops": a taught skill wins over digging up blocks called hops.
-                LumenSkill skill = Lumen.skills().find(argument);
-                if (skill != null && (verb.equals("harvest") || argument.equalsIgnoreCase(skill.name))) {
+                // "harvest the hops", "harvest 10 hops": a taught skill wins over digging up
+                // blocks called hops.
+                LumenSkill skill = Lumen.skills().find(skillQuery(argument));
+                if (skill != null && (verb.equals("harvest") || skillQuery(argument).equalsIgnoreCase(skill.name)
+                        || skill.aliases.contains(skillQuery(argument)))) {
                     return routeSkill(server, lumen, requester, skill, argument);
                 }
                 PlaceLookup where = lookupPlace(argument, requester);
@@ -488,10 +526,10 @@ public final class LumenBrain {
                 if (requester == null) {
                     return "no such player: " + senderName;
                 }
-                LumenSkill skill = Lumen.skills().find(argument);
+                LumenSkill skill = Lumen.skills().find(skillQuery(argument));
                 if (skill == null) {
                     Lumen.broadcast(server, "i don't know how to " + argument + " - teach me: \"learn "
-                            + argument + ": right click the ripe ones\"");
+                            + argument + ": right click the ripe ones, then collect the drops\"");
                     return "unknown skill: " + argument;
                 }
                 return routeSkill(server, lumen, requester, skill, argument);
@@ -509,6 +547,30 @@ public final class LumenBrain {
                 return describeSubmission(server, lumen,
                         lumen.submit(new LumenTask.Craft(requester.getUuid(), request.query(), count)),
                         "let me see what i can make", "crafting " + count + " " + request.query());
+            }
+            case "put", "store", "stash", "deposit", "unload" -> {
+                ServerPlayerEntity requester = resolvePlayer(server, senderName, senderName);
+                if (requester == null) {
+                    return "no such player: " + senderName;
+                }
+                // The player's own words carry "this chest"; the model's tend not to.
+                String sentence = argument;
+                if (playerText != null) {
+                    String lower = playerText.toLowerCase(Locale.ROOT);
+                    Matcher m = Pattern.compile("\\b(put|store|stash|deposit|unload)\\b\\s+(.+)$").matcher(lower);
+                    if (m.find() && m.group(2).length() > sentence.length()) {
+                        sentence = m.group(2).replaceAll("[?!.]+$", "");
+                    }
+                }
+                SkillStep step = SkillTeacher.parseClause("put " + sentence, LumenCommand.lookedAt(requester));
+                if (step == null || !SkillStep.PUT.equals(step.kind)) {
+                    Lumen.broadcast(server, "what goes where? like \"put the wheat in this chest\" while looking at it");
+                    return "could not parse a deposit from '" + sentence + "'";
+                }
+                return describeSubmission(server, lumen,
+                        lumen.submit(new LumenTask.Deposit(requester.getUuid(), step.item, step.count,
+                                step.hasPos() ? new BlockPos(step.pos[0], step.pos[1], step.pos[2]) : null, step.target)),
+                        "on it - " + step.describe(), step.describe());
             }
             case "wand" -> {
                 ServerPlayerEntity player = resolvePlayer(server, senderName, senderName);
@@ -553,13 +615,28 @@ public final class LumenBrain {
     private String routeSkill(MinecraftServer server, LumenEntity lumen, ServerPlayerEntity requester,
                               LumenSkill skill, String argument) {
         PlaceLookup where = lookupPlace(argument, requester);
+        // "harvest 10 hops": the amount caps what the skill works through.
+        ChestFinder.Request request = ChestFinder.parseRequest(where.rest(), 0);
+        int count = request.isEverything() ? 0 : Math.max(0, request.count());
         return describeSubmission(server, lumen,
                 lumen.submit(new LumenTask.Harvest(requester.getUuid(), skill.name,
                         where.place() == null ? null : where.place().pos(),
-                        where.place() == null ? null : where.place().name)),
-                "on it - " + skill.name + (where.place() == null ? "" : " at the " + where.place().name),
-                "running skill '" + skill.name + "'");
+                        where.place() == null ? null : where.place().name, count)),
+                "on it - " + skill.name + (count > 0 ? ", " + count + " of them" : "")
+                        + (where.place() == null ? "" : " at the " + where.place().name),
+                "running skill '" + skill.name + "'" + (count > 0 ? " x" + count : ""));
     }
+
+    /** "10 hops from the hops room" -> "hops": the skill's name without a count or a place. */
+    static String skillQuery(String argument) {
+        Phrasing.PlaceRef ref = Phrasing.splitPlaceReference(argument);
+        String rest = ref.place() == null ? argument : ref.rest();
+        return ChestFinder.parseRequest(rest, 0).query();
+    }
+
+    private static final Pattern LEVEL_REQUEST = Pattern.compile(
+            "^(?:go\\s+|get\\s+|dig\\s+|head\\s+|descend\\s+)?(?:down\\s+|descend\\s+)?(?:to\\s+)?(?:level|y|layer|depth|height)\\s*(-?\\d{1,3})\\b");
+    private static final Pattern COORDS = Pattern.compile("^(-?\\d+)[ ,]+(-?\\d+)[ ,]+(-?\\d+)$");
 
     /**
      * Teaching. The sentence names the skill and how it is done; the block the player
@@ -586,20 +663,13 @@ public final class LumenBrain {
                 }
             }
         }
-        String lookedAt = null;
-        boolean ripe = false;
-        HitResult hit = teacher.raycast(6.0D, 1.0F, false);
-        if (hit instanceof BlockHitResult blockHit && hit.getType() == HitResult.Type.BLOCK) {
-            BlockState state = teacher.getWorld().getBlockState(blockHit.getBlockPos());
-            if (!state.isAir()) {
-                lookedAt = BlockStates.id(state);
-                ripe = BlockStates.isRipe(teacher.getWorld(), blockHit.getBlockPos(), state);
-            }
-        }
-        LumenSkill skill = SkillTeacher.parse(lesson, lookedAt, ripe);
+        SkillTeacher.LookedAt looked = LumenCommand.lookedAt(teacher);
+        String lookedAt = looked.blockId();
+        LumenSkill skill = SkillTeacher.parse(lesson, looked);
         if (skill == null) {
             Lumen.broadcast(server, "tell me what to do and to what - like \"learn harvest hops: right click the ripe hops vines\""
-                    + " - or look at the block while you say it");
+                    + " or \"learn restock: take 16 wheat from the storage chest, then put it in this barrel\""
+                    + " - and look at the block or chest while you say it");
             return "could not parse a lesson from '" + lesson + "'";
         }
         skill.taughtBy = teacher.getName().getString();
@@ -608,12 +678,11 @@ public final class LumenBrain {
             Lumen.broadcast(server, "i can't hold any more skills - forget one first");
             return "skill book full";
         }
-        Lumen.LOGGER.info("{} taught skill '{}': {} {} (looking at {})", skill.taughtBy, skill.name,
-                skill.action, skill.target, lookedAt == null ? "nothing" : lookedAt);
-        Lumen.broadcast(server, "learned \"" + skill.name + "\": " + (skill.isInteract() ? "right-click " : "break ")
-                + skill.target + (skill.collect ? " and collect the drops" : "")
-                + ". say \"" + skill.name + "\" and i'll do it; /lumen skill " + skill.name + " shows it");
-        return "learned skill '" + skill.name + "' -> " + skill.action + " " + skill.target;
+        Lumen.LOGGER.info("{} taught skill '{}': {} (looking at {})", skill.taughtBy, skill.name,
+                skill.describe(), lookedAt == null ? "nothing" : lookedAt);
+        Lumen.broadcast(server, "learned " + skill.describe()
+                + ". say \"" + skill.name + "\" and i'll do it; /lumen skill " + skill.name + " shows the steps");
+        return "learned skill '" + skill.name + "' -> " + skill.describe();
     }
 
     // -------------------------------------------------------------------- notes
@@ -821,7 +890,8 @@ public final class LumenBrain {
             "grab", "collect", "search", "mine", "dig", "chop", "break", "harvest", "drop",
             "give", "hand", "return", "pass", "stay", "stop", "wait", "halt", "hold",
             "remember", "save", "mark", "continue", "resume", "carry", "keep", "proceed", "walk",
-            "learn", "teach", "do", "run", "craft", "make", "quarry", "excavate", "wand");
+            "learn", "teach", "do", "run", "craft", "make", "quarry", "excavate", "wand",
+            "put", "store", "stash", "deposit", "unload", "stand", "descend", "down", "take");
 
     /**
      * Last resort when the model chats but omits the command field: read the intent
@@ -968,9 +1038,17 @@ public final class LumenBrain {
                 + "  goto <place>    - walk to a place you were taught the name of\n"
                 + "  remember <name> - save the spot the speaker is standing in under that name\n"
                 + "  continue        - carry on with whatever was paused\n"
-                + "  learn <name>: <how> - when the player explains how to do a job, copy their words: "
-                + "\"learn harvest hops: right click the ripe hops vines and collect the drops\"\n"
-                + "  do <skill>      - run a skill you were taught (a [skills you were taught] block lists them)\n"
+                + "  learn <name>: <steps> - when the player explains how to do a job, copy their words "
+                + "exactly, including every \"then\": \"learn harvest hops: right click the ripe hops vines, "
+                + "then collect the drops\", \"learn restock: take 16 wheat from the storage chest, then put it "
+                + "in this barrel\". Steps can be: walk to <place>, right click <block>, break <block>, "
+                + "take <n> <item> from <chest>, put <item> in <chest>, hold <tool>, wait <n> seconds, "
+                + "say <words>, collect the drops, come back\n"
+                + "  do <skill>      - run a skill you were taught (a [skills you were taught] block lists them); "
+                + "a number caps it: \"do 10 harvest hops\"\n"
+                + "  put <item> in <chest> - put things from your pack into a container: \"put wheat in this chest\"\n"
+                + "  goto <x> <y> <z> / stand here - walk to exact coordinates, or to where the speaker stands\n"
+                + "  down <y>        - dig a staircase down to that level: \"down 12\"\n"
                 + "  craft <n> <item> - make something from what is in your pack, e.g. \"craft 4 sticks\"\n"
                 + "  quarry <WxLxH> [level Y] - dig out an area: \"quarry 20x20x2 level 2\"; "
                 + "\"quarry selection\" digs what the player marked with the wand\n"
@@ -1003,8 +1081,14 @@ public final class LumenBrain {
                 + "\"message\":\"iron first, then copper, then back to you\"}\n"
                 + "{\"reason\":\"naming this spot\",\"command\":\"remember hops room\","
                 + "\"message\":\"the hops room, got it\"}\n"
-                + "{\"reason\":\"they are teaching me\",\"command\":\"learn harvest hops: right click the ripe hops vines and collect what drops\","
+                + "{\"reason\":\"they are teaching me\",\"command\":\"learn harvest hops: right click the ripe hops vines, then collect what drops\","
                 + "\"message\":\"got it, ripe ones get a right click\"}\n"
+                + "{\"reason\":\"a chest job to learn\",\"command\":\"learn restock: take 16 wheat from the storage chest, then put it in this barrel\","
+                + "\"message\":\"wheat from storage into the barrel, got it\"}\n"
+                + "{\"reason\":\"they want things put away\",\"command\":\"put the cobblestone in this chest\","
+                + "\"message\":\"stashing it\"}\n"
+                + "{\"reason\":\"they want me lower down\",\"command\":\"down 12\","
+                + "\"message\":\"digging stairs down to 12\"}\n"
                 + "{\"reason\":\"a skill i know\",\"command\":\"do harvest hops\","
                 + "\"message\":\"on it\"}\n"
                 + "{\"reason\":\"they need sticks\",\"command\":\"craft 8 sticks\","

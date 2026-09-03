@@ -4,13 +4,11 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Something a player taught Lumen to do. A mutable bean rather than a record so Gson
- * writes and reads it without adapters.
+ * Something a player taught Lumen to do: a name and a short list of {@link SkillStep}s.
+ * A mutable bean rather than a record so Gson writes and reads it without adapters.
  *
- * <p>A skill is a target and an action: "the ripe hops vines" and "right-click them".
- * Every farming, harvesting and machine-operating job a player has described so far
- * fits that shape, and it can be executed deterministically without asking the model
- * anything, which is what makes it reliable with a small local LLM.
+ * <p>Steps run in order and can be executed deterministically without asking the
+ * model anything, which is what makes a skill reliable with a small local LLM.
  */
 public final class LumenSkill {
 
@@ -21,27 +19,64 @@ public final class LumenSkill {
     public String name = "";
     /** Other ways the player refers to it: "hops", "pick the hops". */
     public List<String> aliases = new ArrayList<>();
-    /** A {@code BlockMatcher} spec: "ripe hops vine", "sweet berry bush age=3". */
-    public String target = "";
-    /** {@link #INTERACT} (right-click) or {@link #BREAK} (mine it). */
-    public String action = INTERACT;
-    /** How far from where Lumen starts to look for targets. */
+    /** What to do, in order. */
+    public List<SkillStep> steps = new ArrayList<>();
+    /** How far from where Lumen starts to look for blocks a step names. */
     public int radius = 12;
-    /** Pick up what drops and bring it back. */
-    public boolean collect = true;
     /** The exact block the player was looking at when teaching, for the record. */
     public String example = "";
     public String taughtBy = "";
     public long created;
     public int uses;
 
+    // v0.8.0 shape, kept so an old skills.json still loads. migrate() turns these into steps.
+    public String target = "";
+    public String action = INTERACT;
+    public boolean collect = true;
+
+    /** Steps, building them from the v0.8.0 fields when the file predates steps. */
+    public List<SkillStep> steps() {
+        migrate();
+        return steps;
+    }
+
+    /** Turns a v0.8.0 target/action/collect skill into steps. Harmless on a new one. */
+    public void migrate() {
+        if (steps == null) {
+            steps = new ArrayList<>();
+        }
+        if (!steps.isEmpty() || target == null || target.isEmpty()) {
+            return;
+        }
+        steps.add(BREAK.equalsIgnoreCase(action) ? SkillStep.breakBlocks(target, 0) : SkillStep.click(target, 0));
+        if (collect) {
+            steps.add(SkillStep.collect());
+        }
+        target = "";
+    }
+
+    /** The first click or break step, which is what a count ("harvest 10 hops") applies to. */
+    public SkillStep firstBlockStep() {
+        for (SkillStep step : steps()) {
+            if (step.isBlockAction()) {
+                return step;
+            }
+        }
+        return null;
+    }
+
+    /** True when the skill is one right-click job, the v0.8.0 shape. */
     public boolean isInteract() {
-        return !BREAK.equalsIgnoreCase(action);
+        SkillStep first = firstBlockStep();
+        return first == null || SkillStep.RIGHT_CLICK.equals(first.kind);
     }
 
     /** One line for /lumen skills and the prompt. */
     public String describe() {
-        return name + ": " + (isInteract() ? "right-click " : "break ") + target
-                + (collect ? ", collect the drops" : "") + " within " + radius + " blocks";
+        List<String> parts = new ArrayList<>();
+        for (SkillStep step : steps()) {
+            parts.add(step.describe());
+        }
+        return name + ": " + String.join(", then ", parts) + " (within " + radius + " blocks)";
     }
 }

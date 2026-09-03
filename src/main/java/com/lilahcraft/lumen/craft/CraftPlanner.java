@@ -15,6 +15,7 @@ import net.minecraft.server.MinecraftServer;
 import org.jetbrains.annotations.Nullable;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -49,9 +50,10 @@ public final class CraftPlanner {
         }
     }
 
-    private static final int MAX_DEPTH = 4;
-    private static final int MAX_ALTERNATIVES = 4;
+    private static final int MAX_DEPTH = 5;
     private static final int MAX_STEPS = 24;
+    /** Recipe attempts per plan. Enough for a wood tree of modded planks, not enough to stall a tick. */
+    private static final int BUDGET = 2000;
 
     private final RecipeManager manager;
     private final DynamicRegistryManager registries;
@@ -90,14 +92,21 @@ public final class CraftPlanner {
         Lumen.LOGGER.info("Indexed {} crafting recipe(s) for {} item(s)", count, byOutput.size());
     }
 
-    /** Items that can be crafted, matching a plain-words query - for "make me some sticks". */
+    /**
+     * Items that can be crafted, matching a plain-words query - for "make me some sticks".
+     * On a tie the vanilla item wins, then the shorter name: "stick" is the stick, not
+     * some mod's "stick bundle".
+     */
     @Nullable
     public Item findCraftable(String query) {
         Item best = null;
         int bestScore = 0;
         for (Item item : byOutput.keySet()) {
             int score = com.lilahcraft.lumen.entity.ChestFinder.matchScore(new ItemStack(item), query);
-            if (score > bestScore) {
+            if (score == 0) {
+                continue;
+            }
+            if (score > bestScore || (score == bestScore && best != null && prefer(item, best))) {
                 bestScore = score;
                 best = item;
             }
@@ -105,11 +114,36 @@ public final class CraftPlanner {
         return best;
     }
 
+    private static boolean prefer(Item candidate, Item current) {
+        boolean candidateVanilla = Registries.ITEM.getId(candidate).getNamespace().equals("minecraft");
+        boolean currentVanilla = Registries.ITEM.getId(current).getNamespace().equals("minecraft");
+        if (candidateVanilla != currentVanilla) {
+            return candidateVanilla;
+        }
+        return name(candidate).length() < name(current).length();
+    }
+
+    /** The first thing that could not be found, closest to what was asked for. */
+    private static final class Missing {
+        String text;
+        int depth = Integer.MAX_VALUE;
+
+        void note(int depth, String text) {
+            if (depth < this.depth) {
+                this.depth = depth;
+                this.text = text;
+            }
+        }
+    }
+
+    /** Recipe attempts left for the plan in progress. */
+    private int budget;
+
     /**
      * Plans {@code count} of {@code target} from {@code have}. The list is not modified;
      * the plan's steps, run in order against the real pack, consume what the plan assumed.
      */
-    public Plan plan(Item target, int count, List<ItemStack> have) {
+    public synchronized Plan plan(Item target, int count, List<ItemStack> have) {
         List<ItemStack> sim = new ArrayList<>();
         for (ItemStack stack : have) {
             if (!stack.isEmpty()) {
@@ -117,7 +151,8 @@ public final class CraftPlanner {
             }
         }
         List<Step> steps = new ArrayList<>();
-        String[] missing = new String[1];
+        Missing missing = new Missing();
+        this.budget = BUDGET;
         boolean ok = planInto(target, count, sim, steps, new HashSet<>(), 0, missing);
         boolean needsTable = false;
         for (Step step : steps) {
@@ -126,28 +161,32 @@ public final class CraftPlanner {
             }
         }
         if (!ok) {
-            return new Plan(List.of(), needsTable, missing[0] == null ? "no recipe i know makes that" : missing[0]);
+            return new Plan(List.of(), needsTable, missing.text == null ? "no recipe i know makes that" : missing.text);
         }
         return new Plan(steps, needsTable, null);
     }
 
+    /**
+     * Every recipe for the target is tried, the ones that use what is in hand first. v0.8.0
+     * tried only the first four, which in a pack with dozens of wood types meant the recipe
+     * taking the log Lumen actually had was never reached - "i'd need a log" while holding one.
+     */
     private boolean planInto(Item target, int count, List<ItemStack> sim, List<Step> steps,
-                             Set<Item> onPath, int depth, String[] missing) {
-        if (depth > MAX_DEPTH || steps.size() > MAX_STEPS || onPath.contains(target)) {
+                             Set<Item> onPath, int depth, Missing missing) {
+        if (depth > MAX_DEPTH || steps.size() > MAX_STEPS || onPath.contains(target) || budget <= 0) {
             return false;
         }
         List<CraftingRecipe> recipes = byOutput.get(target);
         if (recipes == null || recipes.isEmpty()) {
-            if (missing[0] == null) {
-                missing[0] = "i don't know a recipe for " + name(target);
-            }
+            missing.note(depth, "i don't know a recipe for " + name(target));
             return false;
         }
         onPath.add(target);
         try {
-            int tried = 0;
-            for (CraftingRecipe recipe : recipes) {
-                if (tried++ >= MAX_ALTERNATIVES) {
+            List<CraftingRecipe> ordered = new ArrayList<>(recipes);
+            ordered.sort(Comparator.comparingInt((CraftingRecipe r) -> -inHandScore(r, sim)));
+            for (CraftingRecipe recipe : ordered) {
+                if (budget-- <= 0) {
                     break;
                 }
                 List<ItemStack> attemptSim = copy(sim);
@@ -165,8 +204,45 @@ public final class CraftPlanner {
         }
     }
 
+    /** How many of the recipe's ingredients something in hand already satisfies. */
+    private static int inHandScore(CraftingRecipe recipe, List<ItemStack> sim) {
+        int score = 0;
+        for (Ingredient ingredient : recipe.getIngredients()) {
+            if (ingredient == null || ingredient.isEmpty()) {
+                continue;
+            }
+            if (anyMatch(ingredient, sim)) {
+                score++;
+            }
+        }
+        return score;
+    }
+
+    /** True when the recipe could run right now from what is in hand, no crafting first. */
+    private static boolean allInHand(CraftingRecipe recipe, List<ItemStack> sim) {
+        List<ItemStack> scratch = copy(sim);
+        for (Ingredient ingredient : recipe.getIngredients()) {
+            if (ingredient == null || ingredient.isEmpty()) {
+                continue;
+            }
+            if (!consume(ingredient, scratch)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static boolean anyMatch(Ingredient ingredient, List<ItemStack> sim) {
+        for (ItemStack stack : sim) {
+            if (!stack.isEmpty() && ingredient.test(stack)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private boolean tryRecipe(CraftingRecipe recipe, Item target, int count, List<ItemStack> sim,
-                              List<Step> steps, Set<Item> onPath, int depth, String[] missing) {
+                              List<Step> steps, Set<Item> onPath, int depth, Missing missing) {
         ItemStack output = recipe.getOutput(registries);
         if (output.isEmpty() || output.getItem() != target) {
             return false;
@@ -180,27 +256,8 @@ public final class CraftPlanner {
                 if (consume(ingredient, sim)) {
                     continue;
                 }
-                // Nothing in hand satisfies it: try to craft one of the things it accepts.
-                boolean made = false;
-                int options = 0;
-                for (ItemStack option : ingredient.getMatchingStacks()) {
-                    if (options++ >= MAX_ALTERNATIVES) {
-                        break;
-                    }
-                    if (!byOutput.containsKey(option.getItem())) {
-                        continue;
-                    }
-                    if (planInto(option.getItem(), 1, sim, steps, onPath, depth + 1, missing)) {
-                        made = consume(ingredient, sim);
-                        if (made) {
-                            break;
-                        }
-                    }
-                }
-                if (!made) {
-                    if (missing[0] == null) {
-                        missing[0] = "i'd need " + describeIngredient(ingredient) + " for " + name(target);
-                    }
+                if (!craftOneOf(ingredient, sim, steps, onPath, depth, missing) || !consume(ingredient, sim)) {
+                    missing.note(depth, "i'd need " + describeIngredient(ingredient) + " for " + name(target));
                     return false;
                 }
             }
@@ -211,6 +268,46 @@ public final class CraftPlanner {
         sim.add(made);
         steps.add(new Step(recipe, times, output.copy()));
         return true;
+    }
+
+    /**
+     * Nothing in hand satisfies the ingredient: craft one of the things it accepts. The
+     * options that can be made straight from the pack go first (the planks whose log we
+     * hold), then anything else, until the budget runs out.
+     */
+    private boolean craftOneOf(Ingredient ingredient, List<ItemStack> sim, List<Step> steps,
+                               Set<Item> onPath, int depth, Missing missing) {
+        List<Item> direct = new ArrayList<>();
+        List<Item> indirect = new ArrayList<>();
+        for (ItemStack option : ingredient.getMatchingStacks()) {
+            Item item = option.getItem();
+            List<CraftingRecipe> recipes = byOutput.get(item);
+            if (recipes == null || onPath.contains(item) || direct.contains(item) || indirect.contains(item)) {
+                continue;
+            }
+            boolean now = false;
+            for (CraftingRecipe recipe : recipes) {
+                if (allInHand(recipe, sim)) {
+                    now = true;
+                    break;
+                }
+            }
+            (now ? direct : indirect).add(item);
+        }
+        for (Item item : direct) {
+            if (planInto(item, 1, sim, steps, onPath, depth + 1, missing)) {
+                return true;
+            }
+        }
+        for (Item item : indirect) {
+            if (budget <= 0) {
+                break;
+            }
+            if (planInto(item, 1, sim, steps, onPath, depth + 1, missing)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** Removes one item matching the ingredient from the simulated pack. */
@@ -289,13 +386,51 @@ public final class CraftPlanner {
         return new ItemStack(item).getName().getString().toLowerCase(Locale.ROOT);
     }
 
-    private static String describeIngredient(Ingredient ingredient) {
+    /** "planks" for the planks tag, "oak log or the like" for a list, "stick" for one item. */
+    static String describeIngredient(Ingredient ingredient) {
         ItemStack[] options = ingredient.getMatchingStacks();
         if (options.length == 0) {
             return "something";
         }
         String first = options[0].getName().getString().toLowerCase(Locale.ROOT);
-        return options.length > 1 ? first + " or the like" : first;
+        if (options.length == 1) {
+            return first;
+        }
+        List<String> names = new ArrayList<>();
+        for (ItemStack option : options) {
+            names.add(option.getName().getString().toLowerCase(Locale.ROOT));
+        }
+        String shared = commonTail(names);
+        return shared.isEmpty() ? first + " or the like" : "any " + shared;
+    }
+
+    /** The words every name ends with: "oak planks", "birch planks" -> "planks". */
+    static String commonTail(List<String> names) {
+        if (names.isEmpty()) {
+            return "";
+        }
+        String[] tail = names.get(0).trim().split(" ");
+        int keep = tail.length;
+        for (String name : names) {
+            String[] words = name.trim().split(" ");
+            int match = 0;
+            while (match < keep && match < words.length
+                    && words[words.length - 1 - match].equals(tail[tail.length - 1 - match])) {
+                match++;
+            }
+            keep = match;
+            if (keep == 0) {
+                return "";
+            }
+        }
+        StringBuilder out = new StringBuilder();
+        for (int i = tail.length - keep; i < tail.length; i++) {
+            if (out.length() > 0) {
+                out.append(' ');
+            }
+            out.append(tail[i]);
+        }
+        return out.toString();
     }
 
     public static String id(Item item) {

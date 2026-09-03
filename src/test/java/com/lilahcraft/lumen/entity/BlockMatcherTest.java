@@ -51,7 +51,10 @@ class BlockMatcherTest {
     @DisplayName("ripe: the block's own growth check wins, then age at max")
     void ripeness() {
         assertTrue(BlockMatcher.isRipe(BUSH_RIPE, BUSH_MAX, false));
-        assertFalse(BlockMatcher.isRipe(BUSH_RIPE, BUSH_MAX, true));
+        // The block claims it can still grow but its age is at the maximum: modded crops
+        // answer "yes" to bone meal at every age, so the age wins.
+        assertTrue(BlockMatcher.isRipe(BUSH_RIPE, BUSH_MAX, true));
+        assertFalse(BlockMatcher.isRipe(BUSH_YOUNG, BUSH_MAX, true));
         assertTrue(BlockMatcher.isRipe(BUSH_RIPE, BUSH_MAX, null));
         assertFalse(BlockMatcher.isRipe(BUSH_YOUNG, BUSH_MAX, null));
         assertFalse(BlockMatcher.isRipe(Map.of("facing", "north"), Map.of(), null));

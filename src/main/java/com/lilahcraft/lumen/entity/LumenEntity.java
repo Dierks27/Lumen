@@ -11,6 +11,7 @@ import com.lilahcraft.lumen.entity.goal.LumenMineGoal;
 import com.lilahcraft.lumen.entity.goal.LumenPickUpItemGoal;
 import com.lilahcraft.lumen.entity.goal.LumenWanderGoal;
 import com.lilahcraft.lumen.skill.LumenSkill;
+import com.lilahcraft.lumen.skill.SkillStep;
 import com.lilahcraft.lumen.memory.LumenMemory;
 import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
@@ -48,6 +49,7 @@ import net.minecraft.entity.mob.HostileEntity;
 import net.minecraft.entity.mob.PathAwareEntity;
 import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.entity.player.PlayerInventory;
+import net.minecraft.block.entity.BlockEntity;
 import net.minecraft.inventory.SimpleInventory;
 import net.minecraft.item.FoodComponent;
 import net.minecraft.item.Item;
@@ -141,8 +143,15 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
     private BlockPos fetchAnchor;
     private BlockPos mineAnchor;
 
-    /** One block a skill or quarry lined up: break it, or right-click it. */
-    public record WorkItem(BlockPos pos, boolean interact) {
+    /**
+     * One block a skill or quarry lined up: break it, or right-click it. {@code stairs}
+     * marks a staircase step: one that cannot be done ends the job, because the steps
+     * after it would be dug from mid-air.
+     */
+    public record WorkItem(BlockPos pos, boolean interact, boolean stairs) {
+        public WorkItem(BlockPos pos, boolean interact) {
+            this(pos, interact, false);
+        }
     }
 
     /** Blocks lined up by a skill or a quarry, worked through the mine goal in order. */
@@ -156,6 +165,34 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
     /** A craft that needs a table: done once Lumen has walked to one. */
     private LumenTask.Craft craftAfterArrival;
     private int collectTicks;
+    /** Picking up drops around here until none are left or time runs out. Null otherwise. */
+    private BlockPos collectCenter;
+    private double collectRadius;
+    /** What the work list is matching, rechecked as each block comes up. Null means anything. */
+    private BlockMatcher.Spec workSpec;
+    private int workUnreachable;
+    private int workGone;
+    private int workUnsafe;
+    private BlockPos firstUnreachable;
+    /** Items right-clicks put straight into the requester's hands and Lumen took back. */
+    private int workCollected;
+
+    // A taught skill in progress: the steps still to run, and the one running now.
+    private final Deque<SkillStep> skillSteps = new ArrayDeque<>();
+    private LumenSkill runningSkill;
+    private SkillStep skillStep;
+    private BlockPos skillAnchor;
+    private int skillCount;
+    private int skillStepsDone;
+    private final List<String> skillReport = new ArrayList<>();
+    private boolean skillReturning;
+    /** Fetched items stay in the pack instead of being handed over: a take step. */
+    private boolean keepFetched;
+    /** A deposit in progress: what to put into fetchChest once beside it. Null otherwise. */
+    private String depositQuery;
+    private int depositCount;
+    private int waitTicks;
+    private int wetTicks;
 
     // Survival: a food level that drains with real time, and a name tag that shows health.
     private float foodLevel = 20.0F;
@@ -214,12 +251,20 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         super(entityType, world);
         this.setPersistent();
         this.setCanPickUpLoot(false); // we run our own pickup, vanilla's would equip junk
-        this.setPathfindingPenalty(PathNodeType.WATER, 0.0F);
+        // Water costs what vanilla says it costs. v0.8.0 set it to 0, which is how Lumen
+        // came to wade through every pond in its way and sit in the deep ones.
+        this.setPathfindingPenalty(PathNodeType.WATER, (float) Lumen.config().waterPenalty);
         this.setPathfindingPenalty(PathNodeType.DOOR_WOOD_CLOSED, 0.0F);
         this.setPathfindingPenalty(PathNodeType.DOOR_OPEN, 0.0F);
         this.setPathfindingPenalty(PathNodeType.DOOR_IRON_CLOSED, -1.0F); // cannot open these
-        this.setPathfindingPenalty(PathNodeType.DANGER_FIRE, 12.0F);
-        this.setPathfindingPenalty(PathNodeType.DAMAGE_FIRE, 24.0F);
+        // Hazards. -1 is "never", not "expensive": lava, fire, magma and cactus are not a
+        // shortcut at any price. Standing next to them is allowed at a high cost so a
+        // nether corridor is still walkable.
+        this.setPathfindingPenalty(PathNodeType.LAVA, -1.0F);
+        this.setPathfindingPenalty(PathNodeType.DAMAGE_FIRE, -1.0F);
+        this.setPathfindingPenalty(PathNodeType.DANGER_FIRE, 16.0F);
+        this.setPathfindingPenalty(PathNodeType.DAMAGE_OTHER, -1.0F);
+        this.setPathfindingPenalty(PathNodeType.DANGER_OTHER, 12.0F);
     }
 
     /**
@@ -421,6 +466,7 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         this.fetchAnchor = null;
         this.mineAnchor = null;
         clearWork();
+        clearSkillRun();
         this.craftAfterArrival = null;
         this.stuckTicks = 0;
         this.getNavigation().stop();
@@ -539,12 +585,39 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
                 this.lastTaskNote = "i don't know how to " + harvest.skillName();
                 ok = false;
             } else {
-                String refusal = startSkill(requester, skill, harvest.anchor(), harvest.anchorName());
+                String refusal = startSkill(requester, skill, harvest.anchor(), harvest.anchorName(), harvest.count());
                 ok = refusal == null;
                 if (!ok) {
                     this.lastTaskNote = refusal;
                 }
             }
+        } else if (task instanceof LumenTask.Deposit deposit) {
+            if (requester == null) {
+                this.lastTaskNote = "whoever asked has gone";
+                ok = false;
+            } else {
+                String refusal = startDeposit(requester, deposit.query(), deposit.count(), deposit.container(),
+                        deposit.containerRef());
+                ok = refusal == null;
+                if (!ok) {
+                    this.lastTaskNote = refusal;
+                }
+            }
+        } else if (task instanceof LumenTask.Descend descend) {
+            if (requester == null) {
+                this.lastTaskNote = "whoever asked has gone";
+                ok = false;
+            } else {
+                String refusal = startDescend(requester, descend.targetY());
+                ok = refusal == null;
+                if (!ok) {
+                    this.lastTaskNote = refusal;
+                }
+            }
+        } else if (task instanceof LumenTask.Wait wait) {
+            this.waitTicks = Math.max(1, wait.ticks());
+            this.mode = Mode.IDLE;
+            ok = true;
         } else if (task instanceof LumenTask.Quarry quarry) {
             if (requester == null) {
                 this.lastTaskNote = "whoever asked has gone";
@@ -565,8 +638,7 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
             }
         } else if (task instanceof LumenTask.Collect collect) {
             this.deliverTo = collect.requester();
-            this.collectTicks = 0;
-            this.mode = Mode.IDLE; // the pick-up goal only runs while idle
+            beginCollect(collect.center(), collect.radius());
             ok = true;
         } else {
             ok = false;
@@ -583,6 +655,10 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
      * errand always did.
      */
     private void taskDone() {
+        // A skill step just finished: run the next step under the same task.
+        if (runningSkill != null && currentTask instanceof LumenTask.Harvest && advanceSkill()) {
+            return;
+        }
         LumenTask finished = this.currentTask;
         this.currentTask = null;
         while (!taskQueue.isEmpty()) {
@@ -621,7 +697,10 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
             }
         } else if (running instanceof LumenTask.Mine || running instanceof LumenTask.GoTo
                 || running instanceof LumenTask.Harvest || running instanceof LumenTask.Quarry
-                || running instanceof LumenTask.Craft) {
+                || running instanceof LumenTask.Craft || running instanceof LumenTask.Deposit
+                || running instanceof LumenTask.Descend) {
+            // A skill starts again from its first step when resumed; a half-done skill
+            // is not a state worth saving.
             taskQueue.addFirst(running);
         }
         // Handover and Return are about the player anyway; they just happen on arrival.
@@ -645,6 +724,7 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         this.mineAnchor = null;
         this.minedPositions.clear();
         clearWork();
+        clearSkillRun();
         this.craftAfterArrival = null;
         this.stuckTicks = 0;
         this.getNavigation().stop();
@@ -656,8 +736,30 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         this.workLabel = null;
         this.workCollect = false;
         this.workCenter = null;
+        this.workSpec = null;
         this.workDone = 0;
         this.workSkipped = 0;
+        this.workUnreachable = 0;
+        this.workGone = 0;
+        this.workUnsafe = 0;
+        this.workCollected = 0;
+        this.firstUnreachable = null;
+    }
+
+    private void clearSkillRun() {
+        this.skillSteps.clear();
+        this.runningSkill = null;
+        this.skillStep = null;
+        this.skillAnchor = null;
+        this.skillCount = 0;
+        this.skillStepsDone = 0;
+        this.skillReport.clear();
+        this.skillReturning = false;
+        this.keepFetched = false;
+        this.depositQuery = null;
+        this.depositCount = 0;
+        this.waitTicks = 0;
+        this.collectCenter = null;
     }
 
     /** "Carry on": starts the next queued task. False when there is nothing waiting. */
@@ -865,6 +967,15 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
     public void fetchUnreachable() {
         BlockPos chest = this.fetchChest;
         this.fetchChest = null;
+        if (depositQuery != null) {
+            // A deposit has one container; no route to it is the end of the errand.
+            this.depositQuery = null;
+            this.mode = Mode.IDLE;
+            Lumen.broadcast(this.getWorld().getServer(), "i can't get to the container"
+                    + (chest == null ? "" : " at " + chest.toShortString()));
+            taskDone();
+            return;
+        }
         if (chest == null || !(this.getWorld() instanceof ServerWorld world)) {
             taskDone();
             return;
@@ -883,6 +994,10 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
      * to whoever asked. Called by the fetch goal once Lumen is standing at the chest.
      */
     public void collectFromChest() {
+        if (depositQuery != null) {
+            depositIntoChest();
+            return;
+        }
         LumenConfig config = Lumen.config();
         BlockPos chest = this.fetchChest;
         String query = this.fetchQuery;
@@ -938,7 +1053,8 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
                          LumenConfig config) {
         List<ItemStack> contents = access.contents();
         ItemStack sameAs = fetchSample.isEmpty() ? null : fetchSample;
-        int tier = ChestFinder.scoreContainer(contents, query, sameAs);
+        boolean everything = "*".equals(query);
+        int tier = everything ? ChestFinder.EXACT_MATCH : ChestFinder.scoreContainer(contents, query, sameAs);
         if (tier < Math.max(ChestFinder.SUBSTRING_MATCH, fetchMinScore)) {
             return 0;
         }
@@ -946,7 +1062,7 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         List<ItemStack> kinds = new ArrayList<>();
         for (ItemStack stack : contents) {
             boolean familiar = sameAs != null && ItemStack.canCombine(stack, sameAs);
-            if (!familiar && ChestFinder.matchScore(stack, query) != tier) {
+            if (!everything && !familiar && ChestFinder.matchScore(stack, query) != tier) {
                 continue;
             }
             boolean seen = false;
@@ -980,6 +1096,9 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
                 this.fetchRequested = remaining;
                 this.fetchStacks = 0.0D;
             }
+            if (everything) {
+                remaining = Math.max(remaining, 64);
+            }
             // One stack's worth per call, so a big order comes out as proper stacks.
             for (int round = 0; remaining > 0 && round < 64; round++) {
                 ItemStack removed = access.take(kind, remaining);
@@ -996,7 +1115,9 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
                 this.fetchMinScore = Math.max(this.fetchMinScore, tier);
                 pendingDelivery.add(removed);
                 // Learned: this container is where that item lives.
-                Lumen.memory().rememberContainer(query, Registries.ITEM.getId(removed.getItem()), dimension, chest);
+                if (!everything) {
+                    Lumen.memory().rememberContainer(query, Registries.ITEM.getId(removed.getItem()), dimension, chest);
+                }
             }
         }
         this.fetchWanted = remaining;
@@ -1016,10 +1137,27 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         this.fetchStacks = 0.0D;
 
         String line;
-        if (this.fetchTaken == 0) {
+        if (keepFetched && this.fetchTaken > 0) {
+            // A take step: it stays in the pack for the next step, not for handing over.
+            int kept = 0;
+            for (ItemStack stack : pendingDelivery) {
+                ItemStack leftover = getInventory().addStack(stack);
+                kept += stack.getCount() - leftover.getCount();
+                if (!leftover.isEmpty()) {
+                    dropAndIgnore(leftover);
+                }
+            }
+            pendingDelivery.clear();
+            line = "got " + kept + " " + what + (this.fetchRequested != Integer.MAX_VALUE
+                    && this.fetchTaken < this.fetchRequested ? " (all there was)" : "");
+            skillReport.add(line);
+        } else if (this.fetchTaken == 0) {
             line = this.fetchSawUnreachable
                     ? "i can see some " + query + " in a container but i can't get to it"
                     : "i couldn't find any " + query + " in anything nearby";
+            if (keepFetched) {
+                skillReport.add(line);
+            }
         } else if (this.fetchRequested != Integer.MAX_VALUE && this.fetchTaken < this.fetchRequested) {
             line = "found " + this.fetchTaken + " " + what + " but you asked for " + this.fetchRequested
                     + " - that's all i could find" + (this.fetchSawUnreachable ? " that i could get to" : "")
@@ -1029,7 +1167,228 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         }
         Lumen.broadcast(world.getServer(), line);
         this.fetchAnchor = null;
+        this.keepFetched = false;
         taskDone();
+    }
+
+    /**
+     * Sends Lumen to one particular container for an order - a take step that named
+     * the chest the player was looking at when they taught it.
+     */
+    private boolean startFetchAt(PlayerEntity requester, ChestFinder.Request request, BlockPos chest) {
+        LumenConfig config = Lumen.config();
+        if (!config.allowChestAccess || !(this.getWorld() instanceof ServerWorld world)) {
+            return false;
+        }
+        if (ContainerAccess.at(world, chest) == null) {
+            this.fetchSawUnreachable = false;
+            return false;
+        }
+        this.fetchQuery = request.query().isEmpty() ? "*" : request.query();
+        this.fetchWanted = Math.min(request.count(), config.maxFetchItems);
+        this.fetchRequested = request.isEverything() ? Integer.MAX_VALUE : this.fetchWanted;
+        this.fetchStacks = request.stacks();
+        this.fetchTaken = 0;
+        this.fetchSample = ItemStack.EMPTY;
+        this.fetchMinScore = ChestFinder.SUBSTRING_MATCH;
+        this.fetchSawUnreachable = false;
+        this.fetchAnchor = null;
+        this.deliverTo = requester.getUuid();
+        setOwner(requester);
+        this.triedContainers.clear();
+        this.fetchAttempts = 5; // one container, no tour
+        this.followTarget = null;
+        this.destination = null;
+        this.stuckTicks = 0;
+        if (!isReachable(chest)) {
+            this.fetchSawUnreachable = true;
+            return false;
+        }
+        this.mode = Mode.FETCH;
+        this.fetchChest = chest;
+        return true;
+    }
+
+    // -------------------------------------------------------------- deposits
+
+    /**
+     * Puts things from the pack into a container: "put the wheat in this chest".
+     *
+     * @param query        item words, or empty for everything Lumen carries
+     * @param count        how many, 0 for all
+     * @param container    the exact container, or null to find one by {@code ref}
+     * @param ref          "nearest", "with <item>", or a named place; null means nearest
+     * @return a refusal to say out loud, or null when Lumen set off
+     */
+    @Nullable
+    public String startDeposit(PlayerEntity requester, String query, int count, @Nullable BlockPos container,
+                               @Nullable String ref) {
+        LumenConfig config = Lumen.config();
+        if (!config.allowChestAccess) {
+            return "chest access is switched off in the config";
+        }
+        if (!(this.getWorld() instanceof ServerWorld world)) {
+            return "i can't do that here";
+        }
+        String q = query == null ? "" : query.trim();
+        if (countInPack(q) == 0) {
+            return q.isEmpty() ? "i'm not carrying anything to put away" : "i don't have any " + q + " on me";
+        }
+        BlockPos chest = container;
+        String where = ref == null ? "" : ref.trim().toLowerCase(Locale.ROOT);
+        if (chest == null) {
+            BlockPos center = this.getBlockPos();
+            if (!where.isEmpty() && !where.equals(SkillStep.NEAREST) && !where.startsWith(SkillStep.WITH)) {
+                LumenMemory.KnownPlace place = Lumen.memory().findPlace(where, world.getRegistryKey().getValue());
+                if (place == null) {
+                    return "i don't know where the " + where + " is";
+                }
+                center = place.pos();
+            }
+            if (where.startsWith(SkillStep.WITH)) {
+                String holding = where.substring(SkillStep.WITH.length()).trim();
+                for (ChestFinder.Match match : ChestFinder.findContainersWith(world, center, config.chestSearchRadius,
+                        holding, ChestFinder.SUBSTRING_MATCH, null, java.util.Set.of())) {
+                    if (isReachable(match.pos())) {
+                        chest = match.pos();
+                        break;
+                    }
+                }
+                if (chest == null) {
+                    return "i can't find a container with " + holding + " in it that i can get to";
+                }
+            } else {
+                chest = findNearestContainer(world, center, where.isEmpty() || where.equals(SkillStep.NEAREST)
+                        ? config.chestSearchRadius : 12.0D);
+                if (chest == null) {
+                    return "there's no container i can get to around " + (where.isEmpty() ? "here" : "the " + where);
+                }
+            }
+        } else if (ContainerAccess.at(world, chest) == null) {
+            return "there's no container at " + chest.toShortString() + " any more";
+        } else if (!isReachable(chest)) {
+            return "i can't get to the container at " + chest.toShortString();
+        }
+        this.depositQuery = q;
+        this.depositCount = Math.max(0, count);
+        this.deliverTo = requester.getUuid();
+        setOwner(requester);
+        this.fetchQuery = null;
+        this.fetchAnchor = null;
+        this.triedContainers.clear();
+        this.followTarget = null;
+        this.destination = null;
+        this.stuckTicks = 0;
+        this.mode = Mode.FETCH;
+        this.fetchChest = chest;
+        return null;
+    }
+
+    /** Beside the container: move the matching stacks across, then move on. */
+    private void depositIntoChest() {
+        BlockPos chest = this.fetchChest;
+        String query = this.depositQuery == null ? "" : this.depositQuery;
+        int wanted = this.depositCount > 0 ? this.depositCount : Integer.MAX_VALUE;
+        this.fetchChest = null;
+        this.depositQuery = null;
+        if (chest == null || !(this.getWorld() instanceof ServerWorld world)) {
+            taskDone();
+            return;
+        }
+        ContainerAccess access = ContainerAccess.at(world, chest);
+        int moved = 0;
+        int leftBehind = 0;
+        ItemStack first = ItemStack.EMPTY;
+        if (access != null) {
+            world.playSound(null, chest, SoundEvents.BLOCK_CHEST_OPEN, SoundCategory.BLOCKS, 0.6F, 1.0F);
+            SimpleInventory pack = getInventory();
+            for (int slot = 0; slot < pack.size() && moved < wanted; slot++) {
+                ItemStack stack = pack.getStack(slot);
+                if (stack.isEmpty() || (!query.isEmpty() && !ChestFinder.matches(stack, query))) {
+                    continue;
+                }
+                int give = Math.min(stack.getCount(), wanted - moved);
+                ItemStack offered = stack.copyWithCount(give);
+                ItemStack rest = access.put(offered);
+                int accepted = give - rest.getCount();
+                if (accepted <= 0) {
+                    leftBehind += stack.getCount();
+                    continue;
+                }
+                if (first.isEmpty()) {
+                    first = stack.copyWithCount(1);
+                }
+                stack.decrement(accepted);
+                if (stack.isEmpty()) {
+                    pack.setStack(slot, ItemStack.EMPTY);
+                }
+                moved += accepted;
+            }
+            access.finish();
+            pack.markDirty();
+            world.playSound(null, chest, SoundEvents.BLOCK_CHEST_CLOSE, SoundCategory.BLOCKS, 0.6F, 1.0F);
+        }
+        String what = first.isEmpty() ? (query.isEmpty() ? "things" : query) : ChestFinder.plainName(first);
+        String line = moved == 0
+                ? "the container at " + chest.toShortString() + " has no room for " + what
+                : "put " + moved + " " + what + " in the container at " + chest.toShortString()
+                        + (leftBehind > 0 ? " - it was full before i got everything in" : "");
+        Lumen.LOGGER.info("Lumen put {} item(s) matching '{}' into the container at {}", moved, query, chest.toShortString());
+        Lumen.broadcast(world.getServer(), line);
+        if (runningSkill != null) {
+            skillReport.add(line);
+        }
+        this.mode = Mode.IDLE;
+        taskDone();
+    }
+
+    /** How many items in the pack answer to the query (all of them for an empty query). */
+    private int countInPack(String query) {
+        int total = 0;
+        SimpleInventory pack = getInventory();
+        for (int slot = 0; slot < pack.size(); slot++) {
+            ItemStack stack = pack.getStack(slot);
+            if (!stack.isEmpty() && (query.isEmpty() || ChestFinder.matches(stack, query))) {
+                total += stack.getCount();
+            }
+        }
+        return total;
+    }
+
+    /** The nearest container Lumen can walk to, of any kind, within {@code radius} of {@code center}. */
+    @Nullable
+    private BlockPos findNearestContainer(ServerWorld world, BlockPos center, double radius) {
+        List<BlockPos> candidates = new ArrayList<>();
+        int reach = (int) Math.ceil(radius);
+        int height = Math.min(reach, 8);
+        for (int dx = -reach; dx <= reach; dx++) {
+            for (int dz = -reach; dz <= reach; dz++) {
+                int x = center.getX() + dx;
+                int z = center.getZ() + dz;
+                if (!world.isChunkLoaded(x >> 4, z >> 4)) {
+                    continue;
+                }
+                for (int dy = -height; dy <= height; dy++) {
+                    BlockPos pos = new BlockPos(x, center.getY() + dy, z);
+                    BlockEntity blockEntity = world.getBlockEntity(pos);
+                    if (blockEntity == null || !ContainerAccess.isSearchable(world, pos, blockEntity)) {
+                        continue;
+                    }
+                    candidates.add(pos);
+                }
+            }
+        }
+        candidates.sort(java.util.Comparator.comparingDouble(pos -> pos.getSquaredDistance(center)));
+        int tested = 0;
+        for (BlockPos pos : candidates) {
+            if (tested++ >= MAX_PATH_TESTS) {
+                break;
+            }
+            if (isReachable(pos)) {
+                return pos;
+            }
+        }
+        return null;
     }
 
     /**
@@ -1153,6 +1512,9 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
                         : "walking to " + pos.getX() + ", " + pos.getY() + ", " + pos.getZ();
             }
             case FETCH -> {
+                if (depositQuery != null) {
+                    return "going to a container to put " + (depositQuery.isEmpty() ? "things" : depositQuery) + " away";
+                }
                 return fetchQuery == null ? "standing around"
                         : "going to a nearby container to fetch " + fetchQuery;
             }
@@ -1164,8 +1526,14 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
                         : "mining " + mineQuery + " (" + minedCount + " so far)";
             }
             default -> {
-                if (currentTask instanceof LumenTask.Collect) {
+                if (collectCenter != null) {
                     return "picking up the drops";
+                }
+                if (waitTicks > 0) {
+                    return "waiting" + (runningSkill == null ? "" : " (part of " + runningSkill.name + ")");
+                }
+                if (runningSkill != null && skillStep != null) {
+                    return runningSkill.name + ": " + skillStep.describe();
                 }
                 return "standing around";
             }
@@ -1778,21 +2146,59 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
                 BlockPos pos = item.pos();
                 if (!world.isChunkLoaded(pos.getX() >> 4, pos.getZ() >> 4)) {
                     workSkipped++;
+                    workGone++;
                     continue;
                 }
                 BlockState state = world.getBlockState(pos);
                 if (state.isAir() || state.hasBlockEntity()) {
+                    // Already gone: the other half of a plant that was harvested, say.
+                    if (item.stairs() && state.isAir()) {
+                        continue; // a step that is already open is fine
+                    }
                     workSkipped++;
+                    workGone++;
+                    continue;
+                }
+                if (workSpec != null && !BlockStates.matches(workSpec, world, pos, state)) {
+                    // No longer ripe, or reset by a click on its neighbour. Not a failure,
+                    // and clicking it again would only make the count look bad.
+                    workSkipped++;
+                    workGone++;
                     continue;
                 }
                 if (!item.interact()) {
-                    if (!MineFinder.isMineable(world, state, pos) || touchesFluid(world, pos)) {
+                    if (!MineFinder.isMineable(world, state, pos) || touchesFluid(world, pos) || wouldDropLumen(pos)) {
                         workSkipped++;
+                        workUnsafe++;
+                        if (item.stairs()) {
+                            // The steps after this one would be dug from mid-air, or into
+                            // whatever is behind it. Stop the stairs here and say why.
+                            this.work.clear();
+                            this.lastTaskNote = touchesFluid(world, pos)
+                                    ? "there's " + (nearLava(world, pos) ? "lava" : "water") + " at y " + pos.getY()
+                                            + " - i'm stopping the stairs here"
+                                    : "i can't dig any further at y " + pos.getY();
+                            return false;
+                        }
                         continue;
                     }
                 }
                 if (findApproach(pos) == null && !canStandAt(pos.up())) {
                     workSkipped++;
+                    workUnreachable++;
+                    if (firstUnreachable == null) {
+                        firstUnreachable = pos;
+                    }
+                    continue;
+                }
+                if (!isReachable(pos)) {
+                    // A real path test, so the block downstairs is skipped rather than
+                    // walked at for two minutes.
+                    workSkipped++;
+                    workUnreachable++;
+                    if (firstUnreachable == null) {
+                        firstUnreachable = pos;
+                    }
                     continue;
                 }
                 this.currentWork = item;
@@ -1805,7 +2211,12 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         if (mineQuery == null) {
             return false;
         }
-        BlockPos next = MineFinder.findNearest(world, this, mineAnchor != null ? mineAnchor : this.getBlockPos(),
+        // Never the floor: mining the block under its own feet is how Lumen dug a one
+        // wide shaft straight down into lava. Those two are ruled out before the search.
+        BlockPos feet = this.getBlockPos();
+        minedPositions.add(feet.down());
+        minedPositions.add(feet.down(2));
+        BlockPos next = MineFinder.findNearest(world, this, mineAnchor != null ? mineAnchor : feet,
                 mineQuery, config.miningRadius, config.miningHeight, minedPositions);
         if (next == null) {
             return false;
@@ -1813,6 +2224,57 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         this.mode = Mode.MINE;
         this.mineTarget = next;
         return true;
+    }
+
+    /**
+     * Breaking {@code pos} would drop Lumen more than one block: it is the block under
+     * Lumen's feet and there is nothing solid under that. One block down is a step; two
+     * or more is a shaft, and a shaft ends in a cave or lava.
+     */
+    private boolean wouldDropLumen(BlockPos pos) {
+        BlockPos feet = this.getBlockPos();
+        if (!pos.equals(feet.down())) {
+            return false;
+        }
+        BlockPos below = feet.down(2);
+        BlockState state = this.getWorld().getBlockState(below);
+        return state.getCollisionShape(this.getWorld(), below).isEmpty() || !state.getFluidState().isEmpty();
+    }
+
+    private static boolean nearLava(ServerWorld world, BlockPos pos) {
+        for (Direction side : Direction.values()) {
+            if (world.getFluidState(pos.offset(side)).isIn(net.minecraft.registry.tag.FluidTags.LAVA)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The mine goal found no route to the current block. On a list job that block is
+     * skipped and the next one tried; on a plain mine the errand ends as before.
+     */
+    public void skipCurrentWork() {
+        if (workLabel == null || !(this.getWorld() instanceof ServerWorld world)) {
+            finishMining();
+            return;
+        }
+        if (mineTarget != null) {
+            minedPositions.add(mineTarget);
+            if (firstUnreachable == null) {
+                firstUnreachable = mineTarget;
+            }
+        }
+        this.mineTarget = null;
+        this.workSkipped++;
+        this.workUnreachable++;
+        if (currentWork != null && currentWork.stairs()) {
+            this.work.clear();
+            this.lastTaskNote = "i can't get to the next step of the stairs";
+        }
+        if (!targetNextBlock(world) || !canHarvest(this.mineTarget)) {
+            finishMining();
+        }
     }
 
     /** A block with lava or water against it is left alone: breaking it lets the fluid in. */
@@ -1956,6 +2418,10 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         }
         this.getLookControl().lookAt(Vec3d.ofCenter(target));
         BlockHitResult hit = new BlockHitResult(Vec3d.ofCenter(target), Direction.UP, target, false);
+        // Some mods hand the harvest to the clicking player instead of dropping it. The
+        // click is made as the player, so anything that appears in their inventory
+        // during it is Lumen's harvest and is taken back.
+        Map<Item, Integer> before = countItems(requester);
         ActionResult result;
         try {
             result = state.onUse(world, requester, Hand.MAIN_HAND, hit);
@@ -1963,15 +2429,57 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
             Lumen.LOGGER.warn("Using {} at {} threw {}", BlockStates.id(state), target.toShortString(), e.toString());
             result = ActionResult.FAIL;
         }
+        int reclaimed = reclaimGained(requester, before);
+        this.workCollected += reclaimed;
         this.swingHand(Hand.MAIN_HAND);
-        Lumen.LOGGER.info("Lumen used {} at {} as {}: {}", BlockStates.describe(state), target.toShortString(),
-                requester.getName().getString(), result);
-        if (result.isAccepted()) {
+        Lumen.LOGGER.info("Lumen used {} at {} as {}: {}{}", BlockStates.describe(state), target.toShortString(),
+                requester.getName().getString(), result, reclaimed > 0 ? " (took back " + reclaimed + " item(s))" : "");
+        if (result.isAccepted() || reclaimed > 0) {
             this.workDone++;
         } else {
             this.workSkipped++;
+            this.workGone++;
         }
         return continueOrFinish(world);
+    }
+
+    private static Map<Item, Integer> countItems(PlayerEntity player) {
+        Map<Item, Integer> counts = new HashMap<>();
+        for (int slot = 0; slot < player.getInventory().size(); slot++) {
+            ItemStack stack = player.getInventory().getStack(slot);
+            if (!stack.isEmpty()) {
+                counts.merge(stack.getItem(), stack.getCount(), Integer::sum);
+            }
+        }
+        return counts;
+    }
+
+    /** Moves whatever the player gained since {@code before} into Lumen's delivery. */
+    private int reclaimGained(PlayerEntity player, Map<Item, Integer> before) {
+        Map<Item, Integer> after = countItems(player);
+        int reclaimed = 0;
+        for (Map.Entry<Item, Integer> entry : after.entrySet()) {
+            int gained = entry.getValue() - before.getOrDefault(entry.getKey(), 0);
+            if (gained <= 0) {
+                continue;
+            }
+            for (int slot = player.getInventory().size() - 1; slot >= 0 && gained > 0; slot--) {
+                ItemStack stack = player.getInventory().getStack(slot);
+                if (stack.isEmpty() || stack.getItem() != entry.getKey()) {
+                    continue;
+                }
+                ItemStack taken = player.getInventory().removeStack(slot, Math.min(gained, stack.getCount()));
+                if (!taken.isEmpty()) {
+                    gained -= taken.getCount();
+                    reclaimed += taken.getCount();
+                    pendingDelivery.add(taken);
+                }
+            }
+        }
+        if (reclaimed > 0) {
+            player.getInventory().markDirty();
+        }
+        return reclaimed;
     }
 
     private String continueOrFinish(ServerWorld world) {
@@ -1997,12 +2505,30 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
             boolean collect = workCollect && done > 0;
             BlockPos center = workCenter == null ? this.getBlockPos() : workCenter;
             UUID requester = deliverTo;
+            String reasons = describeSkips();
+            String levelNote = levelNote(label);
+            String stopped = lastTaskNote;
+            int collected = workCollected;
             clearWork();
-            Lumen.broadcast(this.getWorld().getServer(), done == 0
-                    ? "couldn't do any of the " + label + (skipped > 0 ? " - " + skipped + " weren't worth it or i couldn't reach them" : "")
-                    : label + " done - " + done + " block" + (done == 1 ? "" : "s")
-                            + (skipped > 0 ? ", skipped " + skipped : "")
-                            + (collect ? ", grabbing the drops" : ""));
+            String line;
+            if (done == 0) {
+                line = levelNote != null ? levelNote
+                        : "couldn't do any of the " + label + (reasons.isEmpty() ? "" : " - " + reasons);
+            } else {
+                line = label + " done - " + done + " block" + (done == 1 ? "" : "s")
+                        + (reasons.isEmpty() ? "" : ", skipped " + reasons)
+                        + (collected > 0 ? ", " + collected + " item" + (collected == 1 ? "" : "s") + " in hand" : "")
+                        + (collect ? ", grabbing the drops" : "")
+                        + (levelNote != null ? ". " + levelNote : "");
+            }
+            if (stopped != null && !stopped.isEmpty() && (label.startsWith("stairs") || label.equals("quarry"))) {
+                line = line + ". " + stopped;
+                this.lastTaskNote = "";
+            }
+            Lumen.broadcast(this.getWorld().getServer(), line);
+            if (runningSkill != null) {
+                skillReport.add(line);
+            }
             if (collect && requester != null) {
                 taskQueue.addFirst(new LumenTask.Collect(requester, center, 10.0D));
             }
@@ -2010,30 +2536,341 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         taskDone();
     }
 
+    /** "3 i couldn't reach, 2 not ripe any more, 1 next to water". */
+    private String describeSkips() {
+        List<String> parts = new ArrayList<>();
+        if (workUnreachable > 0) {
+            parts.add(workUnreachable + " i couldn't reach");
+        }
+        if (workGone > 0) {
+            parts.add(workGone + (workSpec != null ? " not ripe or already done" : " already gone"));
+        }
+        if (workUnsafe > 0) {
+            parts.add(workUnsafe + " next to water, lava or a drop");
+        }
+        int other = workSkipped - workUnreachable - workGone - workUnsafe;
+        if (other > 0) {
+            parts.add(other + " skipped");
+        }
+        return String.join(", ", parts);
+    }
+
+    /**
+     * When everything reachable was on another floor: say so, and by how much. The
+     * pathfinder cannot say "take the stairs", but Lumen can say which way they need to go.
+     */
+    @Nullable
+    private String levelNote(String label) {
+        if (workUnreachable == 0 || firstUnreachable == null || workDone > 0) {
+            return null;
+        }
+        int dy = firstUnreachable.getY() - this.getBlockPos().getY();
+        if (Math.abs(dy) < 2) {
+            return null;
+        }
+        return "i can't find a way " + (dy < 0 ? "down" : "up") + " to the " + label + " - "
+                + (workUnreachable == 1 ? "it's " : "they're ") + Math.abs(dy) + " blocks "
+                + (dy < 0 ? "below" : "above") + " me. if there are stairs or a door, walk me there and ask again";
+    }
+
     // -------------------------------------------------------------- skills
 
     /**
-     * Runs a taught skill: finds every block its target matches within its radius, keeps
-     * the reachable ones, and works them one by one through the mine goal - breaking or
-     * right-clicking as the skill says.
+     * Runs a taught skill: its steps in order, each one through the machinery that
+     * already exists for it - the mine goal for clicks and breaks, the fetch goal for
+     * taking and putting, the go-to goal for walking. The Harvest task stays current
+     * until the last step is done, and {@link #taskDone()} moves to the next step.
+     *
+     * @param count caps the first block step or take step: "harvest 10 hops". 0 means all
+     * @return a refusal to say out loud, or null when Lumen set off
+     */
+    @Nullable
+    public String startSkill(PlayerEntity requester, LumenSkill skill, @Nullable BlockPos anchor,
+                             @Nullable String anchorName, int count) {
+        LumenConfig config = Lumen.config();
+        if (!(this.getWorld() instanceof ServerWorld)) {
+            return "i can't do that here";
+        }
+        List<SkillStep> steps = skill.steps();
+        if (steps.isEmpty()) {
+            return "the skill " + skill.name + " has no steps - teach it again";
+        }
+        clearSkillRun();
+        this.deliverTo = requester.getUuid();
+        setOwner(requester);
+        this.runningSkill = skill;
+        this.skillAnchor = anchor;
+        this.skillCount = Math.max(0, count);
+        int limit = Math.max(1, config.maxSkillSteps);
+        for (SkillStep step : steps) {
+            if (skillSteps.size() >= limit) {
+                break;
+            }
+            skillSteps.addLast(step);
+        }
+        Lumen.skills().noteUse(skill);
+        // The first step starts now; a step that cannot start refuses the whole skill,
+        // so the player hears why instead of a silent stand-still.
+        String refusal = runNextStep();
+        if (refusal != null) {
+            clearSkillRun();
+            return refusal;
+        }
+        if (skillStep == null) {
+            // Every step was instant (a "say", a "hold"): the skill is already over.
+            taskDone();
+        }
+        return null;
+    }
+
+    /**
+     * Starts steps until one is running, or the skill is finished.
+     *
+     * @return a refusal when the next step could not start, null otherwise
+     */
+    @Nullable
+    private String runNextStep() {
+        PlayerEntity requester = deliverTo == null ? null : this.getWorld().getPlayerByUuid(deliverTo);
+        while (!skillSteps.isEmpty()) {
+            SkillStep step = skillSteps.pollFirst();
+            this.skillStep = step;
+            if (requester == null) {
+                return "whoever asked has gone";
+            }
+            StepStart start = startStep(requester, step);
+            if (start.refusal != null) {
+                return start.refusal;
+            }
+            skillStepsDone++;
+            if (start.running) {
+                return null;
+            }
+        }
+        this.skillStep = null;
+        return null;
+    }
+
+    private record StepStart(boolean running, @Nullable String refusal) {
+        static final StepStart DONE = new StepStart(false, null);
+        static final StepStart RUNNING = new StepStart(true, null);
+
+        static StepStart refuse(String why) {
+            return new StepStart(false, why);
+        }
+    }
+
+    /** Called from taskDone when a step's work ends. True when another step is now running. */
+    private boolean advanceSkill() {
+        String refusal = runNextStep();
+        if (refusal != null) {
+            Lumen.broadcast(this.getWorld().getServer(), "stopping " + runningSkill.name + " - " + refusal);
+            clearSkillRun();
+            clearErrandFields();
+            return false;
+        }
+        if (skillStep != null) {
+            return true;
+        }
+        finishSkill();
+        return false;
+    }
+
+    private void finishSkill() {
+        LumenSkill skill = this.runningSkill;
+        List<String> report = new ArrayList<>(skillReport);
+        clearSkillRun();
+        if (skill == null) {
+            return;
+        }
+        this.mode = Mode.IDLE;
+        String carrying = pendingDelivery.isEmpty() ? "" : " - bringing you " + describePending();
+        Lumen.broadcast(this.getWorld().getServer(), skill.name + " done" + carrying);
+        Lumen.LOGGER.info("Skill '{}' finished: {}", skill.name, String.join("; ", report));
+    }
+
+    /** Puts one step into motion. */
+    private StepStart startStep(PlayerEntity requester, SkillStep step) {
+        LumenConfig config = Lumen.config();
+        if (!(this.getWorld() instanceof ServerWorld world)) {
+            return StepStart.refuse("i can't do that here");
+        }
+        String kind = step.kind == null ? "" : step.kind;
+        switch (kind) {
+            case SkillStep.RIGHT_CLICK, SkillStep.BREAK -> {
+                int cap = step.count > 0 ? step.count : skillCount > 0 && step == runningSkill.firstBlockStep()
+                        ? skillCount : config.maxSkillBlocks;
+                String refusal = startBlockWork(requester, step, cap);
+                return refusal == null ? StepStart.RUNNING : StepStart.refuse(refusal);
+            }
+            case SkillStep.TAKE -> {
+                boolean everything = "*".equals(step.item) || step.item.isEmpty();
+                int count = step.count > 0 ? step.count : skillCount > 0 ? skillCount : config.defaultFetchCount;
+                ChestFinder.Request request = everything
+                        ? new ChestFinder.Request(Integer.MAX_VALUE, 0.0D, "*", true)
+                        : new ChestFinder.Request(count, 0.0D, step.item, step.count > 0 || skillCount > 0);
+                this.keepFetched = true;
+                boolean started;
+                if (step.hasPos()) {
+                    started = startFetchAt(requester, request, new BlockPos(step.pos[0], step.pos[1], step.pos[2]));
+                } else if (everything) {
+                    return StepStart.refuse("i can only take everything out of a chest you showed me while teaching");
+                } else {
+                    BlockPos anchor = skillAnchor;
+                    String ref = step.target == null ? "" : step.target;
+                    if (!ref.isEmpty() && !ref.equals(SkillStep.NEAREST) && !ref.startsWith(SkillStep.WITH)) {
+                        LumenMemory.KnownPlace place = Lumen.memory().findPlace(ref, world.getRegistryKey().getValue());
+                        if (place != null) {
+                            anchor = place.pos();
+                        }
+                    }
+                    started = startFetch(requester, request, anchor);
+                }
+                if (!started) {
+                    this.keepFetched = false;
+                    return StepStart.refuse(fetchSawUnreachable
+                            ? "i can see " + (everything ? "the chest" : "some " + step.item) + " but i can't get to it"
+                            : "i can't find any " + step.item + " to take");
+                }
+                return StepStart.RUNNING;
+            }
+            case SkillStep.PUT -> {
+                int count = step.count > 0 ? step.count : 0;
+                String refusal = startDeposit(requester, step.item, count,
+                        step.hasPos() ? new BlockPos(step.pos[0], step.pos[1], step.pos[2]) : null, step.target);
+                return refusal == null ? StepStart.RUNNING : StepStart.refuse(refusal);
+            }
+            case SkillStep.WALK_TO -> {
+                BlockPos where = null;
+                if (step.hasPos()) {
+                    where = new BlockPos(step.pos[0], step.pos[1], step.pos[2]);
+                } else if (!step.target.isEmpty()) {
+                    LumenMemory.KnownPlace place = Lumen.memory().findPlace(step.target, world.getRegistryKey().getValue());
+                    if (place != null) {
+                        where = place.pos();
+                    } else if (step.target.equals(SkillStep.NEAREST)) {
+                        where = findNearestContainer(world, this.getBlockPos(), config.chestSearchRadius);
+                    } else if (step.target.startsWith(SkillStep.WITH)) {
+                        String holding = step.target.substring(SkillStep.WITH.length()).trim();
+                        for (ChestFinder.Match match : ChestFinder.findContainersWith(world, this.getBlockPos(),
+                                config.chestSearchRadius, holding, ChestFinder.SUBSTRING_MATCH, null, java.util.Set.of())) {
+                            if (isReachable(match.pos())) {
+                                where = match.pos();
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (where == null) {
+                    return StepStart.refuse("i don't know where " + (step.target.isEmpty() ? "that" : "the " + step.target) + " is");
+                }
+                BlockPos goal = canStandAt(where) ? where : findApproach(where);
+                if (goal == null) {
+                    return StepStart.refuse("there's nowhere to stand at " + where.toShortString());
+                }
+                if (this.getBlockPos().isWithinDistance(goal, 2.0D)) {
+                    return StepStart.DONE;
+                }
+                goTo(goal);
+                return StepStart.RUNNING;
+            }
+            case SkillStep.EQUIP -> {
+                if (!equipFromPack(step.item)) {
+                    Lumen.broadcast(world.getServer(), "i don't have a " + step.item + " to hold, carrying on without");
+                }
+                return StepStart.DONE;
+            }
+            case SkillStep.WAIT -> {
+                this.waitTicks = Math.max(20, step.count * 20);
+                this.mode = Mode.IDLE;
+                this.getNavigation().stop();
+                return StepStart.RUNNING;
+            }
+            case SkillStep.SAY -> {
+                if (!step.item.isEmpty()) {
+                    Lumen.broadcast(world.getServer(), step.item);
+                }
+                return StepStart.DONE;
+            }
+            case SkillStep.COLLECT -> {
+                beginCollect(workCenter != null ? workCenter : this.getBlockPos(), 10.0D);
+                return StepStart.RUNNING;
+            }
+            case SkillStep.RETURN -> {
+                this.skillReturning = true;
+                followPlayer(requester);
+                return StepStart.RUNNING;
+            }
+            default -> {
+                return StepStart.refuse("i don't know how to " + kind);
+            }
+        }
+    }
+
+    /** Stands still picking up drops around {@code center} until none are left or time runs out. */
+    private void beginCollect(BlockPos center, double radius) {
+        this.collectCenter = center;
+        this.collectRadius = radius;
+        this.collectTicks = 0;
+        this.mode = Mode.IDLE; // the pick-up goal only runs while idle
+        this.getNavigation().stop();
+    }
+
+    /** Puts the first pack item matching {@code query} in the main hand, swapping what was there. */
+    private boolean equipFromPack(String query) {
+        if (query == null || query.isBlank()) {
+            return false;
+        }
+        SimpleInventory pack = getInventory();
+        int bestSlot = -1;
+        int bestScore = 0;
+        for (int slot = 0; slot < pack.size(); slot++) {
+            ItemStack stack = pack.getStack(slot);
+            if (stack.isEmpty()) {
+                continue;
+            }
+            int score = ChestFinder.matchScore(stack, query);
+            if (score > bestScore) {
+                bestScore = score;
+                bestSlot = slot;
+            }
+        }
+        if (bestSlot < 0) {
+            return false;
+        }
+        ItemStack chosen = pack.removeStack(bestSlot);
+        ItemStack held = this.getMainHandStack();
+        this.equipStack(EquipmentSlot.MAINHAND, chosen);
+        if (!held.isEmpty()) {
+            ItemStack leftover = pack.addStack(held);
+            if (!leftover.isEmpty()) {
+                dropAndIgnore(leftover);
+            }
+        }
+        return true;
+    }
+
+    /**
+     * A click or break step: finds every block the step's target matches within the
+     * skill's radius and works them one by one through the mine goal.
      *
      * @return a refusal to say out loud, or null when Lumen set off
      */
     @Nullable
-    public String startSkill(PlayerEntity requester, LumenSkill skill, @Nullable BlockPos anchor, @Nullable String anchorName) {
+    private String startBlockWork(PlayerEntity requester, SkillStep step, int cap) {
         LumenConfig config = Lumen.config();
-        if (skill.isInteract() && !config.allowInteract) {
+        boolean interact = SkillStep.RIGHT_CLICK.equals(step.kind);
+        if (interact && !config.allowInteract) {
             return "using blocks is switched off in the config";
         }
-        if (!skill.isInteract() && !config.allowMining) {
+        if (!interact && !config.allowMining) {
             return "mining is switched off";
         }
         if (!(this.getWorld() instanceof ServerWorld world)) {
             return "i can't do that here";
         }
-        BlockMatcher.Spec spec = BlockMatcher.parse(skill.target);
-        BlockPos center = anchor != null ? anchor : this.getBlockPos();
-        int radius = Math.max(2, Math.min(32, skill.radius));
+        BlockMatcher.Spec spec = BlockMatcher.parse(step.target);
+        BlockPos center = skillAnchor != null ? skillAnchor : this.getBlockPos();
+        int radius = Math.max(2, Math.min(32, runningSkill == null ? 12 : runningSkill.radius));
         int height = Math.min(radius, 8);
         List<BlockPos> found = new ArrayList<>();
         BlockPos.Mutable cursor = new BlockPos.Mutable();
@@ -2053,7 +2890,7 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
                     if (!BlockStates.matches(spec, world, cursor, state)) {
                         continue;
                     }
-                    if (!skill.isInteract() && !MineFinder.isMineable(world, state, cursor)) {
+                    if (!interact && !MineFinder.isMineable(world, state, cursor)) {
                         continue;
                     }
                     found.add(cursor.toImmutable());
@@ -2061,9 +2898,75 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
             }
         }
         if (found.isEmpty()) {
-            return "i can't see any " + skill.target + (anchorName == null ? " around here" : " at the " + anchorName);
+            return "i can't see any " + step.target + " within " + radius + " blocks";
         }
         found.sort(java.util.Comparator.comparingDouble(pos -> pos.getSquaredDistance(center)));
+        this.mineQuery = null;
+        this.mineAnchor = null;
+        this.minedCount = 0;
+        this.minedPositions.clear();
+        this.followTarget = null;
+        this.destination = null;
+        this.stuckTicks = 0;
+        clearWork();
+        int limit = Math.max(1, Math.min(cap, config.maxSkillBlocks));
+        for (BlockPos pos : found) {
+            if (work.size() >= limit) {
+                break;
+            }
+            work.addLast(new WorkItem(pos, interact));
+        }
+        this.workLabel = runningSkill == null ? step.describe() : runningSkill.name;
+        this.workSpec = spec;
+        this.workCollect = false; // collecting is its own step now
+        this.workCenter = center;
+        if (!targetNextBlock(world)) {
+            String note = levelNote(workLabel);
+            clearWork();
+            return note != null ? note : "i can see the " + step.target + " but i can't get to any of it";
+        }
+        if (!interact && !canHarvest(this.mineTarget)) {
+            clearWork();
+            this.mineTarget = null;
+            this.mode = Mode.IDLE;
+            return this.getMainHandStack().isEmpty()
+                    ? "i'd need a tool for that - put one in my pack"
+                    : "what i'm holding won't break that";
+        }
+        return null;
+    }
+
+    // -------------------------------------------------------------- descend
+
+    /**
+     * "Go down to level 2": digs a one-wide staircase in the direction Lumen is facing,
+     * one block down per block forward, so there is a walkable way back up and nothing
+     * is ever dug from directly underfoot.
+     *
+     * @return a refusal to say out loud, or null when Lumen set off
+     */
+    @Nullable
+    public String startDescend(PlayerEntity requester, int targetY) {
+        LumenConfig config = Lumen.config();
+        if (!config.allowMining) {
+            return "mining is switched off";
+        }
+        if (!(this.getWorld() instanceof ServerWorld world)) {
+            return "i can't do that here";
+        }
+        BlockPos feet = this.getBlockPos();
+        int target = Math.max(world.getBottomY() + 2, targetY);
+        if (target >= feet.getY()) {
+            return target == feet.getY() ? "i'm already at y " + feet.getY()
+                    : "y " + target + " is above me - i'm at " + feet.getY() + ". walk me up there instead";
+        }
+        int descent = feet.getY() - target;
+        if (descent > config.maxQuarryDescent) {
+            return "that's " + descent + " blocks down; i'll dig down " + config.maxQuarryDescent + " at most";
+        }
+        Direction facing = this.getHorizontalFacing();
+        List<int[]> plan = QuarryPlanner.staircase(feet.getX(), feet.getY(), feet.getZ(), target,
+                facing.getOffsetX(), facing.getOffsetZ());
         this.deliverTo = requester.getUuid();
         setOwner(requester);
         this.mineQuery = null;
@@ -2074,29 +2977,28 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         this.destination = null;
         this.stuckTicks = 0;
         clearWork();
-        int cap = Math.max(1, config.maxSkillBlocks);
-        for (BlockPos pos : found) {
-            if (work.size() >= cap) {
-                break;
-            }
-            work.addLast(new WorkItem(pos, skill.isInteract()));
+        for (int[] p : plan) {
+            work.addLast(new WorkItem(new BlockPos(p[0], p[1], p[2]), false, true));
         }
-        this.workLabel = skill.name;
-        this.workCollect = skill.collect;
-        this.workCenter = center;
+        this.workLabel = "stairs down to y " + target;
+        this.workCollect = false;
+        this.workCenter = feet;
+        this.lastTaskNote = "";
         if (!targetNextBlock(world)) {
+            String why = lastTaskNote;
             clearWork();
-            return "i can see the " + skill.target + " but i can't get to any of it";
+            return why == null || why.isEmpty() ? "i can't dig down from here" : why;
         }
-        if (!skill.isInteract() && !canHarvest(this.mineTarget)) {
+        if (!canHarvest(this.mineTarget)) {
             clearWork();
             this.mineTarget = null;
             this.mode = Mode.IDLE;
             return this.getMainHandStack().isEmpty()
-                    ? "i'd need a tool for that - put one in my pack"
+                    ? "i'd need a pickaxe for that - put one in my pack"
                     : "what i'm holding won't break that";
         }
-        Lumen.skills().noteUse(skill);
+        Lumen.LOGGER.info("Lumen digs stairs from y {} to y {} heading {} for {}", feet.getY(), target, facing,
+                requester.getName().getString());
         return null;
     }
 
@@ -2145,6 +3047,7 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
             int dz = dx == 0 ? Integer.compare(centerZ, feet.getZ()) : 0;
             plan.addAll(QuarryPlanner.staircase(feet.getX(), feet.getY(), feet.getZ(), clamped.maxY() + 1, dx, dz));
         }
+        int stairSteps = plan.size();
         plan.addAll(QuarryPlanner.order(clamped, feet.getX(), feet.getZ()));
         this.deliverTo = requester.getUuid();
         setOwner(requester);
@@ -2156,15 +3059,18 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         this.destination = null;
         this.stuckTicks = 0;
         clearWork();
+        int index = 0;
         for (int[] p : plan) {
-            work.addLast(new WorkItem(new BlockPos(p[0], p[1], p[2]), false));
+            work.addLast(new WorkItem(new BlockPos(p[0], p[1], p[2]), false, index++ < stairSteps));
         }
         this.workLabel = "quarry";
+        this.lastTaskNote = "";
         this.workCollect = false; // drops are banked straight into the delivery
         this.workCenter = new BlockPos((clamped.minX() + clamped.maxX()) / 2, clamped.maxY(), (clamped.minZ() + clamped.maxZ()) / 2);
         if (!targetNextBlock(world)) {
+            String why = lastTaskNote;
             clearWork();
-            return "there's nothing in that area i can break";
+            return why == null || why.isEmpty() ? "there's nothing in that area i can break" : why;
         }
         if (!canHarvest(this.mineTarget)) {
             clearWork();
@@ -2709,26 +3615,32 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
         } else if (mode == Mode.GO_TO && destination != null
                 && this.getBlockPos().isWithinDistance(destination, 2.0D)) {
             arrived();
-        } else if (mode == Mode.FOLLOW && currentTask instanceof LumenTask.Return) {
+        } else if (mode == Mode.FOLLOW && (currentTask instanceof LumenTask.Return || skillReturning)) {
             PlayerEntity target = getFollowTarget();
             double reach = Lumen.config().followStartDistance;
             if (target != null && this.squaredDistanceTo(target) <= reach * reach) {
+                this.skillReturning = false;
                 taskDone();
             }
+        }
+        if (waitTicks > 0 && --waitTicks == 0) {
+            taskDone();
         }
         // Let go the instant the fight is over, rather than carrying aggro onward.
         LivingEntity currentTarget = this.getTarget();
         if (currentTarget != null && (!currentTarget.isAlive() || currentTarget instanceof PlayerEntity)) {
             this.setTarget(null);
         }
-        if (currentTask instanceof LumenTask.Collect collect) {
+        if (collectCenter != null) {
             // Stay until the drops are picked up, or long enough that they are not coming.
             boolean anyLeft = !this.getWorld().getEntitiesByClass(ItemEntity.class,
-                    new Box(collect.center()).expand(collect.radius()), this::wantsToPickUp).isEmpty();
+                    new Box(collectCenter).expand(collectRadius), this::wantsToPickUp).isEmpty();
             if (!anyLeft || ++this.collectTicks > 20 * 15) {
+                this.collectCenter = null;
                 taskDone();
             }
         }
+        escapeWater();
         updateStuckState();
         updateSurvival();
         handleFenceGates();
@@ -2742,6 +3654,54 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
             this.equipCooldown = 40;
             equipBetterGear();
         }
+    }
+
+    /**
+     * Out of the pond. Vanilla mobs cannot climb a two-deep bank, and the pathfinder
+     * refuses to plan from inside water, so a swim that goes nowhere ends with a short
+     * hop to the nearest dry block instead of a slow drowning.
+     */
+    private void escapeWater() {
+        if (!this.isTouchingWater() || this.isOnGround()) {
+            this.wetTicks = 0;
+            return;
+        }
+        this.wetTicks++;
+        if (this.wetTicks < 80 || this.wetTicks % 20 != 0) {
+            return;
+        }
+        BlockPos dry = findDryLand(6);
+        if (dry != null) {
+            Lumen.LOGGER.info("Lumen has been in water for {} ticks, climbing out to {}", wetTicks, dry.toShortString());
+            this.getNavigation().stop();
+            this.refreshPositionAndAngles(dry.getX() + 0.5D, dry.getY(), dry.getZ() + 0.5D, this.getYaw(), this.getPitch());
+            this.wetTicks = 0;
+        }
+    }
+
+    @Nullable
+    private BlockPos findDryLand(int radius) {
+        BlockPos feet = this.getBlockPos();
+        BlockPos best = null;
+        double bestDistance = Double.MAX_VALUE;
+        World world = this.getWorld();
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dz = -radius; dz <= radius; dz++) {
+                for (int dy = -2; dy <= 3; dy++) {
+                    BlockPos candidate = feet.add(dx, dy, dz);
+                    if (!canStandAt(candidate) || !world.getFluidState(candidate).isEmpty()
+                            || !world.getFluidState(candidate.down()).isEmpty()) {
+                        continue;
+                    }
+                    double distance = candidate.getSquaredDistance(feet);
+                    if (distance < bestDistance) {
+                        bestDistance = distance;
+                        best = candidate;
+                    }
+                }
+            }
+        }
+        return best;
     }
 
     /** Reached a go-to destination: note the visit if it was a named place, then move on. */
@@ -2779,7 +3739,13 @@ public class LumenEntity extends PathAwareEntity implements NamedScreenHandlerFa
 
     /** Called by the go-to goal when there is no route and no warp either. */
     public void goToFailed() {
-        if (currentTask instanceof LumenTask.GoTo go) {
+        if (runningSkill != null && skillStep != null) {
+            Lumen.broadcast(this.getWorld().getServer(), "stopping " + runningSkill.name + " - i can't find a way to "
+                    + (skillStep.hasPos() ? skillStep.pos[0] + ", " + skillStep.pos[1] + ", " + skillStep.pos[2] : "the " + skillStep.target));
+            clearSkillRun();
+            clearErrandFields();
+            taskDone();
+        } else if (currentTask instanceof LumenTask.GoTo go) {
             Lumen.broadcast(this.getWorld().getServer(), "i can't find a way to " + go.describe().replaceFirst("^go to ", ""));
             taskDone();
         } else {
