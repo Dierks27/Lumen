@@ -241,7 +241,7 @@ public final class CraftPlanner {
                         continue;
                     }
                     if (!takeFromPack(ingredient, pack, remainders)) {
-                        return ItemStack.EMPTY;
+                        return made;
                     }
                 }
                 ItemStack out = step.recipe().getOutput(registries).copy();
