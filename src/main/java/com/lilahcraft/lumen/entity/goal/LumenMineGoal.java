@@ -95,7 +95,8 @@ public class LumenMineGoal extends Goal {
 
         lumen.getNavigation().stop();
         if (requiredTicks <= 0) {
-            this.requiredTicks = ticksToBreak();
+            // A right-click takes a moment, not a cracking animation.
+            this.requiredTicks = lumen.currentWorkIsInteract() ? 8 : ticksToBreak();
             if (this.requiredTicks < 0) {
                 Lumen.broadcast(lumen.getWorld().getServer(), "i can't break that at all");
                 lumen.finishMining();
@@ -103,7 +104,9 @@ public class LumenMineGoal extends Goal {
             }
         }
         this.progressTicks++;
-        showBreakingOverlay();
+        if (!lumen.currentWorkIsInteract()) {
+            showBreakingOverlay();
+        }
 
         if (this.progressTicks >= this.requiredTicks) {
             resetProgress();

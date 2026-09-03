@@ -2,13 +2,24 @@ package com.lilahcraft.lumen.brain;
 
 import com.lilahcraft.lumen.Lumen;
 import com.lilahcraft.lumen.LumenConfig;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonParser;
+import com.lilahcraft.lumen.entity.BlockStates;
 import com.lilahcraft.lumen.entity.ChestFinder;
+import com.lilahcraft.lumen.entity.LumenWand;
+import com.lilahcraft.lumen.entity.QuarryPlanner;
+import com.lilahcraft.lumen.skill.LumenSkill;
+import com.lilahcraft.lumen.skill.SkillTeacher;
 import com.lilahcraft.lumen.entity.LumenEntity;
 import com.lilahcraft.lumen.entity.LumenTask;
 import com.lilahcraft.lumen.memory.LumenMemory;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.server.world.ServerWorld;
+import net.minecraft.block.BlockState;
+import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
 import org.jetbrains.annotations.Nullable;
 
@@ -38,6 +49,10 @@ public final class LumenBrain {
 
     private volatile CommandTrace lastTrace;
     private volatile String lastRawContent;
+
+    /** Player messages since the conversation was last summarised into notes. */
+    private int messagesSinceSummary;
+    private final AtomicBoolean summarising = new AtomicBoolean(false);
 
     public synchronized void reset() {
         history.clear();
@@ -140,6 +155,7 @@ public final class LumenBrain {
         // and survives a failed request.
         remember(config, ChatMessage.user(line));
         List<ChatMessage> messages = buildMessages(config, lumen, senderName, text);
+        maybeSummarise(config);
 
         client(config).complete(config, messages)
                 .whenComplete((content, error) -> server.execute(() -> {
@@ -411,13 +427,23 @@ public final class LumenBrain {
                                 where.place() == null ? null : where.place().name)),
                         "on it - " + wanted, "fetching " + wanted + fromChat);
             }
-            case "mine", "dig", "chop", "break", "harvest" -> {
+            case "mine", "dig", "chop", "break", "harvest", "quarry", "excavate" -> {
                 if (argument.isEmpty()) {
                     return "no block named";
                 }
                 ServerPlayerEntity requester = resolvePlayer(server, senderName, senderName);
                 if (requester == null) {
                     return "no such player: " + senderName;
+                }
+                // "mine out a 20x20x2 at level 2", "quarry the selection": a region, not a kind.
+                QuarryPlanner.Spec spec = QuarryPlanner.parse(argument);
+                if (spec != null || verb.equals("quarry") || verb.equals("excavate")) {
+                    return routeQuarry(server, lumen, requester, spec, argument);
+                }
+                // "harvest the hops": a taught skill wins over digging up blocks called hops.
+                LumenSkill skill = Lumen.skills().find(argument);
+                if (skill != null && (verb.equals("harvest") || argument.equalsIgnoreCase(skill.name))) {
+                    return routeSkill(server, lumen, requester, skill, argument);
                 }
                 PlaceLookup where = lookupPlace(argument, requester);
                 if (where.unknown() != null) {
@@ -450,10 +476,236 @@ public final class LumenBrain {
                 Lumen.broadcast(server, LumenEntity.describeHandover(result, everything ? "" : argument));
                 return "handed over " + result.stacks() + " stack(s)";
             }
+            case "learn", "teach" -> {
+                ServerPlayerEntity teacher = resolvePlayer(server, senderName, senderName);
+                if (teacher == null) {
+                    return "no such player: " + senderName;
+                }
+                return routeLearn(server, teacher, argument, playerText);
+            }
+            case "do", "run", "perform", "use" -> {
+                ServerPlayerEntity requester = resolvePlayer(server, senderName, senderName);
+                if (requester == null) {
+                    return "no such player: " + senderName;
+                }
+                LumenSkill skill = Lumen.skills().find(argument);
+                if (skill == null) {
+                    Lumen.broadcast(server, "i don't know how to " + argument + " - teach me: \"learn "
+                            + argument + ": right click the ripe ones\"");
+                    return "unknown skill: " + argument;
+                }
+                return routeSkill(server, lumen, requester, skill, argument);
+            }
+            case "craft", "make", "build", "create" -> {
+                if (argument.isEmpty()) {
+                    return "nothing named to craft";
+                }
+                ServerPlayerEntity requester = resolvePlayer(server, senderName, senderName);
+                if (requester == null) {
+                    return "no such player: " + senderName;
+                }
+                ChestFinder.Request request = resolveFetchRequest(argument, playerText, 1);
+                int count = request.isEverything() ? 1 : Math.max(1, Math.min(64, request.count()));
+                return describeSubmission(server, lumen,
+                        lumen.submit(new LumenTask.Craft(requester.getUuid(), request.query(), count)),
+                        "let me see what i can make", "crafting " + count + " " + request.query());
+            }
+            case "wand" -> {
+                ServerPlayerEntity player = resolvePlayer(server, senderName, senderName);
+                if (player == null) {
+                    return "no such player: " + senderName;
+                }
+                LumenWand.giveTo(player);
+                Lumen.broadcast(server, "here's a wand - left click one corner, right click the other, then say mine out the selection");
+                return "gave a wand to " + player.getName().getString();
+            }
             default -> {
                 return "unrecognised verb '" + verb + "'";
             }
         }
+    }
+
+    /** A region job: from a sized request or from the wand selection. */
+    private String routeQuarry(MinecraftServer server, LumenEntity lumen, ServerPlayerEntity requester,
+                               @Nullable QuarryPlanner.Spec spec, String argument) {
+        QuarryPlanner.Region region;
+        String label;
+        if (spec == null || spec.selection() || !spec.hasSize()) {
+            region = LumenWand.selection(requester.getUuid());
+            if (region == null) {
+                Lumen.broadcast(server, "mark the area first - say wand, then left click one corner and right click the other"
+                        + (spec == null ? ", or tell me a size like 10x10x2" : ""));
+                return "no selection and no size in '" + argument + "'";
+            }
+            label = "the selection (" + region.sizeX() + "x" + region.sizeZ() + "x" + region.sizeY() + ")";
+        } else {
+            BlockPos feet = lumen.getBlockPos();
+            region = QuarryPlanner.regionAround(feet.getX(), feet.getY(), feet.getZ(), spec);
+            label = spec.sizeX() + "x" + spec.sizeZ() + "x" + spec.height()
+                    + (spec.targetY() != null ? " at y " + spec.targetY() : " under my feet");
+        }
+        return describeSubmission(server, lumen,
+                lumen.submit(new LumenTask.Quarry(requester.getUuid(), region, label)),
+                "on it - digging out " + label, "quarry " + region.describe());
+    }
+
+    /** Runs a taught skill, around a named place when one is given. */
+    private String routeSkill(MinecraftServer server, LumenEntity lumen, ServerPlayerEntity requester,
+                              LumenSkill skill, String argument) {
+        PlaceLookup where = lookupPlace(argument, requester);
+        return describeSubmission(server, lumen,
+                lumen.submit(new LumenTask.Harvest(requester.getUuid(), skill.name,
+                        where.place() == null ? null : where.place().pos(),
+                        where.place() == null ? null : where.place().name)),
+                "on it - " + skill.name + (where.place() == null ? "" : " at the " + where.place().name),
+                "running skill '" + skill.name + "'");
+    }
+
+    /**
+     * Teaching. The sentence names the skill and how it is done; the block the player
+     * is looking at grounds "these" and "ripe" on a real blockstate, which is what
+     * Lumen actually matches on. The confirmation reads that back, so a wrong lesson
+     * can be corrected on the spot.
+     */
+    private String routeLearn(MinecraftServer server, ServerPlayerEntity teacher, String argument,
+                              @Nullable String playerText) {
+        LumenConfig config = Lumen.config();
+        if (!config.allowTeaching) {
+            Lumen.broadcast(server, "teaching is switched off in the config");
+            return "teaching disabled";
+        }
+        // The model tends to shorten the lesson; the player's own words are the lesson.
+        String lesson = argument;
+        if (playerText != null) {
+            String lower = playerText.toLowerCase(Locale.ROOT);
+            int at = Math.max(lower.indexOf("learn"), lower.indexOf("teach"));
+            if (at >= 0) {
+                String tail = playerText.substring(at).replaceFirst("(?i)^(learn|teach)\\s+(you\\s+|me\\s+)?(this|how\\s+to|to)?[:\\s-]*", "").trim();
+                if (tail.length() > lesson.length()) {
+                    lesson = tail;
+                }
+            }
+        }
+        String lookedAt = null;
+        boolean ripe = false;
+        HitResult hit = teacher.raycast(6.0D, 1.0F, false);
+        if (hit instanceof BlockHitResult blockHit && hit.getType() == HitResult.Type.BLOCK) {
+            BlockState state = teacher.getWorld().getBlockState(blockHit.getBlockPos());
+            if (!state.isAir()) {
+                lookedAt = BlockStates.id(state);
+                ripe = BlockStates.isRipe(teacher.getWorld(), blockHit.getBlockPos(), state);
+            }
+        }
+        LumenSkill skill = SkillTeacher.parse(lesson, lookedAt, ripe);
+        if (skill == null) {
+            Lumen.broadcast(server, "tell me what to do and to what - like \"learn harvest hops: right click the ripe hops vines\""
+                    + " - or look at the block while you say it");
+            return "could not parse a lesson from '" + lesson + "'";
+        }
+        skill.taughtBy = teacher.getName().getString();
+        skill.created = System.currentTimeMillis();
+        if (!Lumen.skills().put(skill)) {
+            Lumen.broadcast(server, "i can't hold any more skills - forget one first");
+            return "skill book full";
+        }
+        Lumen.LOGGER.info("{} taught skill '{}': {} {} (looking at {})", skill.taughtBy, skill.name,
+                skill.action, skill.target, lookedAt == null ? "nothing" : lookedAt);
+        Lumen.broadcast(server, "learned \"" + skill.name + "\": " + (skill.isInteract() ? "right-click " : "break ")
+                + skill.target + (skill.collect ? " and collect the drops" : "")
+                + ". say \"" + skill.name + "\" and i'll do it; /lumen skill " + skill.name + " shows it");
+        return "learned skill '" + skill.name + "' -> " + skill.action + " " + skill.target;
+    }
+
+    // -------------------------------------------------------------------- notes
+
+    /**
+     * Every so often, asks the model to boil the recent conversation down to a few
+     * facts the player stated, and keeps those across restarts. The model's own lines
+     * are excluded on purpose: a small model summarising its own guesses into
+     * permanent memory is how invented lore becomes canon.
+     */
+    private void maybeSummarise(LumenConfig config) {
+        if (!config.conversationNotes) {
+            return;
+        }
+        if (++this.messagesSinceSummary < config.notesEveryMessages) {
+            return;
+        }
+        if (!summarising.compareAndSet(false, true)) {
+            return;
+        }
+        this.messagesSinceSummary = 0;
+        List<ChatMessage> transcript;
+        synchronized (this) {
+            transcript = new ArrayList<>();
+            for (ChatMessage message : history) {
+                if ("user".equals(message.role())) {
+                    transcript.add(message);
+                }
+            }
+        }
+        if (transcript.isEmpty()) {
+            summarising.set(false);
+            return;
+        }
+        StringBuilder lines = new StringBuilder();
+        for (ChatMessage message : transcript) {
+            lines.append(message.content()).append('\n');
+        }
+        List<ChatMessage> request = new ArrayList<>();
+        request.add(ChatMessage.system("You keep notes for a Minecraft companion. From the chat lines below, "
+                + "written by players, pick at most 4 facts worth remembering for weeks: who the players are, "
+                + "what they are building, where things are, what they like or dislike, plans. Only facts a "
+                + "player actually stated. No requests or errands, nothing the companion said, no guesses. "
+                + "Reply with ONLY a JSON array of short strings, e.g. [\"Dierks is building a brewery\"]. "
+                + "Reply [] if there is nothing worth keeping."));
+        request.add(ChatMessage.user(lines.toString()));
+        client(config).complete(config, request).whenComplete((content, error) -> {
+            try {
+                if (error != null || content == null) {
+                    Lumen.LOGGER.debug("Note summary failed: {}", error == null ? "empty" : error.toString());
+                    return;
+                }
+                List<String> notes = parseNotes(content);
+                int added = Lumen.memory().addNotes(notes);
+                if (added > 0) {
+                    Lumen.LOGGER.info("Kept {} new note(s) from the conversation", added);
+                }
+            } finally {
+                summarising.set(false);
+            }
+        });
+    }
+
+    /** Pulls a JSON array of strings out of whatever the model returned. */
+    static List<String> parseNotes(@Nullable String content) {
+        List<String> out = new ArrayList<>();
+        if (content == null) {
+            return out;
+        }
+        int start = content.indexOf('[');
+        int end = content.lastIndexOf(']');
+        if (start < 0 || end <= start) {
+            return out;
+        }
+        try {
+            JsonElement element = JsonParser.parseString(content.substring(start, end + 1));
+            if (!element.isJsonArray()) {
+                return out;
+            }
+            JsonArray array = element.getAsJsonArray();
+            for (JsonElement item : array) {
+                if (item.isJsonPrimitive()) {
+                    out.add(item.getAsString());
+                }
+                if (out.size() >= 4) {
+                    break;
+                }
+            }
+        } catch (RuntimeException e) {
+            // Not JSON: no notes this round.
+        }
+        return out;
     }
 
     /**
@@ -568,7 +820,8 @@ public final class LumenBrain {
             "follow", "come", "goto", "here", "approach", "find", "fetch", "get", "bring",
             "grab", "collect", "search", "mine", "dig", "chop", "break", "harvest", "drop",
             "give", "hand", "return", "pass", "stay", "stop", "wait", "halt", "hold",
-            "remember", "save", "mark", "continue", "resume", "carry", "keep", "proceed", "walk");
+            "remember", "save", "mark", "continue", "resume", "carry", "keep", "proceed", "walk",
+            "learn", "teach", "do", "run", "craft", "make", "quarry", "excavate", "wand");
 
     /**
      * Last resort when the model chats but omits the command field: read the intent
@@ -595,6 +848,8 @@ public final class LumenBrain {
                     .replaceFirst("^(i\\s+want\\s+you\\s+to|i\\s+need\\s+you\\s+to)\\b", "")
                     .replaceFirst("^(can|could|may)\\s+i\\s+(have|get)\\b", "give me")
                     .replaceFirst("^(i\\s+want|i\\s+need)\\s+(the|my|that)\\b(.*)\\bback$", "give me $2$3")
+                    .replaceFirst("^(i\\s+need|i\\s+want|make\\s+me|craft\\s+me|could\\s+you\\s+make)\\s+(?!you\\b|the\\b|my\\b|that\\b)", "craft ")
+                    .replaceFirst("^(mine|dig)\\s+out\\b", "quarry")
                     .trim();
             if (peeled.equals(text)) {
                 break;
@@ -670,7 +925,9 @@ public final class LumenBrain {
         if (lumen.queuedCount() > 0) {
             queue = "[what you have lined up]\n- " + String.join("\n- ", lumen.describeQueue()) + "\n";
         }
-        messages.add(ChatMessage.user(snapshot + recalled + places + queue + "\n" + senderName + " says: " + text));
+        String skills = Lumen.skills().describeForPrompt(text, 3);
+        String notes = Lumen.memory().describeNotes();
+        messages.add(ChatMessage.user(snapshot + recalled + places + notes + skills + queue + "\n" + senderName + " says: " + text));
         return messages;
     }
 
@@ -688,6 +945,8 @@ public final class LumenBrain {
                 + "If a [what you remember from before] block is present, those are places you have "
                 + "actually fetched things from and you may talk about them. When someone asks for "
                 + "something you have found before, you already know where to look - say so. "
+                + "A [things you remember from earlier days] block holds facts players told you before; "
+                + "trust them. "
                 + "A [places you know] block lists spots the player named for you, with how far away "
                 + "they are; use those names in goto, find and mine. A [what you have lined up] block "
                 + "is what you have agreed to do next - do not offer to do it again.\n\n"
@@ -709,6 +968,13 @@ public final class LumenBrain {
                 + "  goto <place>    - walk to a place you were taught the name of\n"
                 + "  remember <name> - save the spot the speaker is standing in under that name\n"
                 + "  continue        - carry on with whatever was paused\n"
+                + "  learn <name>: <how> - when the player explains how to do a job, copy their words: "
+                + "\"learn harvest hops: right click the ripe hops vines and collect the drops\"\n"
+                + "  do <skill>      - run a skill you were taught (a [skills you were taught] block lists them)\n"
+                + "  craft <n> <item> - make something from what is in your pack, e.g. \"craft 4 sticks\"\n"
+                + "  quarry <WxLxH> [level Y] - dig out an area: \"quarry 20x20x2 level 2\"; "
+                + "\"quarry selection\" digs what the player marked with the wand\n"
+                + "  wand            - hand the player a selection wand\n"
                 + "Several things in one request are joined with \"then\": \"find iron then mine copper "
                 + "then come\". A place can be named at the end of find or mine: \"find hops from the "
                 + "hops room\", \"mine copper near the copper spot\". A second request waits its turn "
@@ -736,7 +1002,15 @@ public final class LumenBrain {
                 + "{\"reason\":\"three jobs in a row\",\"command\":\"find iron then mine copper then come\","
                 + "\"message\":\"iron first, then copper, then back to you\"}\n"
                 + "{\"reason\":\"naming this spot\",\"command\":\"remember hops room\","
-                + "\"message\":\"the hops room, got it\"}\n\n"
+                + "\"message\":\"the hops room, got it\"}\n"
+                + "{\"reason\":\"they are teaching me\",\"command\":\"learn harvest hops: right click the ripe hops vines and collect what drops\","
+                + "\"message\":\"got it, ripe ones get a right click\"}\n"
+                + "{\"reason\":\"a skill i know\",\"command\":\"do harvest hops\","
+                + "\"message\":\"on it\"}\n"
+                + "{\"reason\":\"they need sticks\",\"command\":\"craft 8 sticks\","
+                + "\"message\":\"i'll knock some together\"}\n"
+                + "{\"reason\":\"dig out a room\",\"command\":\"quarry 10x10x3\","
+                + "\"message\":\"clearing it out\"}\n\n"
                 + "The \"message\" field is the only thing players see: one or two short sentences, "
                 + "lowercase and casual, like typing in chat. Never mention JSON, commands or that "
                 + "you are an AI.";

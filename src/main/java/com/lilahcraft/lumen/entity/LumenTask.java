@@ -66,4 +66,37 @@ public sealed interface LumenTask {
             return "hand over " + (query == null ? "everything" : "the " + query);
         }
     }
+
+    /** Run a taught skill: find its targets around {@code anchor} (or Lumen) and work them. */
+    record Harvest(UUID requester, String skillName, @Nullable BlockPos anchor, @Nullable String anchorName)
+            implements LumenTask {
+        @Override
+        public String describe() {
+            return skillName + (anchorName == null ? "" : " at the " + anchorName);
+        }
+    }
+
+    /** Dig out a region, top layer first. */
+    record Quarry(UUID requester, QuarryPlanner.Region region, String label) implements LumenTask {
+        @Override
+        public String describe() {
+            return "mine out " + label;
+        }
+    }
+
+    /** Craft something from the pack, walking to a crafting table if the recipe needs one. */
+    record Craft(UUID requester, String query, int count) implements LumenTask {
+        @Override
+        public String describe() {
+            return "craft " + (count > 1 ? count + " " : "") + query;
+        }
+    }
+
+    /** Pick up what a job dropped around {@code center} before heading back. */
+    record Collect(UUID requester, BlockPos center, double radius) implements LumenTask {
+        @Override
+        public String describe() {
+            return "pick up the drops";
+        }
+    }
 }

@@ -62,9 +62,41 @@ public final class LumenManager {
      *
      * @return the new entity, or null if the world rejected the spawn
      */
+    /**
+     * Why Lumen cannot be spawned right now, or null when it can. A death starts a
+     * real-time cooldown so losing Lumen costs something.
+     */
+    @Nullable
+    public String spawnBlockedReason(LumenConfig config) {
+        long remaining = cooldownRemainingMillis(config);
+        if (remaining <= 0L) {
+            return null;
+        }
+        long minutes = (remaining + 59_999L) / 60_000L;
+        return config.companionName + " is still recovering - back in " + minutes + " minute" + (minutes == 1 ? "" : "s")
+                + ". An admin can /lumen spawn force.";
+    }
+
+    /** Millis left on the respawn cooldown, 0 when none. */
+    public long cooldownRemainingMillis(LumenConfig config) {
+        if (config.respawnCooldownMinutes <= 0) {
+            return 0L;
+        }
+        long died = Lumen.memory().lastDeath();
+        if (died <= 0L) {
+            return 0L;
+        }
+        long until = died + config.respawnCooldownMinutes * 60_000L;
+        return Math.max(0L, until - System.currentTimeMillis());
+    }
+
     @Nullable
     public LumenEntity spawn(ServerWorld world, Vec3d pos, float yaw, LumenConfig config) {
         despawn(world.getServer());
+        // A successful spawn ends any cooldown, so a forced one does not linger.
+        if (Lumen.memory().lastDeath() > 0L) {
+            Lumen.memory().clearDeath();
+        }
 
         LumenEntity lumen = LumenEntity.create(world, config);
         lumen.refreshPositionAndAngles(pos.x, pos.y, pos.z, yaw, 0.0F);

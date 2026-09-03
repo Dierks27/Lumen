@@ -86,6 +86,7 @@ public final class WorldSnapshot {
 
         out.append("- Your health is ").append(Math.round(lumen.getHealth()))
                 .append("/").append(Math.round(lumen.getMaxHealth()))
+                .append(", and you are ").append(lumen.describeFood())
                 .append(". You are ").append(lumen.describeActivity()).append(".\n");
 
         // Always present, even when empty, so "what have you got?" has an answer

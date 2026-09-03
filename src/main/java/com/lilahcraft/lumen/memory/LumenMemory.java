@@ -77,6 +77,10 @@ public final class LumenMemory {
 
     /** The on-disk shape. Keeping a wrapper leaves room to add more kinds of memory. */
     private static final class Data {
+        /** When Lumen last died, epoch millis; 0 when never. Drives the respawn cooldown. */
+        long lastDeath;
+        /** Things the player told Lumen that are worth keeping: summarised conversation. */
+        List<String> notes = new ArrayList<>();
         List<KnownContainer> containers = new ArrayList<>();
         /** Absent in files written before v0.7.0; null-guarded on load. */
         List<KnownPlace> places = new ArrayList<>();
@@ -109,6 +113,9 @@ public final class LumenMemory {
             }
             if (this.data.places == null) {
                 this.data.places = new ArrayList<>();
+            }
+            if (this.data.notes == null) {
+                this.data.notes = new ArrayList<>();
             }
             Lumen.LOGGER.info("Loaded {} remembered container(s) and {} place(s)",
                     this.data.containers.size(), this.data.places.size());
@@ -484,6 +491,100 @@ public final class LumenMemory {
     private static String itemPath(String itemId) {
         int colon = itemId.indexOf(':');
         return (colon < 0 ? itemId : itemId.substring(colon + 1)).toLowerCase(Locale.ROOT);
+    }
+
+    // ------------------------------------------------------------------ deaths
+
+    public synchronized void noteDeath(long epochMillis) {
+        data.lastDeath = epochMillis;
+        save();
+    }
+
+    /** Epoch millis of the last death, or 0. */
+    public synchronized long lastDeath() {
+        return data.lastDeath;
+    }
+
+    public synchronized void clearDeath() {
+        data.lastDeath = 0L;
+        save();
+    }
+
+    // ------------------------------------------------------------------- notes
+
+    /** How many notes are kept; older ones fall off. The prompt pays for every one. */
+    public static final int MAX_NOTES = 12;
+    public static final int MAX_NOTE_LENGTH = 140;
+
+    public synchronized List<String> notes() {
+        return new ArrayList<>(data.notes);
+    }
+
+    /**
+     * Adds notes from a conversation summary. Trimmed, deduplicated, bounded. Anything
+     * that repeats an existing note (same words) is dropped rather than doubled.
+     */
+    public synchronized int addNotes(List<String> fresh) {
+        int added = 0;
+        for (String raw : fresh) {
+            if (raw == null) {
+                continue;
+            }
+            String note = raw.trim().replaceAll("\\s+", " ").replaceAll("^[-*\\d.)\\s]+", "").trim();
+            if (note.length() < 8) {
+                continue;
+            }
+            if (note.length() > MAX_NOTE_LENGTH) {
+                note = note.substring(0, MAX_NOTE_LENGTH - 3) + "...";
+            }
+            String key = note.toLowerCase(Locale.ROOT);
+            boolean duplicate = false;
+            for (String existing : data.notes) {
+                if (existing.toLowerCase(Locale.ROOT).equals(key)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) {
+                continue;
+            }
+            data.notes.add(note);
+            added++;
+        }
+        while (data.notes.size() > MAX_NOTES) {
+            data.notes.remove(0);
+        }
+        if (added > 0) {
+            save();
+        }
+        return added;
+    }
+
+    /** Removes note number {@code index} (1-based, as /lumen notes shows them). */
+    public synchronized boolean forgetNote(int index) {
+        if (index < 1 || index > data.notes.size()) {
+            return false;
+        }
+        data.notes.remove(index - 1);
+        save();
+        return true;
+    }
+
+    public synchronized void clearNotes() {
+        data.notes.clear();
+        save();
+    }
+
+    /** The "[things you remember]" block for the prompt, or empty. */
+    public synchronized String describeNotes() {
+        if (data.notes.isEmpty()) {
+            return "";
+        }
+        StringBuilder out = new StringBuilder("[things you remember from earlier days]\n");
+        for (String note : data.notes) {
+            out.append("- ").append(note).append('\n');
+        }
+        return out.toString();
     }
 
     static String normalise(String query) {

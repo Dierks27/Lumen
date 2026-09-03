@@ -234,7 +234,7 @@ public final class ChestFinder {
     }
 
     /** Every word in the query is a whole word of the name, plurals ignored. */
-    static boolean wordsMatch(String query, String name) {
+    public static boolean wordsMatch(String query, String name) {
         String[] queryWords = words(query);
         if (queryWords.length == 0) {
             return false;
