@@ -32,12 +32,21 @@ public final class MineFinder {
     @Nullable
     public static BlockPos findNearest(ServerWorld world, LumenEntity lumen, String query,
                                        double radius, int height, Set<BlockPos> exclude) {
+        return findNearest(world, lumen, lumen.getBlockPos(), query, radius, height, exclude);
+    }
+
+    /**
+     * @param origin where to look around - Lumen itself, or a named place ("mine near
+     *               the copper spot"); reachability is still judged from where Lumen is
+     */
+    @Nullable
+    public static BlockPos findNearest(ServerWorld world, LumenEntity lumen, BlockPos origin, String query,
+                                       double radius, int height, Set<BlockPos> exclude) {
         String normalised = query.trim().toLowerCase(Locale.ROOT).replace(' ', '_');
         if (normalised.isEmpty()) {
             return null;
         }
         boolean queryNamesOre = normalised.contains("ore");
-        BlockPos origin = lumen.getBlockPos();
         int reach = (int) Math.ceil(radius);
         List<Candidate> found = new ArrayList<>();
         BlockPos.Mutable cursor = new BlockPos.Mutable();

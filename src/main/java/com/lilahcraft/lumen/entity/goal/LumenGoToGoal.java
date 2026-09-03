@@ -80,7 +80,7 @@ public class LumenGoToGoal extends Goal {
         // enough to be reasonable, and give up honestly otherwise.
         double warp = Lumen.config().teleportDistance;
         if (!lumen.getBlockPos().isWithinDistance(destination, warp) || !lumen.teleportNear(destination)) {
-            lumen.stopAndIdle();
+            lumen.goToFailed();
         }
     }
 }

@@ -5,6 +5,9 @@ import com.lilahcraft.lumen.LumenConfig;
 import com.lilahcraft.lumen.brain.LumenBrain;
 import com.lilahcraft.lumen.entity.ChestFinder;
 import com.lilahcraft.lumen.entity.LumenEntity;
+import com.lilahcraft.lumen.entity.LumenTask;
+import com.lilahcraft.lumen.brain.Phrasing;
+import com.lilahcraft.lumen.memory.LumenMemory;
 import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.context.CommandContext;
@@ -82,8 +85,23 @@ public final class LumenCommand {
                 .then(CommandManager.literal("memory")
                         .executes(LumenCommand::memory))
                 .then(CommandManager.literal("forget")
-                        .requires(LumenCommand::isAdmin)
-                        .executes(LumenCommand::forget))
+                        // Bare "forget" wipes everything and is checked for admin inside;
+                        // a child node cannot be more permissive than a gated parent.
+                        .executes(LumenCommand::forget)
+                        .then(CommandManager.argument("place", StringArgumentType.greedyString())
+                                .executes(LumenCommand::forgetPlace)))
+                .then(CommandManager.literal("remember")
+                        .then(CommandManager.argument("name", StringArgumentType.greedyString())
+                                .executes(LumenCommand::remember)))
+                .then(CommandManager.literal("go")
+                        .then(CommandManager.argument("place", StringArgumentType.greedyString())
+                                .executes(LumenCommand::go)))
+                .then(CommandManager.literal("queue")
+                        .executes(LumenCommand::queue))
+                .then(CommandManager.literal("cancel")
+                        .executes(LumenCommand::cancel))
+                .then(CommandManager.literal("continue")
+                        .executes(LumenCommand::resume))
                 .then(CommandManager.literal("find")
                         .then(CommandManager.argument("item", StringArgumentType.greedyString())
                                 .executes(LumenCommand::find)))
@@ -176,7 +194,13 @@ public final class LumenCommand {
         if (lumen == null) {
             return 0;
         }
+        boolean paused = lumen.currentTask() != null;
+        lumen.pauseForPlayer();
         lumen.goTo(player.getBlockPos());
+        if (paused) {
+            source.sendFeedback(() -> Text.literal(Lumen.config().companionName
+                    + " paused its errand. /lumen continue resumes it.").formatted(Formatting.GRAY), false);
+        }
         return 1;
     }
 
@@ -185,8 +209,129 @@ public final class LumenCommand {
         if (lumen == null) {
             return 0;
         }
-        lumen.stopAndIdle();
+        int dropped = lumen.cancelAll();
+        if (dropped > 0) {
+            context.getSource().sendFeedback(() -> Text.literal("Dropped " + dropped + " task(s).")
+                    .formatted(Formatting.GRAY), false);
+        }
         return 1;
+    }
+
+    private static int queue(CommandContext<ServerCommandSource> context) {
+        ServerCommandSource source = context.getSource();
+        LumenEntity lumen = requireLumen(source);
+        if (lumen == null) {
+            return 0;
+        }
+        List<String> lines = lumen.describeQueue();
+        if (lines.isEmpty()) {
+            source.sendFeedback(() -> Text.literal(Lumen.config().companionName + " has nothing lined up.")
+                    .formatted(Formatting.GRAY), false);
+            return 1;
+        }
+        source.sendFeedback(() -> Text.literal(Lumen.config().companionName + "'s list:").formatted(Formatting.AQUA), false);
+        for (String line : lines) {
+            source.sendFeedback(() -> Text.literal("  " + line).formatted(Formatting.GRAY), false);
+        }
+        if (lumen.currentTask() == null && lumen.queuedCount() > 0) {
+            source.sendFeedback(() -> Text.literal("  (paused - /lumen continue to carry on)")
+                    .formatted(Formatting.DARK_GRAY), false);
+        }
+        return 1;
+    }
+
+    private static int cancel(CommandContext<ServerCommandSource> context) {
+        ServerCommandSource source = context.getSource();
+        LumenEntity lumen = requireLumen(source);
+        if (lumen == null) {
+            return 0;
+        }
+        int dropped = lumen.cancelAll();
+        source.sendFeedback(() -> Text.literal(dropped == 0 ? "Nothing to cancel." : "Cancelled " + dropped + " task(s).")
+                .formatted(Formatting.GRAY), false);
+        return 1;
+    }
+
+    private static int resume(CommandContext<ServerCommandSource> context) {
+        ServerCommandSource source = context.getSource();
+        LumenEntity lumen = requireLumen(source);
+        if (lumen == null) {
+            return 0;
+        }
+        if (!lumen.resume()) {
+            source.sendFeedback(() -> Text.literal(lumen.isOnErrand() ? "Already busy." : "Nothing was waiting.")
+                    .formatted(Formatting.GRAY), false);
+            return 0;
+        }
+        LumenTask task = lumen.currentTask();
+        source.sendFeedback(() -> Text.literal(Lumen.config().companionName + " resumes: "
+                + (task == null ? "?" : task.describe())).formatted(Formatting.AQUA), false);
+        return 1;
+    }
+
+    private static int remember(CommandContext<ServerCommandSource> context) throws CommandSyntaxException {
+        ServerCommandSource source = context.getSource();
+        ServerPlayerEntity player = source.getPlayerOrThrow();
+        String name = LumenMemory.cleanPlaceName(Phrasing.placeNameFromRemember(
+                StringArgumentType.getString(context, "name")));
+        if (name.isEmpty()) {
+            source.sendError(Text.literal("Give the place a name: /lumen remember hops room"));
+            return 0;
+        }
+        LumenMemory.KnownPlace place = Lumen.memory().rememberPlace(name, player.getWorld().getRegistryKey().getValue(),
+                player.getBlockPos(), LumenMemory.DEFAULT_PLACE_RADIUS, player.getName().getString());
+        source.sendFeedback(() -> Text.literal("Remembered \"" + place.name + "\" at " + place.pos().toShortString()
+                + " (radius " + place.radius + ").").formatted(Formatting.AQUA), true);
+        return 1;
+    }
+
+    private static int go(CommandContext<ServerCommandSource> context) throws CommandSyntaxException {
+        ServerCommandSource source = context.getSource();
+        ServerPlayerEntity player = source.getPlayerOrThrow();
+        LumenEntity lumen = requireLumen(source);
+        if (lumen == null) {
+            return 0;
+        }
+        String query = StringArgumentType.getString(context, "place");
+        LumenMemory.KnownPlace place = Lumen.memory().findPlace(query, player.getWorld().getRegistryKey().getValue());
+        if (place == null) {
+            source.sendError(Text.literal("No place called \"" + query + "\". Stand there and /lumen remember <name>."));
+            return 0;
+        }
+        LumenEntity.Submission result = lumen.submit(new LumenTask.GoTo(player.getUuid(), place.pos(), place.name));
+        return reportSubmission(source, result, lumen, "goes to the " + place.name);
+    }
+
+    private static int forgetPlace(CommandContext<ServerCommandSource> context) {
+        ServerCommandSource source = context.getSource();
+        String query = StringArgumentType.getString(context, "place");
+        if (!Lumen.memory().forgetPlace(query)) {
+            source.sendError(Text.literal("No place called \"" + query + "\"."));
+            return 0;
+        }
+        source.sendFeedback(() -> Text.literal("Forgot the place \"" + query + "\".").formatted(Formatting.GRAY), true);
+        return 1;
+    }
+
+    /** Feedback for a task that was submitted from a slash command. */
+    private static int reportSubmission(ServerCommandSource source, LumenEntity.Submission result, LumenEntity lumen,
+                                        String started) {
+        String name = Lumen.config().companionName;
+        switch (result) {
+            case STARTED -> {
+                source.sendFeedback(() -> Text.literal(name + " " + started + ".").formatted(Formatting.AQUA), false);
+                return 1;
+            }
+            case QUEUED -> {
+                source.sendFeedback(() -> Text.literal(name + " will do that after what it is doing now ("
+                        + lumen.queuedCount() + " waiting).").formatted(Formatting.AQUA), false);
+                return 1;
+            }
+            default -> {
+                source.sendError(Text.literal(name + ": " + lumen.lastTaskNote()));
+                return 0;
+            }
+        }
     }
 
     /** Escape hatch for the times pathfinding loses: warp Lumen to the player. */
@@ -350,25 +495,39 @@ public final class LumenCommand {
 
     private static int memory(CommandContext<ServerCommandSource> context) {
         ServerCommandSource source = context.getSource();
+        List<String> places = Lumen.memory().placeLines(15);
         List<String> lines = Lumen.memory().lines(15);
-        if (lines.isEmpty()) {
+        if (lines.isEmpty() && places.isEmpty()) {
             source.sendFeedback(() -> Text.literal(Lumen.config().companionName
                     + " has not found anything worth remembering yet.").formatted(Formatting.GRAY), false);
             return 1;
         }
-        source.sendFeedback(() -> Text.literal(Lumen.config().companionName + " remembers "
-                + Lumen.memory().size() + " place(s):").formatted(Formatting.AQUA), false);
-        for (String line : lines) {
-            source.sendFeedback(() -> Text.literal("  " + line).formatted(Formatting.GRAY), false);
+        if (!places.isEmpty()) {
+            source.sendFeedback(() -> Text.literal(Lumen.config().companionName + " knows "
+                    + Lumen.memory().placeCount() + " named place(s):").formatted(Formatting.AQUA), false);
+            for (String line : places) {
+                source.sendFeedback(() -> Text.literal("  " + line).formatted(Formatting.GRAY), false);
+            }
+        }
+        if (!lines.isEmpty()) {
+            source.sendFeedback(() -> Text.literal(Lumen.config().companionName + " remembers "
+                    + Lumen.memory().size() + " container(s):").formatted(Formatting.AQUA), false);
+            for (String line : lines) {
+                source.sendFeedback(() -> Text.literal("  " + line).formatted(Formatting.GRAY), false);
+            }
         }
         return 1;
     }
 
     private static int forget(CommandContext<ServerCommandSource> context) {
         ServerCommandSource source = context.getSource();
-        int had = Lumen.memory().size();
+        if (!isAdmin(source)) {
+            source.sendError(Text.literal("Only an operator can clear everything. /lumen forget <place> forgets one place."));
+            return 0;
+        }
+        int had = Lumen.memory().size() + Lumen.memory().placeCount();
         Lumen.memory().clear();
-        source.sendFeedback(() -> Text.literal("Cleared " + had + " remembered place(s).")
+        source.sendFeedback(() -> Text.literal("Cleared " + had + " remembered container(s) and place(s).")
                 .formatted(Formatting.GRAY), true);
         return 1;
     }
@@ -385,18 +544,15 @@ public final class LumenCommand {
             source.sendError(Text.literal("Chest access is turned off in the config."));
             return 0;
         }
-        ChestFinder.Request request = ChestFinder.parseRequest(query, Lumen.config().defaultFetchCount);
-        if (!lumen.startFetch(player, request)) {
-            source.sendError(Text.literal(lumen.fetchSawUnreachable()
-                    ? "A container within " + Math.round(Lumen.config().chestSearchRadius) + " blocks has \""
-                            + request.query() + "\", but " + Lumen.config().companionName + " cannot path to it."
-                    : "No container within " + Math.round(Lumen.config().chestSearchRadius) + " blocks has \""
-                            + request.query() + "\"."));
-            return 0;
-        }
-        source.sendFeedback(() -> Text.literal(Lumen.config().companionName
-                + " goes looking for " + ChestFinder.describeRequest(request) + ".").formatted(Formatting.AQUA), false);
-        return 1;
+        Phrasing.PlaceRef ref = Phrasing.splitPlaceReference(query);
+        LumenMemory.KnownPlace place = ref.place() == null ? null
+                : Lumen.memory().findPlace(ref.place(), player.getWorld().getRegistryKey().getValue());
+        String itemText = place == null ? query : ref.rest();
+        ChestFinder.Request request = ChestFinder.parseRequest(itemText, Lumen.config().defaultFetchCount);
+        LumenEntity.Submission result = lumen.submit(new LumenTask.Fetch(player.getUuid(), request,
+                place == null ? null : place.pos(), place == null ? null : place.name));
+        return reportSubmission(source, result, lumen, "goes looking for " + ChestFinder.describeRequest(request)
+                + (place == null ? "" : " around the " + place.name));
     }
 
     private static int mine(CommandContext<ServerCommandSource> context) throws CommandSyntaxException {
@@ -411,14 +567,14 @@ public final class LumenCommand {
             return 0;
         }
         String query = StringArgumentType.getString(context, "block");
-        String refusal = lumen.startMining(player, query);
-        if (refusal != null) {
-            source.sendError(Text.literal(Lumen.config().companionName + ": " + refusal));
-            return 0;
-        }
-        source.sendFeedback(() -> Text.literal(Lumen.config().companionName
-                + " goes off to mine " + query + ".").formatted(Formatting.AQUA), false);
-        return 1;
+        Phrasing.PlaceRef ref = Phrasing.splitPlaceReference(query);
+        LumenMemory.KnownPlace place = ref.place() == null ? null
+                : Lumen.memory().findPlace(ref.place(), player.getWorld().getRegistryKey().getValue());
+        String blockText = place == null ? query : ref.rest();
+        LumenEntity.Submission result = lumen.submit(new LumenTask.Mine(player.getUuid(), blockText,
+                place == null ? null : place.pos(), place == null ? null : place.name));
+        return reportSubmission(source, result, lumen, "goes off to mine " + blockText
+                + (place == null ? "" : " near the " + place.name));
     }
 
     /**
@@ -565,6 +721,7 @@ public final class LumenCommand {
         if (lumen == null) {
             return 0;
         }
+        lumen.pauseForPlayer();
         lumen.followPlayer(target);
         return 1;
     }

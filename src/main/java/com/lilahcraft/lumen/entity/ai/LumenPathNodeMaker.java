@@ -18,9 +18,9 @@ import net.minecraft.world.BlockView;
  * route through it.
  *
  * <p>So: if the pathfinder says BLOCKED but the block cannot actually be collided
- * with, treat it as open. Nothing else changes, and the check is a single
- * non-recursive shape lookup - unlike the recursive walkability checks that made
- * Automatone blow the stack on modded blocks.
+ * with, treat it as open. Nothing else changes. The shape lookup is made against the
+ * real world at the real position, and a modded block that throws while computing its
+ * shape is treated as solid rather than allowed to take the server tick down with it.
  */
 public class LumenPathNodeMaker extends LandPathNodeMaker {
 
@@ -49,6 +49,12 @@ public class LumenPathNodeMaker extends LandPathNodeMaker {
     /** True when the block has no collision box, whatever it claims about pathfinding. */
     public static boolean isPhysicallyPassable(BlockView world, int x, int y, int z) {
         BlockPos pos = new BlockPos(x, y, z);
-        return world.getBlockState(pos).getCollisionShape(world, pos).isEmpty();
+        try {
+            return world.getBlockState(pos).getCollisionShape(world, pos).isEmpty();
+        } catch (RuntimeException e) {
+            // A modded block that cannot answer is not one to walk into. In a 375 mod
+            // pack this runs thousands of times a second; one bad block must not matter.
+            return false;
+        }
     }
 }

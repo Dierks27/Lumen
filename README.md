@@ -29,6 +29,24 @@ specific code.
 - Where things were found is kept in `config/lumen/memory.json` and survives restarts
 - Ask for something fetched before and Lumen goes straight back to that container
 - Memories that turn out wrong are forgotten and the search starts again
+- **Named places.** Stand somewhere and say *"remember this as the hops room"* (or
+  `/lumen remember hops room`). From then on *"go to the hops room"*, *"find hops from
+  the hops room"* and *"mine copper near the copper spot"* all work, in chat and as
+  `/lumen go`, `/lumen find` and `/lumen mine`. Names match loosely - "hops", "the hops
+  room" and "hopsroom" are all the same place. `/lumen memory` lists them,
+  `/lumen forget <place>` drops one. The model is told which places are nearby and how
+  far, so it can talk about them
+
+**Doing several things**
+- A second request waits its turn instead of cancelling the first. *"Grab me some iron,
+  then go mine some copper, then come back"* is three jobs run in order; so is saying
+  them one at a time while it works. `/lumen queue` shows the list
+- *"Come here"* and *"follow me"* interrupt: the errand is paused, not lost, and
+  *"carry on"* (or `/lumen continue`) picks it back up with whatever was still owed.
+  *"Stop"* or `/lumen cancel` throws the lot away
+- With combat on, a fight interrupts an errand and the errand resumes when it is over
+- Something the model says in passing ("stop", "follow") only counts when you actually
+  said it - a chatty model no longer talks Lumen out of a job
 
 **Fetching**
 - Takes the amount you asked for and stops: *"grab me 12 redstone"* is 12, not the
@@ -152,16 +170,29 @@ Baritone cannot drive Lumen, and it is worth being clear why. Standard Baritone 
 **client** mod: it controls `Minecraft.getInstance().player` through client tick and
 input hooks, and the 1.20.1 build is a Forge jar. It will not load on a Fabric server,
 and there is no player client for it to attach to. That stays true for the Phase 3
-fake-player route, because a fake `ServerPlayerEntity` is still server side. Automatone
-is the fork that *does* drive server-side mobs - and it is the one that blows the stack
-on modded blocks.
+fake-player route, because a fake `ServerPlayerEntity` is still server side.
+
+Automatone is the Baritone fork that *does* drive server-side mobs, and earlier versions
+of this README repeated the folklore that it "blows the stack on modded blocks in
+recursive `canWalkThrough` checks". That was checked against the source and it is not
+true: `MovementHelper.canWalkThrough` is not recursive (its only outward call is
+`canWalkOn`, which never calls back). The one real `StackOverflowError` in Automatone is
+an unconditional self-call in `EntityContext.worldData()`, reached only from its `chests`
+command, on any block, vanilla or modded. The actual reasons it is not used here are
+duller and decisive: the only 1.20.1 build is a **Quilt** jar with no `fabric.mod.json`,
+so it does not load on a Fabric server at all; it is **LGPL-3.0**, so a fork could never
+be MIT; its `MixinMobEntity` cancels `MobEntity.tickNewAi()` while pathing, which would
+switch off every one of Lumen's goals; and it hands modded blocks `BlockPos.ORIGIN` and
+sometimes a `null` world when asking about passability, which is a worse modded-block
+hazard than the one it was blamed for.
 
 So Lumen fixes the actual symptom instead. Vanilla decides whether a block can be walked
 through with `AbstractBlock#canPathfindThrough`, which mods routinely leave reporting
 their block as solid even when it has no collision box at all - decorative clutter,
 cables, pipes, plants. `LumenPathNodeMaker` says: if the pathfinder calls it BLOCKED but
-it cannot actually be collided with, treat it as open. One non-recursive shape lookup,
-so it cannot recurse into a stack overflow the way Automatone did.
+it cannot actually be collided with, treat it as open. That check asks the real world at
+the real position, and a modded block that throws while answering is treated as solid
+rather than allowed to kill the tick.
 
 When Lumen still gets stuck, **`/lumen why`** runs a real path test to wherever it is
 trying to get to (or to you, when idle) and reports whether the path reaches, where it
@@ -300,10 +331,13 @@ misbehave anyway.
 | --- | --- | --- |
 | `/lumen` or `/lumen status` | everyone | Endpoint, model, current activity |
 | `/lumen say <message>` | everyone | Talk to Lumen regardless of `chatTrigger` |
-| `/lumen come` / `stay` / `follow [player]` | everyone | Manual control, no LLM involved |
+| `/lumen come` / `stay` / `follow [player]` | everyone | Manual control, no LLM involved. `come` and `follow` pause an errand; `stay` cancels everything |
+| `/lumen remember <name>` | everyone | Save where you are standing as a named place |
+| `/lumen go <place>` | everyone | Walk to a named place |
+| `/lumen queue` / `cancel` / `continue` | everyone | What is lined up; drop it all; resume a paused errand |
 | `/lumen here` | everyone | Warp Lumen to you - the escape hatch when pathing loses |
-| `/lumen find <item>` | everyone | Fetch an item from a nearby container |
-| `/lumen mine <block>` | everyone | Go break blocks of that kind and bring them back |
+| `/lumen find <item> [from <place>]` | everyone | Fetch an item from a nearby container, or one near a named place |
+| `/lumen mine <block> [near <place>]` | everyone | Go break blocks of that kind and bring them back |
 | `/lumen inventory` | everyone | What Lumen is carrying and wearing |
 | `/lumen memory` | everyone | Places Lumen remembers finding things |
 | `/lumen drop` | everyone | Hand back everything it is carrying, straight into your inventory |
@@ -311,7 +345,8 @@ misbehave anyway.
 | `/lumen debug` | everyone | What the model last said, and what became of it |
 | `/lumen containers` | everyone | Nearby containers, and which are searchable |
 | `/lumen why` | everyone | A path test to its target, and what is blocking it |
-| `/lumen spawn` / `despawn` / `reload` / `forget` | level 2 | |
+| `/lumen forget <place>` | everyone | Forget one named place |
+| `/lumen spawn` / `despawn` / `reload` / `forget` | level 2 | Bare `forget` clears every memory |
 
 Right-clicking Lumen with something in hand gives it that item. Right-clicking empty
 handed - or while sneaking - opens its pack as a chest screen you can move things in
@@ -320,9 +355,13 @@ and out of. The bottom row is what it is holding and wearing.
 ## Roadmap
 
 **Next**
-- A selection wand for area mining and quarrying
-- A task queue with priorities, so a second request waits instead of cancelling
-- Named places (`remember this as home`) and going back to them
+- Teachable skills: primitive actions (walk, break, take, put, collect, wait) that a
+  learned skill composes, taught in chat and stored in `config/lumen/skills.json`.
+  The catch, verified against the 1.20.1 sources: a mob cannot right-click a block -
+  `AbstractBlock#onUse` needs a real player and Fabric API 1.20.1 has no `FakePlayer` -
+  so the first version acts through the requesting player the way mining already does
+- A selection wand for area mining and quarrying, and area mining from a sentence
+- Crafting from the pack, recursively, from the recipe book
 - Learned memory beyond container locations, carried across restarts
 - Storage that exposes items through neither `Inventory` nor the Fabric transfer API
   (`/lumen containers` shows which)
@@ -341,8 +380,8 @@ and out of. The bottom row is what it is holding and wearing.
 Hard-won details that shaped this build:
 
 1. NoChatReports drops unsigned player chat - companion lines must be system messages.
-2. Automatone / forked Baritone `StackOverflowError`s on modded blocks in recursive
-   `canWalkThrough` checks. Vanilla pathfinding handles them natively.
+2. Automatone does not fit: Quilt-only at 1.20.1, LGPL-3.0, and it disables the goal
+   selector while pathing. Its `canWalkThrough` is not recursive; that was folklore.
 3. `useGrammar` on Ollama is not reliable; enforce the JSON shape in the prompt.
 4. Null fields in the model's JSON will crash naive history handling - null-check first.
 5. `OLLAMA_HOST=0.0.0.0` is required for LAN access.

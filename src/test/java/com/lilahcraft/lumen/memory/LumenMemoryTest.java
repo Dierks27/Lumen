@@ -67,4 +67,43 @@ class LumenMemoryTest {
         assertEquals("iron_ingot", LumenMemory.normalise("  Iron Ingot "));
         assertEquals("", LumenMemory.normalise(null));
     }
+
+    // ---- named places ----
+
+    @Test
+    @DisplayName("place names are cleaned to the name and nothing else")
+    void cleansPlaceNames() {
+        assertEquals("hops room", LumenMemory.cleanPlaceName("the Hops Room!"));
+        assertEquals("hops room", LumenMemory.cleanPlaceName("this as the hops room"));
+        assertEquals("hops room", LumenMemory.cleanPlaceName("hops_room"));
+        assertEquals("home", LumenMemory.cleanPlaceName("home"));
+        assertEquals("copper spot", LumenMemory.cleanPlaceName("the copper spot"));
+        assertEquals("", LumenMemory.cleanPlaceName(null));
+        assertEquals("", LumenMemory.cleanPlaceName("this"));
+    }
+
+    @Test
+    @DisplayName("place matching is tiered: exact, every word, then substring")
+    void scoresPlaces() {
+        assertEquals(3, LumenMemory.placeScore("hops room", "hops room"));
+        assertEquals(2, LumenMemory.placeScore("hops room", "hops"));
+        assertEquals(2, LumenMemory.placeScore("upper hops room", "hops room"));
+        assertEquals(1, LumenMemory.placeScore("hops room", "hopsroom"));
+        assertEquals(1, LumenMemory.placeScore("hops room", "ops"));
+        assertEquals(0, LumenMemory.placeScore("hops room", "copper"));
+        // "room" alone matches every room; a whole-word hit is still only tier 2.
+        assertEquals(2, LumenMemory.placeScore("storage room", "room"));
+    }
+
+    @Test
+    @DisplayName("bearings use minecraft's axes: +z is south, +x is east")
+    void bearings() {
+        net.minecraft.util.math.BlockPos origin = new net.minecraft.util.math.BlockPos(0, 64, 0);
+        assertEquals("north", LumenMemory.bearing(origin, new net.minecraft.util.math.BlockPos(0, 64, -10)));
+        assertEquals("south", LumenMemory.bearing(origin, new net.minecraft.util.math.BlockPos(0, 64, 10)));
+        assertEquals("east", LumenMemory.bearing(origin, new net.minecraft.util.math.BlockPos(10, 64, 0)));
+        assertEquals("west", LumenMemory.bearing(origin, new net.minecraft.util.math.BlockPos(-10, 64, 0)));
+        assertEquals("north-east", LumenMemory.bearing(origin, new net.minecraft.util.math.BlockPos(10, 64, -10)));
+        assertEquals("here", LumenMemory.bearing(origin, origin));
+    }
 }

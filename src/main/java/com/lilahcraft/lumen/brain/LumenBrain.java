@@ -4,6 +4,8 @@ import com.lilahcraft.lumen.Lumen;
 import com.lilahcraft.lumen.LumenConfig;
 import com.lilahcraft.lumen.entity.ChestFinder;
 import com.lilahcraft.lumen.entity.LumenEntity;
+import com.lilahcraft.lumen.entity.LumenTask;
+import com.lilahcraft.lumen.memory.LumenMemory;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.server.world.ServerWorld;
@@ -172,7 +174,17 @@ public final class LumenBrain {
             Lumen.broadcast(server, response.message());
         }
         if (response.hasCommand()) {
-            executeCommand(server, senderName, response.command(), playerText);
+            // "find iron then mine copper then come back" comes back from a small model
+            // as one command. When the player's own sentence has several steps and each
+            // one reads as an instruction, those are the more faithful record.
+            List<String> spoken = inferCommandsFromRequest(playerText);
+            if (spoken.size() > 1 && Phrasing.splitCompound(response.command()).size() == 1) {
+                Lumen.LOGGER.info("model collapsed a {}-step request to '{}'; using the steps as spoken",
+                        spoken.size(), response.command());
+                executeCommand(server, senderName, String.join(" then ", spoken), playerText);
+            } else {
+                executeCommand(server, senderName, response.command(), playerText);
+            }
         } else {
             // The model chatted but sent no command. Rather than saying "on it" and then
             // standing there, work the intent out of what was actually asked.
@@ -233,8 +245,20 @@ public final class LumenBrain {
      */
     public void executeCommand(MinecraftServer server, String senderName, String rawCommand,
                                @Nullable String playerText) {
-        String parsed = normaliseCommand(rawCommand);
-        String outcome = route(server, senderName, parsed, playerText);
+        List<String> parts = Phrasing.splitCompound(rawCommand);
+        if (parts.isEmpty()) {
+            parts = List.of("");
+        }
+        List<String> parsedParts = new ArrayList<>();
+        List<String> outcomes = new ArrayList<>();
+        for (int i = 0; i < parts.size(); i++) {
+            String parsed = normaliseCommand(parts.get(i));
+            parsedParts.add(parsed);
+            // The first step runs now; the rest wait their turn behind it.
+            outcomes.add(route(server, senderName, parsed, playerText, i > 0));
+        }
+        String parsed = String.join(" then ", parsedParts);
+        String outcome = String.join(" | ", outcomes);
         this.lastTrace = new CommandTrace(rawCommand, parsed, outcome);
         Lumen.LOGGER.info("command '{}' parsed as '{}' -> {}", rawCommand, parsed, outcome);
     }
@@ -255,7 +279,12 @@ public final class LumenBrain {
         return fromChat == null ? request : fromChat.applyAmountTo(request);
     }
 
-    private String route(MinecraftServer server, String senderName, String command, @Nullable String playerText) {
+    /**
+     * @param queued true for every step after the first of a compound request - those
+     *               go behind the current errand instead of interrupting it
+     */
+    private String route(MinecraftServer server, String senderName, String command, @Nullable String playerText,
+                         boolean queued) {
         LumenEntity lumen = Lumen.manager().get(server);
         if (lumen == null) {
             return "ignored, not spawned";
@@ -269,6 +298,49 @@ public final class LumenBrain {
         String argument = stripFiller(parts.length > 1 ? parts[1] : "");
 
         switch (verb) {
+            case "remember", "save", "mark", "name", "call" -> {
+                ServerPlayerEntity speaker = resolvePlayer(server, senderName, senderName);
+                if (speaker == null) {
+                    return "no such player: " + senderName;
+                }
+                String name = LumenMemory.cleanPlaceName(Phrasing.placeNameFromRemember(argument));
+                if (name.isEmpty()) {
+                    Lumen.broadcast(server, "what should i call this spot?");
+                    return "no place name given";
+                }
+                Lumen.memory().rememberPlace(name, speaker.getWorld().getRegistryKey().getValue(),
+                        speaker.getBlockPos(), LumenMemory.DEFAULT_PLACE_RADIUS, speaker.getName().getString());
+                Lumen.broadcast(server, "got it, this is the " + name + " now");
+                return "remembered place '" + name + "' at " + speaker.getBlockPos().toShortString();
+            }
+            case "goto", "walk" -> {
+                ServerPlayerEntity speaker = resolvePlayer(server, senderName, senderName);
+                if (speaker == null) {
+                    return "no such player: " + senderName;
+                }
+                if (argument.isEmpty() || argument.equals("me")) {
+                    return routeCome(server, lumen, speaker, queued);
+                }
+                LumenMemory.KnownPlace place = Lumen.memory().findPlace(argument,
+                        speaker.getWorld().getRegistryKey().getValue());
+                if (place == null) {
+                    Lumen.broadcast(server, "i don't know where the " + argument
+                            + " is - stand there and tell me 'remember this as the " + argument + "'");
+                    return "unknown place: " + argument;
+                }
+                return describeSubmission(server, lumen,
+                        lumen.submit(new LumenTask.GoTo(speaker.getUuid(), place.pos(), place.name)),
+                        "heading to the " + place.name, "going to the " + place.name);
+            }
+            case "continue", "resume", "carry", "keep", "proceed", "onward" -> {
+                if (lumen.resume()) {
+                    LumenTask task = lumen.currentTask();
+                    Lumen.broadcast(server, "back to it" + (task == null ? "" : " - " + task.describe()));
+                    return "resumed: " + (task == null ? "?" : task.describe());
+                }
+                Lumen.broadcast(server, lumen.isOnErrand() ? "i'm still on it" : "nothing was waiting");
+                return "nothing to resume";
+            }
             case "idle", "none", "nothing", "relax", "chill", "wander", "explore" -> {
                 // A conversational "idle" must not throw away an errand. Chatting while
                 // Lumen fetches used to cancel the fetch, which is what made it look
@@ -280,8 +352,13 @@ public final class LumenBrain {
                 return "idling";
             }
             case "stay", "stop", "wait", "halt", "hold" -> {
-                lumen.stopAndIdle();
-                return "stopped";
+                if (lumen.isOnErrand() && !playerAsked(playerText, "stay|stop|wait|halt|hold|cancel|never mind|nevermind")) {
+                    // The model said "stop" in passing; the player did not. Small models do
+                    // this mid-conversation, and it used to throw the errand away.
+                    return "kept working (the player did not ask to stop): " + lumen.describeActivity();
+                }
+                int dropped = lumen.cancelAll();
+                return dropped > 1 ? "stopped, dropped " + dropped + " tasks" : "stopped";
             }
             case "follow" -> {
                 ServerPlayerEntity player = resolvePlayer(server,
@@ -289,16 +366,26 @@ public final class LumenBrain {
                 if (player == null) {
                     return "no such player: " + argument;
                 }
+                if (lumen.isOnErrand() && !playerAsked(playerText, "follow|come|with me|here")) {
+                    return "kept working (the player did not ask to be followed): " + lumen.describeActivity();
+                }
+                boolean paused = lumen.currentTask() != null;
+                lumen.pauseForPlayer();
                 lumen.followPlayer(player);
-                return "following " + player.getName().getString();
+                if (paused) {
+                    Lumen.broadcast(server, "ok, i'll pick the rest up when you say carry on");
+                }
+                return "following " + player.getName().getString() + (paused ? " (errand paused)" : "");
             }
-            case "come", "goto", "here", "approach" -> {
+            case "come", "here", "approach" -> {
                 ServerPlayerEntity player = resolvePlayer(server, senderName, senderName);
                 if (player == null) {
                     return "no such player: " + senderName;
                 }
-                lumen.goTo(player.getBlockPos());
-                return "walking to " + player.getName().getString();
+                if (!queued && lumen.isOnErrand() && !playerAsked(playerText, "come|here|over|back|to me")) {
+                    return "kept working (the player did not call): " + lumen.describeActivity();
+                }
+                return routeCome(server, lumen, player, queued);
             }
             case "find", "fetch", "get", "bring", "grab", "collect", "search" -> {
                 if (argument.isEmpty()) {
@@ -308,20 +395,21 @@ public final class LumenBrain {
                 if (requester == null) {
                     return "no such player: " + senderName;
                 }
-                ChestFinder.Request request = resolveFetchRequest(argument, playerText,
+                PlaceLookup where = lookupPlace(argument, requester);
+                ChestFinder.Request request = resolveFetchRequest(where.rest(), playerText,
                         Lumen.config().defaultFetchCount);
-                String wanted = ChestFinder.describeRequest(request);
-                if (!lumen.startFetch(requester, request)) {
-                    if (lumen.fetchSawUnreachable()) {
-                        Lumen.broadcast(server, "i can see some " + request.query()
-                                + " in a container but i can't get to it");
-                        return "found " + request.query() + " but no container holding it is reachable";
-                    }
-                    Lumen.broadcast(server, "i can't find any " + request.query() + " in anything nearby");
-                    return "nothing nearby holds " + request.query();
+                if (where.unknown() != null) {
+                    Lumen.broadcast(server, "i don't know where the " + where.unknown() + " is, so i'll look around here");
                 }
-                return "fetching " + wanted + (request.explicit() && !ChestFinder.parseRequest(argument, 0).explicit()
-                        ? " (amount taken from your message)" : "");
+                String wanted = ChestFinder.describeRequest(request)
+                        + (where.place() == null ? "" : " from the " + where.place().name);
+                String fromChat = request.explicit() && !ChestFinder.parseRequest(where.rest(), 0).explicit()
+                        ? " (amount taken from your message)" : "";
+                return describeSubmission(server, lumen,
+                        lumen.submit(new LumenTask.Fetch(requester.getUuid(), request,
+                                where.place() == null ? null : where.place().pos(),
+                                where.place() == null ? null : where.place().name)),
+                        "on it - " + wanted, "fetching " + wanted + fromChat);
             }
             case "mine", "dig", "chop", "break", "harvest" -> {
                 if (argument.isEmpty()) {
@@ -331,12 +419,16 @@ public final class LumenBrain {
                 if (requester == null) {
                     return "no such player: " + senderName;
                 }
-                String refusal = lumen.startMining(requester, argument);
-                if (refusal != null) {
-                    Lumen.broadcast(server, refusal);
-                    return "refused: " + refusal;
+                PlaceLookup where = lookupPlace(argument, requester);
+                if (where.unknown() != null) {
+                    Lumen.broadcast(server, "i don't know where the " + where.unknown() + " is, so i'll look around here");
                 }
-                return "mining " + argument;
+                String what = where.rest() + (where.place() == null ? "" : " near the " + where.place().name);
+                return describeSubmission(server, lumen,
+                        lumen.submit(new LumenTask.Mine(requester.getUuid(), where.rest(),
+                                where.place() == null ? null : where.place().pos(),
+                                where.place() == null ? null : where.place().name)),
+                        "on my way - mining " + what, "mining " + what);
             }
             case "drop", "give", "hand", "return", "pass" -> {
                 ServerPlayerEntity requester = resolvePlayer(server, senderName, senderName);
@@ -365,6 +457,80 @@ public final class LumenBrain {
     }
 
     /**
+     * "Come here" / "come back". As a step in a compound request it is a task that
+     * waits its turn; on its own it is the player wanting Lumen now, so whatever is
+     * running is paused (not lost) and Lumen walks over.
+     */
+    private String routeCome(MinecraftServer server, LumenEntity lumen, ServerPlayerEntity player, boolean queued) {
+        if (queued) {
+            return describeSubmission(server, lumen, lumen.submit(new LumenTask.Return(player.getUuid())),
+                    "coming", "coming back to " + player.getName().getString());
+        }
+        boolean paused = lumen.currentTask() != null;
+        lumen.pauseForPlayer();
+        lumen.goTo(player.getBlockPos());
+        if (paused) {
+            Lumen.broadcast(server, "ok, coming - say carry on when you want me back on it");
+        }
+        return "walking to " + player.getName().getString() + (paused ? " (errand paused)" : "");
+    }
+
+    /**
+     * Whether the player's own words contain one of these phrases. Null text (a slash
+     * command, or an unknown source) counts as asked: those are never model noise.
+     */
+    static boolean playerAsked(@Nullable String playerText, String phrases) {
+        if (playerText == null) {
+            return true;
+        }
+        return java.util.regex.Pattern.compile("\\b(?:" + phrases + ")\\b", java.util.regex.Pattern.CASE_INSENSITIVE)
+                .matcher(playerText).find();
+    }
+
+    /** Turns a submission into chat and a trace line. */
+    private static String describeSubmission(MinecraftServer server, LumenEntity lumen,
+                                             LumenEntity.Submission result, String sayIfStarted, String trace) {
+        switch (result) {
+            case STARTED -> {
+                return trace;
+            }
+            case QUEUED -> {
+                String later = trace.replaceFirst("^fetching", "fetch")
+                        .replaceFirst("^mining", "mine")
+                        .replaceFirst("^going", "go")
+                        .replaceFirst("^coming back", "come back")
+                        .replaceFirst(" \\(amount taken from your message\\)$", "");
+                Lumen.broadcast(server, "after this, i'll " + later);
+                return "queued (" + lumen.queuedCount() + " waiting): " + trace;
+            }
+            default -> {
+                Lumen.broadcast(server, lumen.lastTaskNote());
+                return "could not start: " + lumen.lastTaskNote();
+            }
+        }
+    }
+
+    /** A fetch/mine argument with any named place resolved. {@code unknown} names a place nobody taught. */
+    private record PlaceLookup(String rest, @Nullable LumenMemory.KnownPlace place, @Nullable String unknown) {
+    }
+
+    private static PlaceLookup lookupPlace(String argument, ServerPlayerEntity requester) {
+        Phrasing.PlaceRef ref = Phrasing.splitPlaceReference(argument);
+        if (ref.place() == null) {
+            return new PlaceLookup(argument, null, null);
+        }
+        LumenMemory.KnownPlace place = Lumen.memory().findPlace(ref.place(),
+                requester.getWorld().getRegistryKey().getValue());
+        if (place != null) {
+            return new PlaceLookup(ref.rest(), place, null);
+        }
+        // "torch in a jar" is an item, not a place. Only complain when it looks like one.
+        boolean looksLikePlace = ref.place().matches(".*\\b(room|house|base|farm|mine|storage|shed|barn|cave|"
+                + "tower|hall|shop|kitchen|cellar|attic|garden|yard|spot|area|place|home)\\b.*");
+        return new PlaceLookup(argument, null, looksLikePlace ? ref.place() : null);
+    }
+
+    /**
      * Reduces whatever the model produced to "verb argument".
      *
      * <p>Handles code fences and quotes around the value, a leading slash, underscores
@@ -382,6 +548,10 @@ public final class LumenBrain {
         text = text.replace('_', ' ');
         text = text.replaceAll("[.!,;:]+$", "");
         text = text.replaceAll("\\s+", " ").trim();
+        // "go to the hops room" is a destination, not the filler "go" in front of a verb.
+        text = text.replaceFirst("^(?:go|head|walk|run)\\s+(?:(?:up|down|over|back|on|in|out)\\s+)?to\\b", "goto");
+        text = text.replaceFirst("^(?:carry\\s+on|keep\\s+going|go\\s+on|get\\s+back\\s+to\\s+it)\\b", "continue");
+        text = text.replaceFirst("^(?:come|go)\\s+back\\b", "come");
         // "go mine iron", "please come", "lumen, follow me"
         for (int i = 0; i < 3; i++) {
             String stripped = text.replaceFirst("^(go|please|now|lumen|hey)\\b[, ]*", "").trim();
@@ -397,7 +567,8 @@ public final class LumenBrain {
     private static final java.util.Set<String> ACTION_VERBS = java.util.Set.of(
             "follow", "come", "goto", "here", "approach", "find", "fetch", "get", "bring",
             "grab", "collect", "search", "mine", "dig", "chop", "break", "harvest", "drop",
-            "give", "hand", "return", "pass", "stay", "stop", "wait", "halt", "hold");
+            "give", "hand", "return", "pass", "stay", "stop", "wait", "halt", "hold",
+            "remember", "save", "mark", "continue", "resume", "carry", "keep", "proceed", "walk");
 
     /**
      * Last resort when the model chats but omits the command field: read the intent
@@ -438,6 +609,21 @@ public final class LumenBrain {
         return ACTION_VERBS.contains(verb) ? normalised : null;
     }
 
+    /**
+     * Every step of a compound request that reads as an instruction, in order. A step
+     * that is only chatter is dropped rather than failing the whole request.
+     */
+    static List<String> inferCommandsFromRequest(@Nullable String playerText) {
+        List<String> out = new ArrayList<>();
+        for (String part : Phrasing.splitCompound(playerText)) {
+            String inferred = inferCommandFromRequest(part);
+            if (inferred != null) {
+                out.add(inferred);
+            }
+        }
+        return out;
+    }
+
     /** "me some iron" -> "iron". */
     static String stripFiller(String argument) {
         String text = argument.trim();
@@ -474,10 +660,17 @@ public final class LumenBrain {
         messages.add(ChatMessage.system(buildSystemPrompt(config)));
         messages.addAll(history);
         String snapshot = WorldSnapshot.describe(lumen, config);
-        String recalled = lumen.getWorld() instanceof ServerWorld world
-                ? Lumen.memory().describe(world.getRegistryKey().getValue(), lumen.getBlockPos(), 6)
-                : "";
-        messages.add(ChatMessage.user(snapshot + recalled + "\n" + senderName + " says: " + text));
+        String recalled = "";
+        String places = "";
+        String queue = "";
+        if (lumen.getWorld() instanceof ServerWorld world) {
+            recalled = Lumen.memory().describe(world.getRegistryKey().getValue(), lumen.getBlockPos(), 6);
+            places = Lumen.memory().describePlaces(world.getRegistryKey().getValue(), lumen.getBlockPos(), 6);
+        }
+        if (lumen.queuedCount() > 0) {
+            queue = "[what you have lined up]\n- " + String.join("\n- ", lumen.describeQueue()) + "\n";
+        }
+        messages.add(ChatMessage.user(snapshot + recalled + places + queue + "\n" + senderName + " says: " + text));
         return messages;
     }
 
@@ -494,7 +687,10 @@ public final class LumenBrain {
                 + "look, and use the come command.\n"
                 + "If a [what you remember from before] block is present, those are places you have "
                 + "actually fetched things from and you may talk about them. When someone asks for "
-                + "something you have found before, you already know where to look - say so.\n\n"
+                + "something you have found before, you already know where to look - say so. "
+                + "A [places you know] block lists spots the player named for you, with how far away "
+                + "they are; use those names in goto, find and mine. A [what you have lined up] block "
+                + "is what you have agreed to do next - do not offer to do it again.\n\n"
                 + "REPLY FORMAT. Every reply is exactly one JSON object with all three fields:\n"
                 + "{\"reason\":\"<short private thought>\","
                 + "\"command\":\"<one command>\","
@@ -510,6 +706,13 @@ public final class LumenBrain {
                 + "  mine <block>    - break blocks of that kind and bring them back\n"
                 + "  give <item>     - hand that item straight to whoever asked (\"give sword\")\n"
                 + "  drop            - hand over everything you are carrying\n"
+                + "  goto <place>    - walk to a place you were taught the name of\n"
+                + "  remember <name> - save the spot the speaker is standing in under that name\n"
+                + "  continue        - carry on with whatever was paused\n"
+                + "Several things in one request are joined with \"then\": \"find iron then mine copper "
+                + "then come\". A place can be named at the end of find or mine: \"find hops from the "
+                + "hops room\", \"mine copper near the copper spot\". A second request waits its turn "
+                + "behind the first; it does not cancel it.\n"
                 + "Name things in plain words - \"iron\", \"oak planks\", \"coal\" - never a mod item "
                 + "id. Partial words match, so \"iron\" finds iron ingots and iron ore. A number or "
                 + "\"all\" or \"a stack\" before the item sets how much: \"find 10 stone\", "
@@ -529,7 +732,11 @@ public final class LumenBrain {
                 + "{\"reason\":\"they called me over\",\"command\":\"come\","
                 + "\"message\":\"coming\"}\n"
                 + "{\"reason\":\"they want stone mined\",\"command\":\"mine stone\","
-                + "\"message\":\"on my way\"}\n\n"
+                + "\"message\":\"on my way\"}\n"
+                + "{\"reason\":\"three jobs in a row\",\"command\":\"find iron then mine copper then come\","
+                + "\"message\":\"iron first, then copper, then back to you\"}\n"
+                + "{\"reason\":\"naming this spot\",\"command\":\"remember hops room\","
+                + "\"message\":\"the hops room, got it\"}\n\n"
                 + "The \"message\" field is the only thing players see: one or two short sentences, "
                 + "lowercase and casual, like typing in chat. Never mention JSON, commands or that "
                 + "you are an AI.";

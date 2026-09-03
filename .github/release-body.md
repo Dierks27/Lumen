@@ -59,6 +59,11 @@ ollama run qwen2.5:14b "hello"
   the mod at fault.
 - Inside a claim, blocks are broken in the name of whoever asked, so Open Parties and
   Claims applies that player's permissions.
+- Named places: stand somewhere and say "remember this as the hops room", then "go to
+  the hops room" or "find hops from the hops room". `/lumen memory` lists them.
+- A second request waits its turn instead of cancelling the first: "grab iron, then
+  mine copper, then come back" runs in order. "Come here" pauses an errand and "carry
+  on" resumes it; `/lumen queue` shows what is lined up.
 - Set `logRawResponses: true` if the model drifts from the expected JSON format —
   that log is where you will see it.
 
