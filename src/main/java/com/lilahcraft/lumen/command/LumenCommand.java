@@ -15,6 +15,10 @@ import com.lilahcraft.lumen.entity.LumenEntity;
 import com.lilahcraft.lumen.entity.LumenTask;
 import com.lilahcraft.lumen.brain.Phrasing;
 import com.lilahcraft.lumen.memory.LumenMemory;
+import com.lilahcraft.lumen.menu.Catalog;
+import com.lilahcraft.lumen.menu.LumenMenu;
+import com.lilahcraft.lumen.menu.PickList;
+import com.lilahcraft.lumen.schedule.RoutineBook;
 import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.context.CommandContext;
@@ -86,6 +90,7 @@ public final class LumenCommand {
                 .then(CommandManager.literal("give")
                         .executes(LumenCommand::drop)
                         .then(CommandManager.argument("item", StringArgumentType.greedyString())
+                                .suggests(LumenSuggestions.PACK)
                                 .executes(LumenCommand::give)))
                 .then(CommandManager.literal("why")
                         .executes(LumenCommand::why))
@@ -106,6 +111,7 @@ public final class LumenCommand {
                                 .executes(LumenCommand::remember)))
                 .then(CommandManager.literal("go")
                         .then(CommandManager.argument("place", StringArgumentType.greedyString())
+                                .suggests(LumenSuggestions.PLACES)
                                 .executes(LumenCommand::go)))
                 .then(CommandManager.literal("look")
                         .executes(LumenCommand::look))
@@ -116,9 +122,11 @@ public final class LumenCommand {
                         .executes(LumenCommand::skills))
                 .then(CommandManager.literal("skill")
                         .then(CommandManager.argument("name", StringArgumentType.greedyString())
+                                .suggests(LumenSuggestions.SKILLS)
                                 .executes(LumenCommand::skill)))
                 .then(CommandManager.literal("do")
                         .then(CommandManager.argument("skill", StringArgumentType.greedyString())
+                                .suggests(LumenSuggestions.SKILLS)
                                 .executes(LumenCommand::doSkill)))
                 .then(CommandManager.literal("wand")
                         .executes(LumenCommand::wand))
@@ -128,6 +136,7 @@ public final class LumenCommand {
                                 .executes(context -> quarry(context, StringArgumentType.getString(context, "area")))))
                 .then(CommandManager.literal("put")
                         .then(CommandManager.argument("what", StringArgumentType.greedyString())
+                                .suggests(LumenSuggestions.PUT)
                                 .executes(LumenCommand::put)))
                 .then(CommandManager.literal("down")
                         .then(CommandManager.argument("y", com.mojang.brigadier.arguments.IntegerArgumentType.integer(-64, 320))
@@ -135,6 +144,38 @@ public final class LumenCommand {
                 .then(CommandManager.literal("craft")
                         .then(CommandManager.argument("item", StringArgumentType.greedyString())
                                 .executes(LumenCommand::craft)))
+                .then(CommandManager.literal("smelt")
+                        .executes(LumenCommand::smeltAll)
+                        .then(CommandManager.argument("item", StringArgumentType.greedyString())
+                                .suggests(LumenSuggestions.SMELTABLE)
+                                .executes(LumenCommand::smelt)))
+                .then(CommandManager.literal("menu")
+                        .executes(LumenCommand::menu))
+                .then(CommandManager.literal("survey")
+                        .executes(LumenCommand::surveyHere)
+                        .then(CommandManager.argument("place", StringArgumentType.greedyString())
+                                .suggests(LumenSuggestions.PLACES)
+                                .executes(LumenCommand::surveyPlace)))
+                .then(CommandManager.literal("where")
+                        .then(CommandManager.argument("item", StringArgumentType.greedyString())
+                                .suggests(LumenSuggestions.NEARBY)
+                                .executes(LumenCommand::where)))
+                .then(CommandManager.literal("routines")
+                        .executes(LumenCommand::routines))
+                .then(CommandManager.literal("routine")
+                        .then(CommandManager.literal("add")
+                                .then(CommandManager.argument("sentence", StringArgumentType.greedyString())
+                                        .executes(LumenCommand::routineAdd)))
+                        .then(CommandManager.literal("remove")
+                                .then(CommandManager.argument("name", StringArgumentType.greedyString())
+                                        .executes(LumenCommand::routineRemove)))
+                        .then(CommandManager.literal("run")
+                                .then(CommandManager.argument("name", StringArgumentType.greedyString())
+                                        .executes(LumenCommand::routineRun))))
+                .then(CommandManager.literal("pick")
+                        .then(CommandManager.literal("smelt").executes(c -> pick(c, "smelt")))
+                        .then(CommandManager.literal("give").executes(c -> pick(c, "give")))
+                        .then(CommandManager.literal("find").executes(c -> pick(c, "find"))))
                 .then(CommandManager.literal("notes")
                         .executes(LumenCommand::notes))
                 .then(CommandManager.literal("queue")
@@ -144,7 +185,9 @@ public final class LumenCommand {
                 .then(CommandManager.literal("continue")
                         .executes(LumenCommand::resume))
                 .then(CommandManager.literal("find")
+                        .executes(c -> pick(c, "find"))
                         .then(CommandManager.argument("item", StringArgumentType.greedyString())
+                                .suggests(LumenSuggestions.NEARBY)
                                 .executes(LumenCommand::find)))
                 .then(CommandManager.literal("mine")
                         .then(CommandManager.argument("block", StringArgumentType.greedyString())
@@ -803,6 +846,195 @@ public final class LumenCommand {
         int count = request.isEverything() ? 1 : Math.max(1, Math.min(64, request.count()));
         LumenEntity.Submission result = lumen.submit(new LumenTask.Craft(player.getUuid(), request.query(), count));
         return reportSubmission(source, result, lumen, "works on " + count + " " + request.query());
+    }
+
+    /**
+     * {@code /lumen smelt} with nothing named: one smeltable kind in the pack just goes;
+     * several get offered as a clickable list, because "everything" is rarely what a
+     * player who typed nothing meant. {@code /lumen smelt everything} skips the question.
+     */
+    private static int smeltAll(CommandContext<ServerCommandSource> context) throws CommandSyntaxException {
+        ServerCommandSource source = context.getSource();
+        ServerPlayerEntity player = source.getPlayerOrThrow();
+        LumenEntity lumen = requireLumen(source);
+        if (lumen == null) {
+            return 0;
+        }
+        if (Catalog.smeltable(lumen).size() > 1 && PickList.offerSmelt(player, lumen)) {
+            return 1;
+        }
+        return submitSmelt(context, "");
+    }
+
+    /** {@code /lumen pick smelt|give|find}: the clickable list on demand. */
+    private static int pick(CommandContext<ServerCommandSource> context, String what) throws CommandSyntaxException {
+        ServerCommandSource source = context.getSource();
+        ServerPlayerEntity player = source.getPlayerOrThrow();
+        LumenEntity lumen = requireLumen(source);
+        if (lumen == null) {
+            return 0;
+        }
+        boolean offered = switch (what) {
+            case "smelt" -> PickList.offerSmelt(player, lumen);
+            case "give" -> PickList.offerGive(player, lumen);
+            default -> PickList.offerFind(player, lumen);
+        };
+        if (!offered) {
+            String name = Lumen.config().companionName;
+            source.sendFeedback(() -> Text.literal(switch (what) {
+                case "smelt" -> name + " is carrying nothing that smelts.";
+                case "give" -> name + "'s pack is empty.";
+                default -> "No containers with anything in them near " + name + ".";
+            }).formatted(Formatting.GRAY), false);
+        }
+        return 1;
+    }
+
+    /** {@code /lumen survey}: every container within reach of where Lumen stands. */
+    private static int surveyHere(CommandContext<ServerCommandSource> context) throws CommandSyntaxException {
+        ServerCommandSource source = context.getSource();
+        ServerPlayerEntity player = source.getPlayerOrThrow();
+        LumenEntity lumen = requireLumen(source);
+        if (lumen == null) {
+            return 0;
+        }
+        int radius = Lumen.config().surveyRadius;
+        LumenEntity.Submission result = lumen.submit(new LumenTask.Survey(player.getUuid(), lumen.getBlockPos(), radius, null));
+        return reportSubmission(source, result, lumen, "goes through the containers within " + radius + " blocks");
+    }
+
+    /** {@code /lumen survey <place>}: around a remembered place. */
+    private static int surveyPlace(CommandContext<ServerCommandSource> context) throws CommandSyntaxException {
+        ServerCommandSource source = context.getSource();
+        ServerPlayerEntity player = source.getPlayerOrThrow();
+        LumenEntity lumen = requireLumen(source);
+        if (lumen == null) {
+            return 0;
+        }
+        String name = StringArgumentType.getString(context, "place");
+        LumenMemory.KnownPlace place = Lumen.memory().findPlace(name, player.getWorld().getRegistryKey().getValue());
+        if (place == null) {
+            source.sendError(Text.literal("No place called '" + name + "'. /lumen places lists them."));
+            return 0;
+        }
+        int radius = Lumen.config().surveyRadius;
+        LumenEntity.Submission result = lumen.submit(new LumenTask.Survey(player.getUuid(), place.pos(), radius, place.name));
+        return reportSubmission(source, result, lumen, "goes through the containers round the " + place.name);
+    }
+
+    /** {@code /lumen where <item>}: where it was last seen on a survey. */
+    private static int where(CommandContext<ServerCommandSource> context) throws CommandSyntaxException {
+        ServerCommandSource source = context.getSource();
+        ServerPlayerEntity player = source.getPlayerOrThrow();
+        String item = StringArgumentType.getString(context, "item").trim();
+        String name = Lumen.config().companionName;
+        List<String> lines = Lumen.storage().whereLines(item, player.getWorld().getRegistryKey().getValue(),
+                player.getBlockPos(), 5);
+        if (lines.isEmpty()) {
+            source.sendFeedback(() -> Text.literal(Lumen.storage().size() == 0
+                    ? name + " has not surveyed any containers yet. /lumen survey to start."
+                    : name + " has not seen any " + item + " in the " + Lumen.storage().size()
+                            + " containers it knows.").formatted(Formatting.GRAY), false);
+            return 1;
+        }
+        source.sendFeedback(() -> Text.literal(name + " last saw:").formatted(Formatting.AQUA), false);
+        for (String line : lines) {
+            source.sendFeedback(() -> Text.literal("  " + line).formatted(Formatting.GRAY), false);
+        }
+        return 1;
+    }
+
+    private static int routines(CommandContext<ServerCommandSource> context) {
+        ServerCommandSource source = context.getSource();
+        List<String> lines = Lumen.routines().lines();
+        String name = Lumen.config().companionName;
+        if (lines.isEmpty()) {
+            source.sendFeedback(() -> Text.literal(name + " has no routines. Try: /lumen routine add every morning: check the hops")
+                    .formatted(Formatting.GRAY), false);
+            return 1;
+        }
+        source.sendFeedback(() -> Text.literal(name + "'s routines:").formatted(Formatting.AQUA), false);
+        for (String line : lines) {
+            source.sendFeedback(() -> Text.literal("  " + line).formatted(Formatting.GRAY), false);
+        }
+        return 1;
+    }
+
+    /** {@code /lumen routine add every morning: check the hops} - same words as chat. */
+    private static int routineAdd(CommandContext<ServerCommandSource> context) throws CommandSyntaxException {
+        ServerCommandSource source = context.getSource();
+        ServerPlayerEntity player = source.getPlayerOrThrow();
+        String sentence = StringArgumentType.getString(context, "sentence");
+        String result = Lumen.brain().runRoutineCommand(source.getServer(), player.getName().getString(),
+                "schedule " + sentence, false);
+        source.sendFeedback(() -> Text.literal(result).formatted(Formatting.GRAY), false);
+        return result.startsWith("saved") ? 1 : 0;
+    }
+
+    private static int routineRemove(CommandContext<ServerCommandSource> context) {
+        ServerCommandSource source = context.getSource();
+        String name = StringArgumentType.getString(context, "name");
+        if (Lumen.routines().remove(name)) {
+            source.sendFeedback(() -> Text.literal("Dropped routine '" + name + "'.").formatted(Formatting.AQUA), false);
+            return 1;
+        }
+        source.sendError(Text.literal("No routine matching '" + name + "'. /lumen routines lists them."));
+        return 0;
+    }
+
+    /** {@code /lumen routine run <name>}: do it now, whatever the clock says. */
+    private static int routineRun(CommandContext<ServerCommandSource> context) throws CommandSyntaxException {
+        ServerCommandSource source = context.getSource();
+        ServerPlayerEntity player = source.getPlayerOrThrow();
+        String name = StringArgumentType.getString(context, "name");
+        RoutineBook.Routine routine = Lumen.routines().find(name);
+        if (routine == null) {
+            source.sendError(Text.literal("No routine matching '" + name + "'."));
+            return 0;
+        }
+        boolean first = true;
+        for (String command : routine.commands) {
+            String result = Lumen.brain().runRoutineCommand(source.getServer(), player.getName().getString(), command, !first);
+            source.sendFeedback(() -> Text.literal(command + " -> " + result).formatted(Formatting.GRAY), false);
+            first = false;
+        }
+        return 1;
+    }
+
+    /** {@code /lumen menu}: the chest-screen menu. */
+    private static int menu(CommandContext<ServerCommandSource> context) throws CommandSyntaxException {
+        ServerCommandSource source = context.getSource();
+        ServerPlayerEntity player = source.getPlayerOrThrow();
+        LumenEntity lumen = requireLumen(source);
+        if (lumen == null) {
+            return 0;
+        }
+        LumenMenu.open(player, lumen);
+        return 1;
+    }
+
+    /** {@code /lumen smelt 10 raw iron}: the input, or what it should become. */
+    private static int smelt(CommandContext<ServerCommandSource> context) throws CommandSyntaxException {
+        return submitSmelt(context, StringArgumentType.getString(context, "item"));
+    }
+
+    private static int submitSmelt(CommandContext<ServerCommandSource> context, String what) throws CommandSyntaxException {
+        if (PickList.isOpenEnded(what) && !what.isBlank()) {
+            // "/lumen smelt something": ask, same as typing nothing.
+            return smeltAll(context);
+        }
+        ServerCommandSource source = context.getSource();
+        ServerPlayerEntity player = source.getPlayerOrThrow();
+        LumenEntity lumen = requireLumen(source);
+        if (lumen == null) {
+            return 0;
+        }
+        ChestFinder.Request request = ChestFinder.parseRequest(what, 0);
+        String query = ChestFinder.meansEverything(request.query()) ? "" : request.query();
+        int count = request.explicit() && !request.isEverything() ? request.count() : 0;
+        LumenEntity.Submission result = lumen.submit(new LumenTask.Smelt(player.getUuid(), query, count));
+        return reportSubmission(source, result, lumen, "goes to smelt "
+                + (query.isEmpty() ? "everything" : (count > 0 ? count + " " : "") + query));
     }
 
     private static int notes(CommandContext<ServerCommandSource> context) {
