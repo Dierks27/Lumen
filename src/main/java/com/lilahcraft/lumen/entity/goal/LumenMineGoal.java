@@ -16,9 +16,6 @@ import java.util.EnumSet;
  */
 public class LumenMineGoal extends Goal {
 
-    /** Close enough to swing at it. */
-    private static final double REACH = 4.0D;
-
     private final LumenEntity lumen;
     private BlockPos target;
     private int progressTicks;
@@ -80,7 +77,7 @@ public class LumenMineGoal extends Goal {
 
         lumen.getLookControl().lookAt(Vec3d.ofCenter(target));
 
-        if (!lumen.getBlockPos().isWithinDistance(target, REACH)) {
+        if (!lumen.canReach(target)) {
             resetProgress();
             if (--this.repathCountdown > 0) {
                 return;
