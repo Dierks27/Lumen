@@ -28,6 +28,9 @@ public final class Lumen implements ModInitializer {
     private static final LumenManager MANAGER = new LumenManager();
     private static final LumenBrain BRAIN = new LumenBrain();
     private static final LumenMemory MEMORY = new LumenMemory();
+    private static final com.lilahcraft.lumen.memory.StorageMap STORAGE = new com.lilahcraft.lumen.memory.StorageMap();
+    private static final com.lilahcraft.lumen.schedule.RoutineBook ROUTINES = new com.lilahcraft.lumen.schedule.RoutineBook();
+    private static final com.lilahcraft.lumen.schedule.Scheduler SCHEDULER = new com.lilahcraft.lumen.schedule.Scheduler();
     private static final SkillBook SKILLS = new SkillBook();
     private static volatile LumenConfig config = LumenConfig.defaults();
 
@@ -48,6 +51,16 @@ public final class Lumen implements ModInitializer {
         return MEMORY;
     }
 
+    /** Lumen's map of what every surveyed container holds. */
+    public static com.lilahcraft.lumen.memory.StorageMap storage() {
+        return STORAGE;
+    }
+
+    /** Jobs Lumen does on a schedule. */
+    public static com.lilahcraft.lumen.schedule.RoutineBook routines() {
+        return ROUTINES;
+    }
+
     /** Skills players have taught Lumen. */
     public static SkillBook skills() {
         return SKILLS;
@@ -62,7 +75,10 @@ public final class Lumen implements ModInitializer {
     public void onInitialize() {
         config = LumenConfig.loadOrCreate();
         MEMORY.load();
+        STORAGE.load();
+        ROUTINES.load();
         SKILLS.load();
+        net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents.END_SERVER_TICK.register(SCHEDULER::tick);
         LumenWand.register();
         LOGGER.info("Lumen ready - model {} at {}", config.model, config.ollamaUrl);
 
@@ -82,6 +98,8 @@ public final class Lumen implements ModInitializer {
             MANAGER.despawn(server);
             BRAIN.shutdown();
             MEMORY.save();
+            STORAGE.save();
+            ROUTINES.save();
             SKILLS.save();
         });
     }

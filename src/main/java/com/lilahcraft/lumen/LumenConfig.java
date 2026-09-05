@@ -189,6 +189,13 @@ public final class LumenConfig {
     /** Blocks a single run of a skill may work through. */
     public int maxSkillBlocks = 32;
 
+    /**
+     * How far from its eyes Lumen can break or use a block, in blocks. A player reaches
+     * about 4.5; earlier builds only ever stood beside a block, which capped it at head
+     * height.
+     */
+    public double reachDistance = 4.5D;
+
     /** Steps a taught skill may have. */
     public int maxSkillSteps = 12;
 
@@ -212,6 +219,26 @@ public final class LumenConfig {
     // ---------------------------------------------------------------- crafting
 
     public boolean allowCrafting = true;
+
+    /** Let Lumen load furnaces from its pack and take the product back out. */
+    public boolean allowSmelting = true;
+
+    /** Right-clicking Lumen with a plain stick opens the menu (/lumen menu does too). */
+    public boolean menuOnStick = true;
+
+    /**
+     * How far from the starting point a survey looks for containers, in blocks. A base
+     * is bigger than a chest search: 50 covers most builds from the middle. Chunks
+     * that are not loaded are skipped, so a huge number costs nothing but a longer walk.
+     */
+    public int surveyRadius = 50;
+
+    /**
+     * After this many minutes with nothing to do, Lumen goes and looks in the chests
+     * again so its map of where things are stays current. 0 turns the idle survey off;
+     * "lumen, check the chests" still works.
+     */
+    public int idleSurveyMinutes = 20;
 
     /** Recipes bigger than 2x2 need a crafting table within reach, like a player. */
     public boolean craftingNeedsTable = true;
@@ -386,6 +413,9 @@ public final class LumenConfig {
         adminPermissionLevel = (int) clamp(adminPermissionLevel, 0, 4);
         interactRange = clamp(interactRange, 4.0D, 128.0D);
         maxSkillBlocks = (int) clamp(maxSkillBlocks, 1, 256);
+        reachDistance = clamp(reachDistance, 2.0D, 6.0D);
+        idleSurveyMinutes = (int) clamp(idleSurveyMinutes, 0, 24 * 60);
+        surveyRadius = (int) clamp(surveyRadius, 8, 160);
         maxSkillSteps = (int) clamp(maxSkillSteps, 1, 32);
         pathSearchEffort = (int) clamp(pathSearchEffort, 1, 64);
         waterPenalty = clamp(waterPenalty, 0.0D, 64.0D);
