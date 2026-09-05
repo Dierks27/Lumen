@@ -187,6 +187,26 @@ specific code.
   restart. `/lumen notes` shows them, `/lumen forget note <n>` and
   `/lumen forget notes` drop them
 
+## v0.9.1 - what changed
+
+Three fixes for the things that were quietly not working:
+
+- **Teaching by chat grounds on what you were looking at when you spoke**, not on
+  whatever your crosshair had drifted to 5-15 seconds later when the model answered.
+  The same snapshot feeds "put it in this chest", "remember this as home" and
+  "stand here". With `logRawResponses` on, the log shows the block captured for
+  every line you say.
+- **Lumen reaches as high as a player.** It used to stand beside a block only, so
+  anything above head height was "couldn't reach". It now stands below and reaches
+  up, to `reachDistance` (4.5) from its eyes, with the same real path test as before.
+- **Right-clicks go through the real click path** (`ServerPlayerInteractionManager#interactBlock`),
+  so Fabric's `UseBlockCallback` fires. Right-click-harvest mods live there, which is
+  why hops (self-harvesting in `onUse`) worked and vanilla carrots never did. For the
+  length of the click the player's main hand is swapped for Lumen's, so a mod that
+  wants a hoe sees Lumen's hoe and nothing the player is holding gets placed or used.
+  Blocks with a block entity are no longer skipped by click steps unless they are
+  actual containers or machines - modded crops often have one.
+
 ## Server-side only, and what that costs
 
 Lumen is installed on the **server only**. Players join with an unmodified client.
@@ -274,6 +294,96 @@ fenced in:
 
 Mining and fetching are separate: `mine` breaks blocks, `find` searches containers.
 Neither silently becomes the other.
+
+## Smelting
+
+`lumen smelt the raw iron`, `smelt everything`, `/lumen smelt 10 raw copper`. Lumen
+already knows what smelts into what: the server's recipe manager holds every
+`smelting`, `blasting` and `smoking` recipe from every mod, and that is what it reads.
+Nobody has to teach it that raw tin becomes a tin ingot.
+
+The words can name the input ("raw iron"), the product ("iron ingots"), or nothing at
+all, which means everything in the pack that any furnace would take. It finds the
+nearest furnace it can walk to of a kind that accepts the item - a blast furnace only
+runs blasting recipes, a smoker only smoking - loads input and fuel from its pack the
+way a hopper would (input in the top, fuel in the side, product out the bottom), waits
+beside it, tops the fuel up if the fire goes out, takes the product and brings it back.
+Modded furnaces work as long as they expose storage on those three sides, which is the
+convention nearly all of them follow.
+
+Fuel comes from its pack; give it coal or charcoal. It picks the fuel that wastes least
+(coal before a block of coal before a lava bucket) and puts in only as much as the job
+needs. With no fuel on it and a cold furnace it fetches some coal from a nearby
+container first, then comes back to the job; if there is none to be had it says so.
+
+Call it away mid-cook and it says where the ore is, does what you asked, and goes
+back to the furnace for the product afterwards.
+
+`smelt` is also a skill step, so an ore routine is one lesson:
+
+```
+lumen learn ore run: take raw iron from the ore chest, then smelt it, then put the ingots in the ingot barrel
+```
+
+`allowSmelting: false` turns it off.
+
+## Knowing where things are
+
+`lumen, check the chests` (or `/lumen survey`, `/lumen survey the storage room`) sends
+Lumen round every container within `surveyRadius` blocks (50; loaded chunks only),
+opening each one in turn and writing down
+what it holds - block, position, contents, time - into `config/lumen/storage.json`.
+That map is what it answers from afterwards: `where is the raw iron` / `/lumen where
+raw iron` gives "12 raw iron in the chest at 10, 64, -3 (seen 2 hours ago)", and a
+fetch tries the containers it remembers holding the item before it searches the chunks.
+The model sees a summary of the map too, so "do we have any copper" gets a real answer.
+
+Things move, so the map is refreshed rather than trusted: after `idleSurveyMinutes`
+(20) with nothing to do and nobody to follow, Lumen wanders off and looks in the chests
+again on its own. Set it to 0 to keep it still. A survey is an ordinary job - calling
+Lumen away pauses it and it picks up where it left off.
+
+## Routines
+
+`lumen, check the hops every morning`, `look through the chests every 2 hours`,
+`every evening: check the garden then come back`. Lumen turns the job words into its
+own commands on the spot (a taught skill by name becomes `do <skill>`, a place it knows
+becomes `goto <place>`, "the chests" becomes `survey`), tells you what it understood,
+and saves the routine to `config/lumen/routines.json`.
+
+Daily routines run at a Minecraft time of day - morning, noon, afternoon, evening,
+night, midnight - once per in-game day, the first time the clock passes it while Lumen
+is free. Interval routines run every N real minutes (five at least). A routine set
+after its time today waits for tomorrow; one Lumen was too busy for runs as soon as
+it is free, and a missed day is simply missed. Nothing runs with no players online.
+
+`/lumen routines` lists them, `/lumen routine add <sentence>` is the command form,
+`/lumen routine run <name>` does one now, `/lumen routine remove <name>` drops it.
+Routines run as if the player who set them up had asked, so what they fetch or make is
+brought to that player (or the nearest one when they are offline).
+
+## Picking things instead of typing them
+
+Modded item names are long, easy to misspell, and sometimes show up as
+`item.somemod.raw_tin` when a mod forgot its lang file. Three ways round typing them,
+all server-side so a vanilla client sees them:
+
+- Tab-completion on every item argument. `/lumen smelt <tab>` cycles through only
+  what is in the pack and would cook; `/lumen give`, `/lumen put`, `/lumen find`,
+  `/lumen do` and `/lumen go` complete from the pack, nearby containers, skills and
+  places.
+- Clickable lists in chat. "lumen, smelt something" with several smeltable things in
+  the pack comes back as `smelt which? [raw iron x10] [raw tin x4]` - click one.
+  `/lumen smelt` alone, `/lumen find` alone, and `/lumen pick smelt|give|find` do the
+  same on demand.
+- A menu. `/lumen menu`, or right-click Lumen holding a plain stick, opens a chest
+  screen: actions across the top (smelt, put away, give me, find, skills, places, come
+  here, stop), what to pick underneath, pages at the bottom. Nothing in it can be
+  taken out; a click runs the matching `/lumen` command and closes. `menuOnStick:
+  false` turns the stick off.
+
+The put page picks the item first, then where: a container that already holds it,
+the nearest one, or any specific container nearby with what it holds in the tooltip.
 
 ## Pathfinding and modded blocks
 
