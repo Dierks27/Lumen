@@ -16,6 +16,10 @@ import com.lilahcraft.lumen.command.LumenCommand;
 import com.lilahcraft.lumen.entity.LumenEntity;
 import com.lilahcraft.lumen.entity.LumenTask;
 import com.lilahcraft.lumen.memory.LumenMemory;
+import com.lilahcraft.lumen.menu.Catalog;
+import com.lilahcraft.lumen.menu.PickList;
+import com.lilahcraft.lumen.schedule.RoutineBook;
+import com.lilahcraft.lumen.schedule.Scheduler;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.server.world.ServerWorld;
@@ -24,6 +28,9 @@ import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
 import org.jetbrains.annotations.Nullable;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -93,6 +100,60 @@ public final class LumenBrain {
         return lastRawContent;
     }
 
+
+    /**
+     * What a player was looking at and where they stood at the moment they spoke.
+     *
+     * <p>The model takes 5-15 seconds to answer. Reading the player's crosshair when
+     * the command finally runs meant "harvest these" was grounded on whatever they
+     * had wandered off to look at in the meantime - usually the floor, or Lumen.
+     * The snapshot is taken on the server thread as the chat line arrives and
+     * consumed by the command that comes back for it.
+     */
+    public record SpokenContext(SkillTeacher.LookedAt looked, BlockPos standingAt, long spokenAtMillis) {
+        public boolean isFresh() {
+            return System.currentTimeMillis() - spokenAtMillis < SPOKEN_CONTEXT_TTL_MILLIS;
+        }
+    }
+
+    /** Longer than any request timeout, so a slow model still finds its snapshot. */
+    private static final long SPOKEN_CONTEXT_TTL_MILLIS = 5 * 60 * 1000L;
+
+    private final Map<UUID, SpokenContext> spokenContexts = new ConcurrentHashMap<>();
+
+    /** Records where the player is and what they look at, right now. Server thread only. */
+    private void captureSpokenContext(ServerPlayerEntity sender) {
+        try {
+            SkillTeacher.LookedAt looked = LumenCommand.lookedAt(sender);
+            spokenContexts.put(sender.getUuid(), new SpokenContext(looked, sender.getBlockPos(), System.currentTimeMillis()));
+            if (Lumen.config().logRawResponses) {
+                Lumen.LOGGER.info("{} spoke looking at {}{} from {}", sender.getName().getString(),
+                        looked.hasBlock() ? looked.blockId() : "nothing",
+                        looked.ripe() ? " (ripe)" : "", sender.getBlockPos().toShortString());
+            }
+        } catch (RuntimeException e) {
+            Lumen.LOGGER.warn("Could not capture what {} was looking at: {}", sender.getName().getString(), e.toString());
+        }
+    }
+
+    /** The block the player was looking at when they spoke, falling back to a live raycast. */
+    SkillTeacher.LookedAt lookedAtWhenSpoken(ServerPlayerEntity player) {
+        SpokenContext context = spokenContexts.get(player.getUuid());
+        if (context != null && context.isFresh() && context.looked() != null) {
+            return context.looked();
+        }
+        return LumenCommand.lookedAt(player);
+    }
+
+    /** Where the player stood when they spoke, falling back to where they are now. */
+    BlockPos standingAtWhenSpoken(ServerPlayerEntity player) {
+        SpokenContext context = spokenContexts.get(player.getUuid());
+        if (context != null && context.isFresh() && context.standingAt() != null) {
+            return context.standingAt();
+        }
+        return player.getBlockPos();
+    }
+
     private synchronized OllamaClient client(LumenConfig config) {
         if (client == null || clientConnectTimeout != config.connectTimeoutSeconds) {
             if (client != null) {
@@ -131,6 +192,9 @@ public final class LumenBrain {
         }
         String senderName = sender.getName().getString();
         String line = senderName + ": " + text;
+        // Taken before anything else: this is the crosshair and position the request
+        // is about, regardless of how long the model takes to answer.
+        captureSpokenContext(sender);
 
         if (!forced && !isAddressedToLumen(config, text)) {
             // Not for Lumen, but it was said in earshot. Keeping it means the next
@@ -333,10 +397,11 @@ public final class LumenBrain {
                     Lumen.broadcast(server, "what should i call this spot?");
                     return "no place name given";
                 }
+                BlockPos spot = standingAtWhenSpoken(speaker);
                 Lumen.memory().rememberPlace(name, speaker.getWorld().getRegistryKey().getValue(),
-                        speaker.getBlockPos(), LumenMemory.DEFAULT_PLACE_RADIUS, speaker.getName().getString());
+                        spot, LumenMemory.DEFAULT_PLACE_RADIUS, speaker.getName().getString());
                 Lumen.broadcast(server, "got it, this is the " + name + " now");
-                return "remembered place '" + name + "' at " + speaker.getBlockPos().toShortString();
+                return "remembered place '" + name + "' at " + spot.toShortString();
             }
             case "goto", "walk", "stand", "descend", "down" -> {
                 ServerPlayerEntity speaker = resolvePlayer(server, senderName, senderName);
@@ -346,8 +411,8 @@ public final class LumenBrain {
                 if (verb.equals("stand") && (argument.isEmpty() || argument.matches("here|there|still|by me|next to me|with me"))) {
                     // "stand here" is a spot to be at, not a follow.
                     return describeSubmission(server, lumen,
-                            lumen.submit(new LumenTask.GoTo(speaker.getUuid(), speaker.getBlockPos(), null)),
-                            "coming to stand there", "going to stand at " + speaker.getBlockPos().toShortString());
+                            lumen.submit(new LumenTask.GoTo(speaker.getUuid(), standingAtWhenSpoken(speaker), null)),
+                            "coming to stand there", "going to stand at " + standingAtWhenSpoken(speaker).toShortString());
                 }
                 if (argument.isEmpty() || argument.equals("me")) {
                     return routeCome(server, lumen, speaker, queued);
@@ -548,6 +613,28 @@ public final class LumenBrain {
                         lumen.submit(new LumenTask.Craft(requester.getUuid(), request.query(), count)),
                         "let me see what i can make", "crafting " + count + " " + request.query());
             }
+            case "smelt", "cook", "melt" -> {
+                ServerPlayerEntity requester = resolvePlayer(server, senderName, senderName);
+                if (requester == null) {
+                    return "no such player: " + senderName;
+                }
+                // "smelt", "smelt everything", "smelt 10 raw iron", "cook up what you've got"
+                String what = argument.replaceFirst("^(?:up|down|the|my|some|all\\s+of\\s+the|all\\s+the)\\s+", "").trim();
+                if (PickList.isOpenEnded(what) && Catalog.smeltable(lumen).size() > 1
+                        && PickList.offerSmelt(requester, lumen)) {
+                    // Several things would cook: ask with a clickable list rather than guess.
+                    return "asked " + senderName + " which of " + Catalog.smeltable(lumen).size()
+                            + " smeltable items to cook (clickable list sent)";
+                }
+                ChestFinder.Request request = ChestFinder.parseRequest(what, 0);
+                String query = request.query().matches("|it|them|that|those|these|things|stuff|what\\s+you(?:'ve|\\s+have)?\\s+got|what\\s+i\\s+gave\\s+you")
+                        || ChestFinder.meansEverything(request.query()) ? "" : request.query();
+                // "all the raw iron" is every raw iron, not a count; only a number caps it.
+                int count = request.explicit() && !request.isEverything() ? request.count() : 0;
+                return describeSubmission(server, lumen,
+                        lumen.submit(new LumenTask.Smelt(requester.getUuid(), query, count)),
+                        "on it - i'll find a furnace", "smelting " + (query.isEmpty() ? "everything" : (count > 0 ? count + " " : "") + query));
+            }
             case "put", "store", "stash", "deposit", "unload" -> {
                 ServerPlayerEntity requester = resolvePlayer(server, senderName, senderName);
                 if (requester == null) {
@@ -562,7 +649,7 @@ public final class LumenBrain {
                         sentence = m.group(2).replaceAll("[?!.]+$", "");
                     }
                 }
-                SkillStep step = SkillTeacher.parseClause("put " + sentence, LumenCommand.lookedAt(requester));
+                SkillStep step = SkillTeacher.parseClause("put " + sentence, lookedAtWhenSpoken(requester));
                 if (step == null || !SkillStep.PUT.equals(step.kind)) {
                     Lumen.broadcast(server, "what goes where? like \"put the wheat in this chest\" while looking at it");
                     return "could not parse a deposit from '" + sentence + "'";
@@ -571,6 +658,63 @@ public final class LumenBrain {
                         lumen.submit(new LumenTask.Deposit(requester.getUuid(), step.item, step.count,
                                 step.hasPos() ? new BlockPos(step.pos[0], step.pos[1], step.pos[2]) : null, step.target)),
                         "on it - " + step.describe(), step.describe());
+            }
+            case "survey", "inventory" -> {
+                ServerPlayerEntity requester = resolvePlayer(server, senderName, senderName);
+                if (requester == null) {
+                    return "no such player: " + senderName;
+                }
+                // "survey", "survey the storage room", "survey around here"
+                String where = argument.replaceFirst("^(?:the\\s+)?(?:chests?|storage|containers?|stock)\\s*", "")
+                        .replaceFirst("^(?:in|at|around|round|near)\\s+(?:the\\s+)?", "").trim();
+                BlockPos center = lumen.getBlockPos();
+                String label = null;
+                if (!where.isEmpty() && !where.matches("here|this|there")) {
+                    LumenMemory.KnownPlace place = Lumen.memory().findPlace(where, requester.getWorld().getRegistryKey().getValue());
+                    if (place == null) {
+                        Lumen.broadcast(server, "i don't know a place called " + where);
+                        return "no place named '" + where + "'";
+                    }
+                    center = place.pos();
+                    label = place.name;
+                } else if (where.matches("here|this|there")) {
+                    center = standingAtWhenSpoken(requester);
+                }
+                int radius = Lumen.config().surveyRadius;
+                return describeSubmission(server, lumen,
+                        lumen.submit(new LumenTask.Survey(requester.getUuid(), center, radius, label)),
+                        "on it - i'll go through the chests" + (label == null ? "" : " round the " + label),
+                        "survey " + (label == null ? center.toShortString() : label));
+            }
+            case "where", "locate", "whereis" -> {
+                ServerPlayerEntity requester = resolvePlayer(server, senderName, senderName);
+                if (requester == null) {
+                    return "no such player: " + senderName;
+                }
+                String item = argument.replaceFirst("^(?:is|are|do\\s+we\\s+keep|did\\s+you\\s+see|can\\s+i\\s+find)\\s+(?:the\\s+|my\\s+|our\\s+|some\\s+|any\\s+)?", "")
+                        .replaceAll("\\?+$", "").trim();
+                if (item.isEmpty()) {
+                    return "no item named";
+                }
+                List<String> lines = Lumen.storage().whereLines(item, lumen.getWorld().getRegistryKey().getValue(),
+                        lumen.getBlockPos(), 3);
+                if (lines.isEmpty()) {
+                    boolean surveyed = Lumen.storage().size() > 0;
+                    Lumen.broadcast(server, surveyed
+                            ? "i haven't seen any " + item + " in the chests i've looked in"
+                            : "i haven't been through the chests yet - say check the chests and i'll go look");
+                    return "no " + item + " in the storage map (" + Lumen.storage().size() + " containers known)";
+                }
+                Lumen.broadcast(server, "last i looked, " + String.join("; ", lines));
+                return "told them: " + String.join("; ", lines);
+            }
+            case "schedule", "routine", "every" -> {
+                ServerPlayerEntity requester = resolvePlayer(server, senderName, senderName);
+                if (requester == null) {
+                    return "no such player: " + senderName;
+                }
+                String sentence = "every".equals(verb) ? "every " + argument : argument;
+                return routeSchedule(server, requester, sentence);
             }
             case "wand" -> {
                 ServerPlayerEntity player = resolvePlayer(server, senderName, senderName);
@@ -584,6 +728,53 @@ public final class LumenBrain {
             default -> {
                 return "unrecognised verb '" + verb + "'";
             }
+        }
+    }
+
+    /**
+     * "every morning: check the hops" - saves a routine. The job words become Lumen
+     * commands here, deterministically, so the model only ever has to copy the sentence.
+     */
+    private String routeSchedule(MinecraftServer server, ServerPlayerEntity requester, String sentence) {
+        String[] split = RoutineBook.splitScheduleSentence(sentence);
+        if (split == null) {
+            Lumen.broadcast(server, "when should i do that? say every morning, every evening, or every 2 hours");
+            return "could not read a schedule from '" + sentence + "'";
+        }
+        RoutineBook.Routine routine = RoutineBook.parseWhen(split[0]);
+        if (routine == null) {
+            Lumen.broadcast(server, "i didn't get the time - every morning, every night, every 30 minutes?");
+            return "could not read a time from '" + split[0] + "'";
+        }
+        List<String> unknown = new ArrayList<>();
+        List<String> commands = Scheduler.jobToCommands(split[1], requester, unknown);
+        if (commands.isEmpty()) {
+            Lumen.broadcast(server, "i don't know how to " + split[1] + " - teach me first, or name a place i know");
+            return "no known command in '" + split[1] + "'";
+        }
+        routine.commands = commands;
+        routine.name = Scheduler.nameFor(split[1], commands);
+        routine.createdBy = requester.getName().getString();
+        routine.created = System.currentTimeMillis();
+        if (!Lumen.routines().put(routine)) {
+            Lumen.broadcast(server, "i've got too many routines already - drop one first");
+            return "routine book full";
+        }
+        String said = "ok - " + routine.describe();
+        if (!unknown.isEmpty()) {
+            said += " (i skipped " + String.join(" and ", unknown) + ", don't know how)";
+        }
+        Lumen.broadcast(server, said);
+        return "saved routine '" + routine.name + "': " + routine.describe();
+    }
+
+    /** A routine's command, run as if {@code playerName} had said it. Server thread. */
+    public String runRoutineCommand(MinecraftServer server, String playerName, String command, boolean queued) {
+        try {
+            return route(server, playerName, normaliseCommand(command), command, queued);
+        } catch (RuntimeException e) {
+            Lumen.LOGGER.warn("Routine command '{}' threw {}", command, e.toString());
+            return "failed: " + e;
         }
     }
 
@@ -663,7 +854,7 @@ public final class LumenBrain {
                 }
             }
         }
-        SkillTeacher.LookedAt looked = LumenCommand.lookedAt(teacher);
+        SkillTeacher.LookedAt looked = lookedAtWhenSpoken(teacher);
         String lookedAt = looked.blockId();
         LumenSkill skill = SkillTeacher.parse(lesson, looked);
         if (skill == null) {
@@ -891,7 +1082,8 @@ public final class LumenBrain {
             "give", "hand", "return", "pass", "stay", "stop", "wait", "halt", "hold",
             "remember", "save", "mark", "continue", "resume", "carry", "keep", "proceed", "walk",
             "learn", "teach", "do", "run", "craft", "make", "quarry", "excavate", "wand",
-            "put", "store", "stash", "deposit", "unload", "stand", "descend", "down", "take");
+            "put", "store", "stash", "deposit", "unload", "stand", "descend", "down", "take",
+            "smelt", "cook", "melt", "survey", "where", "schedule", "routine", "every");
 
     /**
      * Last resort when the model chats but omits the command field: read the intent
@@ -904,7 +1096,7 @@ public final class LumenBrain {
      * @return a command string, or null if the request was not an instruction
      */
     @Nullable
-    static String inferCommandFromRequest(String playerText) {
+    public static String inferCommandFromRequest(String playerText) {
         if (playerText == null) {
             return null;
         }
@@ -920,6 +1112,7 @@ public final class LumenBrain {
                     .replaceFirst("^(i\\s+want|i\\s+need)\\s+(the|my|that)\\b(.*)\\bback$", "give me $2$3")
                     .replaceFirst("^(i\\s+need|i\\s+want|make\\s+me|craft\\s+me|could\\s+you\\s+make)\\s+(?!you\\b|the\\b|my\\b|that\\b)", "craft ")
                     .replaceFirst("^(mine|dig)\\s+out\\b", "quarry")
+                    .replaceFirst("^(?:can\\s+you\\s+|could\\s+you\\s+|please\\s+|go\\s+)?(smelt|cook|melt)(?:\\s+down|\\s+up)?\\b", "smelt")
                     .trim();
             if (peeled.equals(text)) {
                 break;
@@ -929,6 +1122,17 @@ public final class LumenBrain {
         String normalised = normaliseCommand(text);
         if (normalised.isEmpty()) {
             return null;
+        }
+        // "check the hops every morning" is a schedule whatever else it looks like.
+        if (RoutineBook.splitScheduleSentence(normalised) != null
+                && normalised.matches(".*\\b(?:every|each|daily|once a day)\\b.*")) {
+            return "schedule " + normalised;
+        }
+        if (normalised.matches("^(?:check|look in|look through|go through|inspect|survey|scan)\\s+(?:the\\s+|all\\s+the\\s+|my\\s+)?(?:chests?|storage|containers?|barrels?)\\b.*")) {
+            return normalised.replaceFirst("^(?:check|look in|look through|go through|inspect|survey|scan)\\s+", "survey ");
+        }
+        if (normalised.matches("^where(?:'s| is| are| do we keep| did you see| can i find)\\b.*")) {
+            return "where " + normalised.replaceFirst("^where(?:'s| is| are| do we keep| did you see| can i find)\\s+", "");
         }
         String verb = normalised.split(" ", 2)[0];
         return ACTION_VERBS.contains(verb) ? normalised : null;
@@ -988,16 +1192,23 @@ public final class LumenBrain {
         String recalled = "";
         String places = "";
         String queue = "";
+        String storage = "";
+        String routines = "";
         if (lumen.getWorld() instanceof ServerWorld world) {
             recalled = Lumen.memory().describe(world.getRegistryKey().getValue(), lumen.getBlockPos(), 6);
             places = Lumen.memory().describePlaces(world.getRegistryKey().getValue(), lumen.getBlockPos(), 6);
+            storage = Lumen.storage().describeForPrompt(world.getRegistryKey().getValue(), lumen.getBlockPos(), 12);
+        }
+        if (Lumen.routines().size() > 0) {
+            routines = "[your routines]\n- " + String.join("\n- ", Lumen.routines().lines()) + "\n";
         }
         if (lumen.queuedCount() > 0) {
             queue = "[what you have lined up]\n- " + String.join("\n- ", lumen.describeQueue()) + "\n";
         }
         String skills = Lumen.skills().describeForPrompt(text, 3);
         String notes = Lumen.memory().describeNotes();
-        messages.add(ChatMessage.user(snapshot + recalled + places + notes + skills + queue + "\n" + senderName + " says: " + text));
+        messages.add(ChatMessage.user(snapshot + recalled + storage + places + notes + skills + routines + queue
+                + "\n" + senderName + " says: " + text));
         return messages;
     }
 
@@ -1050,6 +1261,17 @@ public final class LumenBrain {
                 + "  goto <x> <y> <z> / stand here - walk to exact coordinates, or to where the speaker stands\n"
                 + "  down <y>        - dig a staircase down to that level: \"down 12\"\n"
                 + "  craft <n> <item> - make something from what is in your pack, e.g. \"craft 4 sticks\"\n"
+                + "  smelt <item>    - cook things from your pack in a nearby furnace and bring the product back: "
+                + "\"smelt raw iron\", \"smelt 10 raw copper\", \"smelt everything\". You already know what "
+                + "smelts into what - never say you don't know how\n"
+                + "  survey [place]  - go through every chest nearby (or round a named place) and remember "
+                + "what is in each: \"survey\", \"survey the storage room\". Use it when asked to check, "
+                + "look through or catalogue the chests\n"
+                + "  where <item>    - say where you last saw something in the chests you surveyed\n"
+                + "  schedule <sentence> - when the player wants something done regularly, copy their "
+                + "sentence: \"schedule every morning: check the hops\", \"schedule check the chests every "
+                + "2 hours\". The times you know are morning, noon, afternoon, evening, night, midnight, "
+                + "or every N minutes/hours\n"
                 + "  quarry <WxLxH> [level Y] - dig out an area: \"quarry 20x20x2 level 2\"; "
                 + "\"quarry selection\" digs what the player marked with the wand\n"
                 + "  wand            - hand the player a selection wand\n"
@@ -1091,6 +1313,14 @@ public final class LumenBrain {
                 + "\"message\":\"digging stairs down to 12\"}\n"
                 + "{\"reason\":\"a skill i know\",\"command\":\"do harvest hops\","
                 + "\"message\":\"on it\"}\n"
+                + "{\"reason\":\"they want the chests catalogued\",\"command\":\"survey\","
+                + "\"message\":\"i'll go have a look in everything\"}\n"
+                + "{\"reason\":\"a daily job\",\"command\":\"schedule every morning: check the hops\","
+                + "\"message\":\"every morning, got it\"}\n"
+                + "{\"reason\":\"raw ore to cook\",\"command\":\"smelt raw iron\","
+                + "\"message\":\"i'll get that in the furnace\"}\n"
+                + "{\"reason\":\"cook whatever i have\",\"command\":\"smelt everything\","
+                + "\"message\":\"firing it all up\"}\n"
                 + "{\"reason\":\"they need sticks\",\"command\":\"craft 8 sticks\","
                 + "\"message\":\"i'll knock some together\"}\n"
                 + "{\"reason\":\"dig out a room\",\"command\":\"quarry 10x10x3\","
